@@ -20,3 +20,4 @@ case_visual_specs.json
 *.dump
 *.tgz
 *.zip
+*.tsbuildinfo
