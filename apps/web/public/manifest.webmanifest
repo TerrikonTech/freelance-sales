@@ -1,0 +1,10 @@
+{
+  "name": "Sales Control",
+  "short_name": "Sales",
+  "start_url": "/sales/",
+  "scope": "/sales/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#111827",
+  "description": "Мониторинг заказов, оценка лидов и согласование ответов"
+}

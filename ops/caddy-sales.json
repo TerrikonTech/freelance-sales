@@ -1,0 +1,134 @@
+{
+  "logging": {
+    "logs": {
+      "default": { "exclude": ["http.log.access.log0"] },
+      "log0": {
+        "writer": { "output": "stdout" },
+        "encoder": {
+          "format": "filter",
+          "fields": {
+            "request>uri": {
+              "filter": "query",
+              "actions": [
+                {
+                  "type": "replace",
+                  "parameter": "ticket",
+                  "value": "REDACTED"
+                },
+                {
+                  "type": "replace",
+                  "parameter": "token",
+                  "value": "REDACTED"
+                }
+              ]
+            }
+          },
+          "wrap": { "format": "console" }
+        },
+        "include": ["http.log.access.log0"]
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "http_port": 8080,
+      "https_port": 80,
+      "servers": {
+        "srv0": {
+          "listen": [":80"],
+          "routes": [
+            {
+              "match": [{ "host": ["vds.31-77-76-226.sslip.io"] }],
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "match": [{ "path": ["/mesh", "/mesh/*"] }],
+                      "handle": [
+                        { "handler": "rewrite", "strip_path_prefix": "/mesh" },
+                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:9443" }] }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "match": [{ "path": ["/sales"] }],
+                      "handle": [
+                        {
+                          "handler": "static_response",
+                          "headers": { "Location": ["/sales/"] },
+                          "status_code": 308
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "match": [{ "path": ["/sales/*"] }],
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": ["camera=(), microphone=(), geolocation=()"],
+                              "Referrer-Policy": ["same-origin"],
+                              "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
+                              "X-Content-Type-Options": ["nosniff"],
+                              "X-Frame-Options": ["DENY"]
+                            }
+                          }
+                        },
+                        { "handler": "rewrite", "strip_path_prefix": "/sales" },
+                        { "encodings": { "gzip": {}, "zstd": {} }, "handler": "encode", "prefer": ["zstd", "gzip"] },
+                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:8790" }] }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": ["camera=(), microphone=(), geolocation=()"],
+                              "Referrer-Policy": ["same-origin"],
+                              "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
+                              "X-Content-Type-Options": ["nosniff"],
+                              "X-Frame-Options": ["SAMEORIGIN"]
+                            }
+                          }
+                        },
+                        { "encodings": { "gzip": {}, "zstd": {} }, "handler": "encode", "prefer": ["zstd", "gzip"] },
+                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:8787" }] }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ],
+          "tls_connection_policies": [
+            {
+              "match": { "sni": ["vds.31-77-76-226.sslip.io"] },
+              "certificate_selection": { "any_tag": ["cert0"] }
+            },
+            {}
+          ],
+          "automatic_https": { "disable_redirects": true },
+          "logs": { "logger_names": { "vds.31-77-76-226.sslip.io:80": "log0" } }
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "load_files": [
+          {
+            "certificate": "/etc/caddy/vds-console/fullchain.pem",
+            "key": "/etc/caddy/vds-console/privkey.pem",
+            "tags": ["cert0"]
+          }
+        ]
+      }
+    }
+  }
+}

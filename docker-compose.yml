@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    image: freelance-sales-app:local
+    build: .
+    restart: unless-stopped
+    command: ["node", "apps/api/dist/main.js"]
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8790:3000"
+    volumes:
+      - ./data/documents:/app/data/documents
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  worker:
+    image: freelance-sales-app:local
+    build: .
+    restart: unless-stopped
+    command: ["node", "apps/api/dist/worker.js"]
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data/documents:/app/data/documents
+    networks: [internal]
+    shm_size: "256mb"
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  router-loader:
+    image: freelance-sales-app:local
+    restart: unless-stopped
+    command: ["node", "apps/api/dist/caddy-loader.js"]
+    network_mode: host
+    volumes:
+      - ./ops/caddy-sales.json:/app/ops/caddy-sales.json:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:2019/config/apps/http/servers/srv0/routes/0/handle/0/routes').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

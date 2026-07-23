@@ -1,0 +1,16 @@
+.git
+.env
+.sales-broker-token
+node_modules
+**/node_modules
+**/dist
+data
+runtime
+.backups
+ops/backups
+portfolio-assets
+.pytest-cache
+*.dump
+*.tgz
+*.zip
+*.log

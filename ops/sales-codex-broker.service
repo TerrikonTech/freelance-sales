@@ -1,0 +1,17 @@
+[Unit]
+Description=Freelance Sales Codex broker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__PROJECT_ROOT__
+Environment=CODEX_BIN=__CODEX_BIN__
+Environment=SALES_CODEX_API=http://127.0.0.1:8790/api/internal/codex
+ExecStart=/usr/bin/python3 __PROJECT_ROOT__/ops/sales_codex_broker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+{
+  "name": "@freelance-sales/api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "nest build",
+    "test": "jest --runInBand"
+  },
+  "jest": {
+    "moduleFileExtensions": ["js", "json", "ts"],
+    "rootDir": "src",
+    "testRegex": ".*\\.spec\\.ts$",
+    "transform": {
+      "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "testEnvironment": "node"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.6",
+    "@nestjs/config": "^4.0.2",
+    "@nestjs/core": "^11.1.6",
+    "@nestjs/jwt": "^11.0.1",
+    "@nestjs/platform-express": "^11.1.6",
+    "bcryptjs": "^3.0.2",
+    "bullmq": "^5.58.5",
+    "cheerio": "^1.1.2",
+    "cookie-parser": "^1.4.7",
+    "docxtemplater": "^3.67.5",
+    "docx": "^9.5.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.7.0",
+    "openai": "^5.16.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.16.3",
+    "pizzip": "^3.2.0",
+    "puppeteer-core": "^24.17.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "uuid": "^11.1.0",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.10",
+    "@nestjs/testing": "^11.1.6",
+    "@types/cookie-parser": "^1.4.9",
+    "@types/express": "^5.0.3",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.17.2",
+    "@types/pg": "^8.15.5",
+    "@types/web-push": "^3.6.4",
+    "jest": "^30.0.5",
+    "ts-jest": "^29.4.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}
