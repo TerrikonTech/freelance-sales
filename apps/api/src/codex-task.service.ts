@@ -62,8 +62,9 @@ export class CodexTaskService {
     return { ok: true };
   }
 
-  async heartbeat() {
-    await this.settings.setConnectorState('codex', { enabled: true, healthy: true, statusText: 'Host broker подключён', success: true });
+  async heartbeat(provider?: string) {
+    const statusText = provider === 'hermes' ? 'Hermes подключён' : 'Codex host broker подключён';
+    await this.settings.setConnectorState('codex', { enabled: true, healthy: true, statusText, success: true });
     return { ok: true };
   }
 }

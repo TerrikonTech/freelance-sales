@@ -1,0 +1,61 @@
+[Unit]
+Description=Freelance Sales Hermes broker
+Documentation=file://__PROJECT_ROOT__/README.md
+After=network-online.target docker.service codex-mesh-hermes.service
+Wants=network-online.target codex-mesh-hermes.service
+Conflicts=sales-codex-broker.service
+ConditionPathExists=/etc/codex-mesh/hermes-api-key
+ConditionPathExists=/etc/freelance-sales-broker.env
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=__PROJECT_ROOT__
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SALES_HERMES_SALES_API=http://127.0.0.1:8790/api/internal/codex
+Environment=SALES_HERMES_API=http://127.0.0.1:8642/v1
+Environment=SALES_HERMES_REQUEST_TIMEOUT_SECONDS=60
+Environment=SALES_HERMES_API_KEY_FILE=/etc/codex-mesh/hermes-api-key
+Environment=SALES_HERMES_TELEGRAM_TOKEN_FILE=/etc/codex-mesh/hermes-telegram-token
+Environment=SALES_HERMES_CHANNEL_DIRECTORY=/var/lib/codex-mesh-hermes/channel_directory.json
+Environment=SALES_BROKER_ENV_FILE=/etc/freelance-sales-broker.env
+Environment=SALES_HERMES_RUNTIME_DIR=__PROJECT_ROOT__/runtime/hermes-jobs
+Environment=SALES_HERMES_EXCHANGE_DIR=__HERMES_EXCHANGE_DIR__
+ExecStartPre=/usr/bin/python3 __PROJECT_ROOT__/ops/sales_hermes_broker.py --dry-run
+ExecStart=/usr/bin/python3 __PROJECT_ROOT__/ops/sales_hermes_broker.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# AI traffic stays on loopback. Optional owner notifications use only the
+# fixed Telegram Bot API endpoint and never call getUpdates or setWebhook.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=__PROJECT_ROOT__
+ReadOnlyPaths=/etc/codex-mesh/hermes-api-key
+ReadOnlyPaths=-/etc/codex-mesh/hermes-telegram-token
+ReadOnlyPaths=-/var/lib/codex-mesh-hermes/channel_directory.json
+ReadOnlyPaths=/etc/freelance-sales-broker.env
+ReadWritePaths=__PROJECT_ROOT__/runtime/hermes-jobs
+ReadWritePaths=__HERMES_EXCHANGE_DIR__
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime" / "codex-jobs"
-TOKEN_FILE = ROOT / ".sales-broker-token"
+TOKEN_FILE_VALUE = os.getenv("SALES_BROKER_TOKEN_FILE", "").strip()
+TOKEN_FILE = Path(TOKEN_FILE_VALUE).expanduser() if TOKEN_FILE_VALUE else None
+BROKER_ENV_FILE = Path(
+    os.getenv("SALES_BROKER_ENV_FILE", "/etc/freelance-sales-broker.env")
+)
 CODEX = Path(os.getenv("CODEX_BIN", "/root/.local/bin/codex"))
 API = os.getenv("SALES_CODEX_API", "http://127.0.0.1:8790/api/internal/codex").rstrip("/")
 WORKER_ID = f"{socket.gethostname()}-sales-codex"
@@ -179,6 +183,125 @@ SCHEMAS = {
         "properties": {"content": {"type": "string", "minLength": 20}},
         "required": ["content"],
     },
+    "conversation_turn": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "intent": {"type": "string"},
+            "stage": {
+                "type": "string",
+                "enum": [
+                    "new", "qualified", "outreach", "conversation",
+                    "telegram_handoff", "discovery", "proposal", "contract",
+                    "build_ready", "won", "lost",
+                ],
+            },
+            "reply": {"type": "string", "minLength": 20},
+            "summary": {"type": "string"},
+            "next_action": {"type": "string"},
+            "discovery_readiness": {"type": "integer", "minimum": 0, "maximum": 100},
+            "build_readiness": {"type": "integer", "minimum": 0, "maximum": 100},
+            "should_move_to_telegram": {"type": "boolean"},
+            "discovery_complete": {"type": "boolean"},
+            "requires_owner": {"type": "boolean"},
+            "risk_flags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 12,
+            },
+            "requirements": {
+                "type": "array",
+                "maxItems": 40,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "category": {"type": "string"},
+                        "slug": {"type": "string"},
+                        "title": {"type": "string"},
+                        "value": {"type": ["string", "null"]},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "open", "confirmed", "assumed", "rejected",
+                                "not_applicable",
+                            ],
+                        },
+                        "required": {"type": "boolean"},
+                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                    },
+                    "required": [
+                        "category", "slug", "title", "value", "status",
+                        "required", "confidence",
+                    ],
+                },
+            },
+        },
+        "required": [
+            "intent", "stage", "reply", "summary", "next_action",
+            "discovery_readiness", "build_readiness",
+            "should_move_to_telegram", "discovery_complete",
+            "requires_owner", "risk_flags", "requirements",
+        ],
+    },
+    "owner_query": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "answer": {"type": "string", "minLength": 10},
+            "evidence_message_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 30,
+            },
+        },
+        "required": ["answer", "evidence_message_ids"],
+    },
+    "implementation_handoff": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "project_summary": {"type": "string"},
+            "business_goal": {"type": "string"},
+            "scope": {"type": "array", "items": {"type": "string"}},
+            "out_of_scope": {"type": "array", "items": {"type": "string"}},
+            "roles": {"type": "array", "items": {"type": "string"}},
+            "user_flows": {"type": "array", "items": {"type": "string"}},
+            "functional_requirements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["id", "title", "description", "acceptance_criteria"],
+                },
+            },
+            "data_entities": {"type": "array", "items": {"type": "string"}},
+            "integrations": {"type": "array", "items": {"type": "string"}},
+            "non_functional_requirements": {"type": "array", "items": {"type": "string"}},
+            "security_requirements": {"type": "array", "items": {"type": "string"}},
+            "test_plan": {"type": "array", "items": {"type": "string"}},
+            "deployment_plan": {"type": "array", "items": {"type": "string"}},
+            "assets": {"type": "array", "items": {"type": "string"}},
+            "definition_of_done": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "project_summary", "business_goal", "scope", "out_of_scope",
+            "roles", "user_flows", "functional_requirements", "data_entities",
+            "integrations", "non_functional_requirements",
+            "security_requirements", "test_plan", "deployment_plan", "assets",
+            "definition_of_done", "open_questions",
+        ],
+    },
     "specification": {
         "type": "object", "additionalProperties": False,
         "properties": {"markdown": {"type": "string", "minLength": 200}},
@@ -282,13 +405,40 @@ proof должен быть правдивым и проверяемым по se
 
 Тексты вида «Готов собрать первый рабочий контур: функция 1, функция 2. В портфолио есть fullstack-платформа...» и «Сделаю X. В разработке 6 лет. У вас уже есть Y?» считаются провалом, даже если формально конкретны. Готовый content: 90–460 знаков, обычно 2–5 предложений, короткое приветствие, ноль или один вопрос, простая пунктуация. Без списка, подзаголовка, эмодзи, длинного тире, канцелярита, пафоса, пересказа заказа и формулы «лучше X, иначе Y». human_score ниже 85 ставь любому тексту, который звучит написанным ИИ; sales_score ниже 85 — если нет ясной причины продолжить разговор; specificity_score ниже 90 — если текст можно почти без изменений отправить на другой проект; factual_score ниже 100 — если есть неподтверждённый факт. До возврата перепиши так, чтобы factual_score был 100, human_score и sales_score были не ниже 85, specificity_score не ниже 90. Верни только JSON по схеме.""",
     "draft_reply": """Напиши ответ в текущем чате по context.json от лица владельца. Отвечай непосредственно на последнее сообщение клиента, без повторной самопрезентации и продажи заново. Если owner_instructions непустые, выполни эти доверенные правки владельца буквально, кроме выдумывания фактов. Обычно 100–500 знаков, максимум два вопроса. Используй voice_examples только для ритма и лексики, не копируй из них факты. Если есть revision, полностью перепиши текст с учётом issues. Не выдумывай обещания и кейсы, не используй markdown и эмодзи. Верни строго JSON по схеме.""",
+    "conversation_turn": """Ты ведущий менеджер по продаже и предпроектному интервью. В context.json есть карточка сделки, полная доступная переписка, уже подтверждённые требования и безопасная информация для перехода в Telegram.
+
+Сначала определи, на какой стадии находится реальная сделка. Затем подготовь один естественный ответ клиенту от лица Савелия. Ответ должен одновременно решать текущий вопрос клиента и мягко продвигать сделку на один следующий шаг. Не перескакивай к ТЗ, договору или разработке, пока предыдущая стадия не подтверждена.
+
+На этапе outreach/conversation выясняй цель, текущую систему, главный результат, ограничения и лицо, принимающее решение. Когда клиент проявил предметный интерес и нужен длинный обмен материалами, should_move_to_telegram=true. Не предлагай Telegram в первом же сообщении без причины.
+
+На этапе discovery веди интервью небольшими порциями: обычно один тематический блок и максимум два связанных вопроса в одном сообщении. Собирай минимум: бизнес-цель, роли, основные сценарии, границы MVP, данные и миграции, интеграции, права доступа, уведомления, платежи, админку, ошибки, безопасность, устройства/браузеры, нагрузку, аналитику, дизайн/материалы, инфраструктуру, сроки, бюджет, критерии приёмки и то, что точно не входит. Не задавай повторно вопрос, если ответ уже есть в messages или structured_requirements.
+
+Каждый новый или уточнённый факт верни в requirements. value — короткая строка с фактом, status=confirmed только при прямом подтверждении клиента; assumed используй для явно обозначенного рабочего допущения; open — для неизвестного вопроса. Одинаковый смысл всегда получает одинаковые category и slug. readiness оцени строго: discovery_readiness=100 только если объём можно зафиксировать коммерчески; build_readiness=100 только если Codex сможет реализовывать без продуктовых догадок и open-вопросов.
+
+requires_owner=true для цены, скидки, сроков, гарантии, договора, юридических формулировок, доступа к секретам, конфликтов и любого нового обязательства. В таких случаях не обещай решение, а подготовь безопасный ответ для проверки владельцем. Не выдумывай факты, кейсы, выполненную работу или согласие клиента. Не упоминай ИИ и автоматизацию. reply — только сообщение клиенту, без пояснений и markdown. Верни строго JSON по схеме.""",
+    "owner_query": """Ответь владельцу по конкретной сделке. Используй только lead, messages и structured_requirements из context.json. Учитывай формулировку периода в вопросе и временные метки сообщений. Отделяй подтверждённые факты от предположений, не считай фразы «сделаем» доказательством выполнения. Если спрашивают полный список, пройди всю переданную историю, объедини повторы и перечисли все отдельные задачи, договорённости, риски и незакрытые вопросы. В evidence_message_ids верни ID сообщений, на которых основан ответ. Не готовь сообщение клиенту, если об этом не попросили. Верни строго JSON по схеме.""",
+    "implementation_handoff": """Собери из подтверждённой переписки и structured_requirements единый пакет постановки задачи для Codex. Это не рекламный текст, а источник истины для реализации.
+
+Зафиксируй бизнес-цель, точный scope и out_of_scope, роли, сквозные пользовательские сценарии, функциональные требования с устойчивыми ID и проверяемыми acceptance criteria, данные, интеграции, нефункциональные и security-требования, тестовый план, развёртывание, передаваемые материалы и Definition of Done. Не превращай предположения в факты. Всё, без чего реализация потребует продуктового решения, перечисли в open_questions. Если вопрос уже подтверждён в переписке, не оставляй его открытым. Ничего не выдумывай. Верни строго JSON по схеме.""",
     "specification": """По context.json составь максимально проверяемое ТЗ для передачи Codex: цели, границы, роли, сценарии, требования с ID, данные, API, ошибки, безопасность, нефункциональные требования, тесты, критерии приёмки, этапы, зависимости и допущения. Неизвестное помечай OPEN_QUESTION, ничего не выдумывай. Верни markdown внутри строгого JSON по схеме.""",
     "contract_data": """Извлеки из context.json только подтверждённые данные для шаблона договора. Не сочиняй юридические условия. Неизвестное возвращай null и перечисляй в open_questions. Верни строго JSON по схеме.""",
 }
 
 
 def token() -> str:
-    value = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    if TOKEN_FILE is not None:
+        value = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    else:
+        matches = []
+        for line in BROKER_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("export "):
+                stripped = stripped[7:].lstrip()
+            if stripped.startswith("SALES_BROKER_TOKEN="):
+                matches.append(stripped.split("=", 1)[1].strip().strip("'\""))
+        if len(matches) != 1:
+            raise RuntimeError("broker token is missing")
+        value = matches[0]
     if len(value) < 32:
         raise RuntimeError("broker token is missing")
     return value
@@ -334,7 +484,7 @@ def run_codex(task: dict) -> dict:
         '"/etc"="deny",'
         '"/opt/gastracker/data"="deny",'
         f'"{ROOT / ".env"}"="deny",'
-        f'"{TOKEN_FILE}"="deny"'
+        f'"{TOKEN_FILE if TOKEN_FILE is not None else BROKER_ENV_FILE}"="deny"'
         '}}'
     )
     command = [

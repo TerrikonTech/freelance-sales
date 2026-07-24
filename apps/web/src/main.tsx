@@ -255,9 +255,19 @@ function DraftCard({ draft, reload, action, notify }: any) {
 
 function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify: (text: string) => void }) {
   const [data, setData] = useState<any>();
+  const [agent, setAgent] = useState<any>();
   const [content, setContent] = useState('');
+  const [question, setQuestion] = useState('');
+  const [agentAnswer, setAgentAnswer] = useState('');
+  const [agentBusy, setAgentBusy] = useState(false);
   const [busy, setBusy] = useState(false);
-  const load = () => api(`/leads/${id}`).then(setData);
+  const load = () => Promise.all([
+    api(`/leads/${id}`),
+    api(`/leads/${id}/agent`),
+  ]).then(([leadData, agentData]) => {
+    setData(leadData);
+    setAgent(agentData);
+  });
   useEffect(() => { void load(); const timer = window.setInterval(load, 15_000); return () => clearInterval(timer); }, [id]);
   const pending = data?.drafts?.find((draft: any) => draft.status === 'pending');
   useEffect(() => { setContent(pending?.content || ''); }, [pending?.id]);
@@ -271,11 +281,26 @@ function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify
   const saveDraft = () => run(() => api(`/drafts/${pending.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }), 'Правки сохранены');
   const approve = () => run(() => api(`/drafts/${pending.id}/approve`, { method: 'POST' }), 'Ответ одобрен и отправляется');
   const reject = () => run(() => api(`/drafts/${pending.id}/reject`, { method: 'POST' }), 'Ответ отклонён');
-  return <section className="chatScreen"><button className="back" onClick={back}>← Все чаты</button><div className="pageTitle chatTitle"><div><span className="eyebrow">Диалог FL.ru</span><h1>{lead.title}</h1><p>{data.messages.length} сообщений · обновлён {relativeTime(lead.updated_at)}</p></div>{lead.url && <a className="button ghost" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
+  const askAgent = async () => {
+    if (!question.trim()) return;
+    setAgentBusy(true);
+    try {
+      const result = await api<any>(`/leads/${id}/agent/query`, {
+        method: 'POST',
+        body: JSON.stringify({ question }),
+      });
+      setAgentAnswer(result.answer || 'Ответ не получен');
+    } catch (error) {
+      notify((error as Error).message);
+    } finally {
+      setAgentBusy(false);
+    }
+  };
+  return <section className="chatScreen"><button className="back" onClick={back}>← Все чаты</button><div className="pageTitle chatTitle"><div><span className="eyebrow">{lead.source === 'telegram' ? 'Диалог Telegram' : 'Диалог FL.ru'}</span><h1>{lead.title}</h1><p>{data.messages.length} сообщений · обновлён {relativeTime(lead.updated_at)}</p></div>{lead.url && <a className="button ghost" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
     <div className="chatWorkspace"><div className="conversationColumn">
       {pending ? <article className="replyReady"><div className="replyReadyHead"><div><span>Готово к отправке</span><h2>Ответ клиенту</h2></div><Status value={pending.status} /></div><textarea rows={7} value={content} onChange={(event) => setContent(event.target.value)} /><div className="actions"><button onClick={saveDraft} disabled={busy}>Сохранить правки</button><button className="primary" onClick={approve} disabled={busy}>✓ Одобрить и отправить</button><button className="danger" onClick={reject} disabled={busy}>Отклонить</button></div></article> : <div className="replyEmpty"><div><b>Нужно ответить клиенту?</b><small>Система подготовит ответ в вашем стиле. Без одобрения он не уйдёт.</small></div><button className="primary" onClick={makeDraft} disabled={busy}>{busy ? 'Готовлю…' : 'Подготовить ответ'}</button></div>}
       <Card title="Переписка" subtitle="Последние сообщения снизу"><div className="messageThread">{data.messages.length === 0 ? <Empty text="Сообщений пока нет" /> : data.messages.slice(-50).map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.direction === 'outbound' ? 'Вы' : 'Клиент'} · {new Date(message.created_at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</small><p>{message.content}</p></div>)}</div></Card>
-    </div><aside className="chatContext"><Card title="Заказ и условия"><div className="contextFacts"><span>Этап<b>{labelStatus(lead.status)}</b></span><span>Релевантность<b>{lead.score ?? '—'}/100</b></span><span>Цена<b>{money(lead.recommended_price)}</b></span><span>Срок<b>{lead.recommended_days ? `${lead.recommended_days} дней` : '—'}</b></span></div>{lead.description && lead.description !== 'Диалог FL.ru' && <details><summary>Описание заказа</summary><p className="pre">{lead.description}</p></details>}<div className="actions"><button onClick={() => run(() => api(`/leads/${id}/documents`, { method: 'POST', body: '{}' }), 'ТЗ и договор готовятся')}>Сформировать ТЗ</button></div></Card><Card title="Правило отправки"><p className="hint">Ни один ответ не отправится, пока вы не нажмёте «Одобрить и отправить».</p></Card></aside></div>
+    </div><aside className="chatContext"><Card title="Агент сделки" subtitle="Можно спрашивать обычными словами"><div className="contextFacts"><span>Стадия<b>{agent?.stage || '—'}</b></span><span>Интервью<b>{agent?.discoveryReadiness ?? 0}%</b></span><span>Готовность к разработке<b>{agent?.buildReadiness ?? 0}%</b></span></div>{agent?.nextAction && <p className="hint"><b>Следующий шаг:</b> {agent.nextAction}</p>}<textarea rows={3} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Например: что клиент хочет и какие вопросы ещё не закрыты?" /><button className="primary" disabled={agentBusy || !question.trim()} onClick={askAgent}>{agentBusy ? 'Анализирую…' : 'Спросить агента'}</button>{agentAnswer && <p className="pre">{agentAnswer}</p>}</Card><Card title="Заказ и условия"><div className="contextFacts"><span>Этап<b>{labelStatus(lead.status)}</b></span><span>Релевантность<b>{lead.score ?? '—'}/100</b></span><span>Цена<b>{money(lead.recommended_price)}</b></span><span>Срок<b>{lead.recommended_days ? `${lead.recommended_days} дней` : '—'}</b></span></div>{lead.description && lead.description !== 'Диалог FL.ru' && <details><summary>Описание заказа</summary><p className="pre">{lead.description}</p></details>}<div className="actions"><button onClick={() => run(() => api(`/leads/${id}/documents`, { method: 'POST', body: '{}' }), 'ТЗ, договор и пакет для Codex готовятся')}>Сформировать пакет проекта</button></div></Card><Card title="Правило отправки"><p className="hint">Рискованные ответы, цены, сроки и договорённости всегда требуют вашего подтверждения.</p></Card></aside></div>
   </section>;
 }
 
@@ -316,7 +341,7 @@ function Settings({ notify }: { notify: (text: string) => void }) {
       <Card title="Push-уведомления" subtitle="О подходящем заказе и готовом черновике"><PushControl notify={notify} /></Card>
       <Card title="Автопоиск FL.ru" subtitle="Только новые проекты, один раз в 5 минут"><div className="settingStatus"><span className={fl.enabled ? 'dot ok' : 'dot'} /><b>{fl.enabled ? 'Включён' : 'На паузе'}</b></div><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={() => connect('fl', { enabled: !fl.enabled })}>{fl.enabled ? 'Остановить' : 'Включить мониторинг'}</button></Card>
     </div>
-    <Card title="Ваше предложение" subtitle="Чем точнее заполнено, тем меньше лишних заказов"><div className="formgrid"><label>Имя<input value={seller.name || ''} onChange={(event) => setSeller({ ...seller, name: event.target.value })} /></label><label>Минимальная цена<input type="number" value={seller.minimum_price || ''} onChange={(event) => setSeller({ ...seller, minimum_price: Number(event.target.value) })} /></label><label className="wide">Услуги<textarea rows={4} value={seller.services || ''} onChange={(event) => setSeller({ ...seller, services: event.target.value })} /></label><label className="wide">Подтверждённые кейсы<textarea rows={4} value={seller.cases || ''} onChange={(event) => setSeller({ ...seller, cases: event.target.value })} /></label><label className="wide">Стиль общения<textarea rows={4} value={style.rules || ''} onChange={(event) => setStyle({ ...style, rules: event.target.value })} /></label></div><button className="primary" onClick={saveProfile}>Сохранить профиль</button></Card>
+    <Card title="Ваше предложение" subtitle="Чем точнее заполнено, тем меньше лишних заказов"><div className="formgrid"><label>Имя<input value={seller.name || ''} onChange={(event) => setSeller({ ...seller, name: event.target.value })} /></label><label>Минимальная цена<input type="number" value={seller.minimum_price || ''} onChange={(event) => setSeller({ ...seller, minimum_price: Number(event.target.value) })} /></label><label>Telegram для клиентов<input placeholder="@username" value={seller.telegram_username || ''} onChange={(event) => setSeller({ ...seller, telegram_username: event.target.value })} /></label><label className="wide">Услуги<textarea rows={4} value={seller.services || ''} onChange={(event) => setSeller({ ...seller, services: event.target.value })} /></label><label className="wide">Подтверждённые кейсы<textarea rows={4} value={seller.cases || ''} onChange={(event) => setSeller({ ...seller, cases: event.target.value })} /></label><label className="wide">Стиль общения<textarea rows={4} value={style.rules || ''} onChange={(event) => setStyle({ ...style, rules: event.target.value })} /></label></div><button className="primary" onClick={saveProfile}>Сохранить профиль</button></Card>
     <div className="settingsGrid">
       <Card title={`Codex Hub ${data.configured.codex ? '✓' : ''}`} subtitle="ИИ и подготовка документов"><p className="hint">Работает через Codex Hub на сервере. От вас ничего не требуется.</p></Card>
       <Card title={`Telegram Business ${data.configured.telegram ? '✓' : ''}`} subtitle="Общение через ваш аккаунт"><p className="hint">Подключайте, когда будете готовы перенести клиента из FL.ru в Telegram.</p><div className="inline"><input type="password" placeholder="Bot token" value={keys.telegram} onChange={(event) => setKeys({ ...keys, telegram: event.target.value })} /><button onClick={() => connect('telegram', { botToken: keys.telegram })}>Подключить</button></div></Card>

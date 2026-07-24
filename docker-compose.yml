@@ -99,6 +99,35 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  telegram-sync:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    command: ["python3", "/app/sales_mtproto_bridge.py"]
+    network_mode: host
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BUSINESS_OWNER_TELEGRAM_ID: "677822370"
+      SALES_BROKER_ENV_FILE: /run/secrets/sales-broker.env
+      TELEGRAM_TOKEN_FILE: /run/secrets/telegram-token
+      HERMES_STATE_DB: /hermes-state/state.sqlite3
+      SALES_TELEGRAM_SYNC_STATE: /runtime/telegram-sync.json
+      SALES_TELEGRAM_INTERNAL_API: http://127.0.0.1:8790/api/internal/telegram
+      SALES_MTPROTO_TEXT_SYNC: "false"
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./ops/sales_mtproto_bridge.py:/app/sales_mtproto_bridge.py:ro
+      - /etc/freelance-sales-broker.env:/run/secrets/sales-broker.env:ro
+      - /var/lib/codex-mesh/hermes-business/telegram-token:/run/secrets/telegram-token:ro
+      - /var/lib/codex-mesh-hermes/exchange/business-bridge-runtime/state:/hermes-state:ro
+      - ./runtime:/runtime
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   internal:
     driver: bridge

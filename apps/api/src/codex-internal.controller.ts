@@ -7,9 +7,12 @@ export class CodexInternalController {
   constructor(private readonly tasks: CodexTaskService) {}
 
   @Post('heartbeat')
-  heartbeat(@Headers('x-sales-broker-token') token?: string) {
+  heartbeat(
+    @Headers('x-sales-broker-token') token?: string,
+    @Body() body: { provider?: string } = {},
+  ) {
     this.authorize(token);
-    return this.tasks.heartbeat();
+    return this.tasks.heartbeat(body.provider);
   }
 
   @Post('tasks/claim')

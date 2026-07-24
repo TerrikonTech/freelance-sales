@@ -9,6 +9,7 @@ import { DatabaseService } from './database.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { QueueService } from './queue.service';
+import { SalesAgentService } from './sales-agent.service';
 import { SettingsService } from './settings.service';
 import { TelegramService } from './telegram.service';
 
@@ -22,6 +23,7 @@ export class AppController {
     private readonly fl: FlService,
     private readonly telegram: TelegramService,
     private readonly documents: DocumentsService,
+    private readonly salesAgent: SalesAgentService,
   ) {}
 
   @Get('health')
@@ -107,6 +109,65 @@ export class AppController {
     return { lead, messages: messages.rows, drafts: drafts.rows, documents: documents.rows, activities: activities.rows };
   }
 
+  @Get('leads/:id/agent')
+  @UseGuards(AuthGuard)
+  async agentState(@Param('id') id: string) {
+    return this.salesAgent.state(id);
+  }
+
+  @Post('leads/:id/agent/query')
+  @UseGuards(AuthGuard)
+  async queryAgent(@Param('id') id: string, @Body() body: { question?: string }) {
+    const question = String(body.question || '').trim();
+    if (!question) throw new BadRequestException('Напишите вопрос агенту');
+    return this.salesAgent.answerOwner(id, question);
+  }
+
+  @Post('leads/:id/codex-handoff')
+  @UseGuards(AuthGuard)
+  async buildCodexHandoff(@Param('id') id: string) {
+    return this.salesAgent.buildCodexHandoff(id);
+  }
+
+  @Post('codex-handoffs/:id/approve')
+  @UseGuards(AuthGuard)
+  async approveCodexHandoff(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
+    const result = await this.db.transaction(async (client) => {
+      const selected = await client.query(
+        `SELECT h.*,l.last_inbound_message_id FROM codex_handoffs h
+         JOIN leads l ON l.id=h.lead_id WHERE h.id=$1 FOR UPDATE`,
+        [id],
+      );
+      const handoff = selected.rows[0];
+      if (!handoff) throw new NotFoundException();
+      if (handoff.status !== 'ready') {
+        throw new ConflictException('Пакет ещё содержит открытые вопросы');
+      }
+      if ((handoff.source_last_message_id || null) !== (handoff.last_inbound_message_id || null)) {
+        await client.query(
+          "UPDATE codex_handoffs SET status='needs_answers',updated_at=now() WHERE id=$1",
+          [id],
+        );
+        throw new ConflictException('После подготовки появились новые сообщения — обновите пакет');
+      }
+      await client.query(
+        `UPDATE codex_handoffs SET status='approved',approved_by=$2,
+         approved_at=now(),updated_at=now() WHERE id=$1`,
+        [id, req.user!.sub],
+      );
+      await client.query(
+        "UPDATE leads SET pipeline_stage='build_ready',build_readiness=100,next_action='Создать проект Codex',updated_at=now() WHERE id=$1",
+        [handoff.lead_id],
+      );
+      await client.query(
+        "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,$2,'codex_handoff_approved',$3)",
+        [handoff.lead_id, req.user!.email, JSON.stringify({ handoffId: id, version: handoff.version })],
+      );
+      return handoff;
+    });
+    return { ok: true, leadId: result.lead_id, version: result.version };
+  }
+
   @Patch('leads/:id')
   @UseGuards(AuthGuard)
   async updateLead(@Param('id') id: string, @Body() body: { status?: string; requirements?: unknown; client?: unknown; recommendedPrice?: number; recommendedDays?: number }) {
@@ -126,7 +187,11 @@ export class AppController {
   @Post('leads/:id/draft')
   @UseGuards(AuthGuard)
   async draft(@Param('id') id: string, @Body() body: { channel?: string; targetExternalId?: string }) {
-    await this.queue.add('draft-reply', { leadId: id, channel: body.channel || 'fl', targetExternalId: body.targetExternalId || '' }, `draft-${id}-${Date.now()}`);
+    await this.queue.add(
+      'draft-reply',
+      { leadId: id, channel: body.channel || 'fl', targetExternalId: body.targetExternalId || '', ownerRequested: true },
+      `draft-${id}-${Date.now()}`,
+    );
     return { queued: true };
   }
 
@@ -142,7 +207,9 @@ export class AppController {
   async drafts() {
     return (await this.db.query(`SELECT d.*,l.title AS lead_title,l.score,l.recommended_price,l.recommended_days,
       CASE WHEN d.metadata->>'mode'='chat' THEN 'message' ELSE 'response' END AS draft_type
-      FROM drafts d JOIN leads l ON l.id=d.lead_id WHERE d.status IN ('pending','approved','sending','failed','stale') ORDER BY d.created_at DESC LIMIT 300`)).rows;
+      FROM drafts d JOIN leads l ON l.id=d.lead_id
+      WHERE d.status IN ('pending','approved','sending','failed','stale','send_unknown')
+      ORDER BY d.created_at DESC LIMIT 300`)).rows;
   }
 
   @Patch('drafts/:id')
@@ -189,6 +256,7 @@ export class AppController {
       targetExternalId: draft.target_external_id || '',
       mode,
       ownerInstructions: instructions,
+      ownerRequested: true,
     }, `regenerate-${id}-${Date.now()}`);
     return { queued: true };
   }

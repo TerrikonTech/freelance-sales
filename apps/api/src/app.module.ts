@@ -6,19 +6,24 @@ import { AppController } from './app.controller';
 import { AuthController } from './auth.controller';
 import { AuthGuard } from './auth.guard';
 import { AuthService } from './auth.service';
+import { AutonomyController } from './autonomy.controller';
+import { AutonomyService } from './autonomy.service';
 import { CryptoService } from './crypto.service';
 import { CodexInternalController } from './codex-internal.controller';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
+import { InternalOwnerController } from './internal-owner.controller';
 import { ProcessorService } from './processor.service';
 import { ProjectAttachmentsService } from './project-attachments.service';
 import { PushController } from './push.controller';
 import { PushService } from './push.service';
 import { QueueService } from './queue.service';
+import { SalesAgentService } from './sales-agent.service';
 import { SettingsService } from './settings.service';
 import { TelegramController } from './telegram.controller';
+import { TelegramInternalController } from './telegram-internal.controller';
 import { TelegramService } from './telegram.service';
 
 @Module({
@@ -26,7 +31,7 @@ import { TelegramService } from './telegram.service';
     ConfigModule.forRoot({ isGlobal: true }),
     JwtModule.register({ global: true, secret: process.env.JWT_SECRET, signOptions: { expiresIn: '7d', issuer: 'freelance-sales-v2' } }),
   ],
-  controllers: [AuthController, AppController, TelegramController, CodexInternalController, PushController],
-  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, ProcessorService],
+  controllers: [AuthController, AppController, TelegramController, TelegramInternalController, CodexInternalController, InternalOwnerController, PushController, AutonomyController],
+  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, SalesAgentService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, AutonomyService, ProcessorService],
 })
 export class AppModule {}

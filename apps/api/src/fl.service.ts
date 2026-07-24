@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as cheerio from 'cheerio';
 import puppeteer, { Browser, CookieData } from 'puppeteer-core';
 import { DatabaseService } from './database.service';
+import { OutboundDeliveryUnknownError, OutboundPreflightError } from './outbound-errors';
 import { ProjectAttachmentsService } from './project-attachments.service';
 import { QueueService } from './queue.service';
 import { PushService } from './push.service';
@@ -293,7 +294,9 @@ export class FlService {
           page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20_000 }).catch(() => null),
         ]);
       }
-      await page.waitForSelector('textarea[name="descr"]', { timeout: 15_000 });
+      await page.waitForSelector('textarea[name="descr"]', { timeout: 15_000 }).catch((error) => {
+        throw new OutboundPreflightError('layout_change', 'Форма отклика FL.ru не найдена: интерфейс изменился', { cause: error });
+      });
       await page.$eval('textarea[name="descr"]', (el, value) => {
         const field = el as HTMLTextAreaElement;
         field.value = String(value);
@@ -302,13 +305,23 @@ export class FlService {
       if (input.price) await this.setInput(page, 'input[name="cost_from"]', String(input.price));
       if (input.days) await this.setInput(page, 'input[name="time_from"]', String(input.days));
       const submit = await page.$('button[type="submit"]');
-      if (!submit) throw new Error('Кнопка отправки FL.ru не найдена');
-      await submit.click();
-      await new Promise((resolve) => setTimeout(resolve, 2_500));
-      const textarea = await page.$('textarea[name="descr"]');
-      if (textarea) {
-        const value = await page.$eval('textarea[name="descr"]', (el) => (el as HTMLTextAreaElement).value);
-        if (value === input.content) throw new Error('FL.ru не подтвердил отправку');
+      if (!submit) throw new OutboundPreflightError('layout_change', 'Кнопка отправки FL.ru не найдена: интерфейс изменился');
+      try {
+        await submit.click();
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        const textarea = await page.$('textarea[name="descr"]');
+        if (textarea) {
+          const value = await page.$eval('textarea[name="descr"]', (el) => (el as HTMLTextAreaElement).value);
+          if (value === input.content) {
+            throw new OutboundDeliveryUnknownError('FL.ru не подтвердил отправку отклика; проверьте проект вручную');
+          }
+        }
+      } catch (error) {
+        if (error instanceof OutboundDeliveryUnknownError) throw error;
+        throw new OutboundDeliveryUnknownError(
+          'Соединение с FL.ru прервалось после нажатия «Отправить»; автоматический повтор запрещён',
+          { cause: error },
+        );
       }
       await this.settings.setConnectorState('fl', { healthy: true, statusText: 'Сессия активна', success: true });
       return { ok: true };
@@ -326,7 +339,9 @@ export class FlService {
       await page.goto(`https://www.fl.ru/messages/?dialogId=${encodeURIComponent(dialogId)}&dialogType=offer`, { waitUntil: 'networkidle2', timeout: 40_000 });
       await this.assertSession(page);
       const selector = 'textarea[placeholder*="Сообщение"], textarea.form-control, #message-text';
-      await page.waitForSelector(selector, { timeout: 15_000 });
+      await page.waitForSelector(selector, { timeout: 15_000 }).catch((error) => {
+        throw new OutboundPreflightError('layout_change', 'Поле сообщения FL.ru не найдено: интерфейс изменился', { cause: error });
+      });
       const before = await page.$$eval('[id^="mes-"]', (elements) => elements.length);
       await page.$eval(selector, (element, value) => {
         const field = element as HTMLTextAreaElement;
@@ -338,11 +353,18 @@ export class FlService {
         (element as HTMLElement).click();
         return true;
       }).catch(() => false);
-      if (!clicked) throw new Error('Кнопка отправки чата FL.ru не найдена');
-      await page.waitForFunction((count, text) => {
-        const field = document.querySelector('textarea[placeholder*="Сообщение"], textarea.form-control, #message-text') as HTMLTextAreaElement | null;
-        return document.querySelectorAll('[id^="mes-"]').length > Number(count) || field?.value.trim() === '' || document.body.innerText.includes(String(text));
-      }, { timeout: 15_000 }, before, content);
+      if (!clicked) throw new OutboundPreflightError('layout_change', 'Кнопка отправки чата FL.ru не найдена: интерфейс изменился');
+      try {
+        await page.waitForFunction((count, text) => {
+          const field = document.querySelector('textarea[placeholder*="Сообщение"], textarea.form-control, #message-text') as HTMLTextAreaElement | null;
+          return document.querySelectorAll('[id^="mes-"]').length > Number(count) || field?.value.trim() === '' || document.body.innerText.includes(String(text));
+        }, { timeout: 15_000 }, before, content);
+      } catch (error) {
+        throw new OutboundDeliveryUnknownError(
+          'FL.ru не подтвердил сообщение после нажатия «Отправить»; автоматический повтор запрещён',
+          { cause: error },
+        );
+      }
       await this.settings.setConnectorState('fl', { healthy: true, statusText: 'Чат FL.ru активен', success: true });
       return { ok: true };
     } finally {
@@ -367,6 +389,13 @@ export class FlService {
       await this.db.query(`UPDATE leads SET client=client || $2::jsonb,updated_at=now() WHERE id=$1`, [lead.rows[0].id, JSON.stringify({ fl_dialog_id: dialogId, fl_chat_rank: chatRank })]);
     }
     const leadId = lead.rows[0].id;
+    await this.db.query(
+      `INSERT INTO lead_channels(lead_id,channel,external_id,metadata)
+       VALUES($1,'fl',$2,$3)
+       ON CONFLICT(channel,external_id) DO UPDATE SET
+         lead_id=EXCLUDED.lead_id,metadata=EXCLUDED.metadata,last_seen_at=now()`,
+      [leadId, dialogId, JSON.stringify({ kind: 'dialog', title, chatRank })],
+    );
     let inserted = 0;
     let lastInboundId: string | null = null;
     let lastDirection: 'inbound' | 'outbound' | null = null;
@@ -386,7 +415,14 @@ export class FlService {
     }
     if (lastInboundId && lastDirection === 'inbound') {
       await this.db.transaction(async (client) => {
-        await client.query('UPDATE leads SET last_inbound_message_id=$2,status=CASE WHEN status IN (\'new\',\'qualified\') THEN \'contacted\' ELSE status END,updated_at=now() WHERE id=$1', [leadId, lastInboundId]);
+        await client.query(
+          `UPDATE leads SET last_inbound_message_id=$2,
+           status=CASE WHEN status IN ('new','qualified') THEN 'contacted' ELSE status END,
+           pipeline_stage=CASE WHEN pipeline_stage IN ('new','qualified','outreach')
+             THEN 'conversation' ELSE pipeline_stage END,
+           updated_at=now() WHERE id=$1`,
+          [leadId, lastInboundId],
+        );
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE lead_id=$1 AND status='pending'", [leadId]);
       });
     }
@@ -601,10 +637,17 @@ export class FlService {
   }
 
   private async assertSession(page: import('puppeteer-core').Page) {
-    if (page.url().includes('/login')) throw new Error('Сессия FL.ru недействительна');
+    const pageText = await page.$eval('body', (element) => (element.textContent || '').toLowerCase()).catch(() => '');
+    const captcha = await page.$('iframe[src*="captcha"], [class*="captcha"], [id*="captcha"], input[name*="captcha"]');
+    if (captcha || /(?:я не робот|подтвердите, что вы не робот|captcha|капча)/iu.test(pageText)) {
+      throw new OutboundPreflightError('captcha', 'FL.ru запросил CAPTCHA — требуется владелец');
+    }
+    if (page.url().includes('/login')) throw new OutboundPreflightError('authentication', 'Сессия FL.ru недействительна');
     const uid = await page.$eval('meta[name="current-uid"]', (element) => element.getAttribute('content')).catch(() => null);
     const hasMessages = await page.$('[data-id^="qa-chat-list-item-"], [id^="mes-"], textarea[placeholder*="Сообщение"]');
-    if (!uid && !hasMessages) throw new Error('Сессия FL.ru недействительна или интерфейс изменился');
+    if (!uid && !hasMessages) {
+      throw new OutboundPreflightError('layout_change', 'Сессия FL.ru недействительна или интерфейс изменился');
+    }
   }
 
   private async setInput(page: import('puppeteer-core').Page, selector: string, value: string) {
