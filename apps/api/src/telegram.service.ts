@@ -317,6 +317,30 @@ export class TelegramService {
     }
   }
 
+  async notifyOwnerDraft(
+    leadId: string,
+    draftId: string,
+    leadTitle: string,
+    content: string,
+  ) {
+    const owner = await this.settings.getPublic<{ id?: number }>('telegram_owner');
+    if (!owner?.id) return { sent: false };
+    await this.db.query(
+      `INSERT INTO owner_agent_sessions(
+         owner_external_id,active_lead_id,pending_draft_id,updated_at
+       ) VALUES($1,$2,$3,now())
+       ON CONFLICT(owner_external_id) DO UPDATE SET
+         active_lead_id=EXCLUDED.active_lead_id,
+         pending_draft_id=EXCLUDED.pending_draft_id,updated_at=now()`,
+      [String(owner.id), leadId, draftId],
+    );
+    await this.sendControlMessage(
+      String(owner.id),
+      `Нужен ваш ответ клиенту «${leadTitle}»:\n\n${content.slice(0, 3000)}\n\nЕсли всё верно, напишите отдельным сообщением «отправь». Если нужно изменить — напишите «подготовь ответ клиенту …».`,
+    );
+    return { sent: true };
+  }
+
   async sendBusinessMessage(chatId: string, content: string) {
     const token = await this.settings.getSecret('telegram_bot_token');
     const connectionId = await this.settings.getSecret('telegram_business_connection_id');

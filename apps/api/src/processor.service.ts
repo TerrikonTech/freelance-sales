@@ -349,6 +349,8 @@ export class ProcessorService implements OnModuleDestroy {
 
     await this.push.notify('Нужен ваш ответ', `${lead.title} · ${decision.reason}`, '/sales/?page=approvals')
       .catch((error) => this.logger.warn(`Push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    await this.telegram.notifyOwnerDraft(leadId, draftId, lead.title, content)
+      .catch((error) => this.logger.warn(`Telegram owner notification skipped: ${error instanceof Error ? error.message : 'unknown'}`));
     return { draftId, decision: decision.decision };
   }
 
