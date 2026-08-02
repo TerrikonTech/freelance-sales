@@ -5,6 +5,17 @@ import { QueueService } from './queue.service';
 import { SalesAgentService } from './sales-agent.service';
 import { SettingsService } from './settings.service';
 
+export function telegramOnDemandOnly(value = process.env.TELEGRAM_ON_DEMAND_ONLY): boolean {
+  return !/^(?:0|false|off|no)$/i.test(String(value || 'true').trim());
+}
+
+export function shouldQueueAutomaticTelegramDraft(
+  live: boolean,
+  value = process.env.TELEGRAM_ON_DEMAND_ONLY,
+): boolean {
+  return live && !telegramOnDemandOnly(value);
+}
+
 @Injectable()
 export class TelegramService {
   constructor(
@@ -125,7 +136,13 @@ export class TelegramService {
         );
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE lead_id=$1 AND status='pending'", [leadId]);
       });
-      await this.queue.add('draft-reply', { leadId, channel: 'telegram', targetExternalId: chatId }, `tg-draft-${inserted.rows[0].id}`);
+      if (shouldQueueAutomaticTelegramDraft(true)) {
+        await this.queue.add(
+          'draft-reply',
+          { leadId, channel: 'telegram', targetExternalId: chatId },
+          `tg-draft-${inserted.rows[0].id}`,
+        );
+      }
     }
   }
 
@@ -207,7 +224,7 @@ export class TelegramService {
             [leadId],
           );
         });
-        if (item.live === true) {
+        if (shouldQueueAutomaticTelegramDraft(item.live === true)) {
           await this.queue.add(
             'draft-reply',
             { leadId, channel: 'telegram', targetExternalId: chatId },
@@ -236,7 +253,7 @@ export class TelegramService {
     if (/^\/(?:start|help)\b/i.test(text)) {
       await this.sendControlMessage(
         chatId,
-        'Пишите обычными словами. Например: «работаем с СОУС», «что он хотел сегодня?», «подготовь ответ, что начну завтра». Клиенту ничего не уйдёт, пока вы отдельно не напишете «отправь».',
+        'Я работаю только по вашей команде. Входящие сообщения сохраняю, но сам ничего не генерирую и не отправляю. Пишите обычными словами: «покажи клиентов», «работаем с СОУС», «что он хотел сегодня?», «подготовь ответ клиенту …». Для отправки нужен отдельный приказ «отправь».',
       );
       return;
     }
@@ -245,6 +262,18 @@ export class TelegramService {
       || /^(?:покажи|список)\s+клиент/i.test(text)
     ) {
       await this.sendControlMessage(chatId, this.formatLeadMatches(await this.agent.recentLeads(12)));
+      return;
+    }
+    if (/^(?:обзор|сводка|что\s+нового|что\s+важного|приоритеты)(?:\s|$)/i.test(text)) {
+      try {
+        const result = await this.agent.answerOwnerOverview(text);
+        await this.sendControlMessage(chatId, result.answer);
+      } catch (error) {
+        await this.sendControlMessage(
+          chatId,
+          error instanceof Error ? error.message : 'Не удалось подготовить обзор',
+        );
+      }
       return;
     }
     const select = text.match(/^(?:работаем\s+с|выбери(?:\s+клиента)?|клиент)\s+(.+)$/i);
@@ -300,10 +329,17 @@ export class TelegramService {
     }
     const lead = await this.agent.ownerLead(ownerId);
     if (!lead) {
-      await this.sendControlMessage(
-        chatId,
-        `Сначала выберите клиента фразой «работаем с …».\n${this.formatLeadMatches(await this.agent.recentLeads(8))}`,
-      );
+      try {
+        const result = await this.agent.answerOwnerOverview(text);
+        await this.sendControlMessage(chatId, result.answer);
+      } catch (error) {
+        await this.sendControlMessage(
+          chatId,
+          error instanceof Error
+            ? error.message
+            : `Сначала выберите клиента фразой «работаем с …».\n${this.formatLeadMatches(await this.agent.recentLeads(8))}`,
+        );
+      }
       return;
     }
     try {
@@ -323,6 +359,9 @@ export class TelegramService {
     leadTitle: string,
     content: string,
   ) {
+    if (telegramOnDemandOnly()) {
+      return { sent: false, reason: 'on_demand_only' };
+    }
     const owner = await this.settings.getPublic<{ id?: number }>('telegram_owner');
     if (!owner?.id) return { sent: false };
     await this.db.query(

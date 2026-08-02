@@ -33,6 +33,10 @@ const DEFAULT_POLICY: AutonomyPolicyConfig = {
   minAutoConfidence: 0.92,
 };
 
+export function strictApprovalEnabled(value = process.env.STRICT_APPROVAL): boolean {
+  return !/^(?:0|false|off|no)$/i.test(String(value || 'true').trim());
+}
+
 const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLowerCase();
 
 const matches = (text: string, patterns: RegExp[]) => patterns.some((pattern) => pattern.test(text));
@@ -210,12 +214,14 @@ export class AutonomyService {
 
   async getPolicy(): Promise<AutonomyPolicyConfig> {
     const stored = await this.settings.getPublic<Partial<AutonomyPolicyConfig>>('autonomy_policy');
-    return this.normalizePolicy(stored);
+    const policy = this.normalizePolicy(stored);
+    return strictApprovalEnabled() ? { ...policy, mode: 'manual' } : policy;
   }
 
   async setPolicy(input: Partial<AutonomyPolicyConfig>): Promise<AutonomyPolicyConfig> {
     const current = await this.getPolicy();
     const policy = this.normalizePolicy({ ...current, ...input });
+    if (strictApprovalEnabled()) policy.mode = 'manual';
     await this.settings.setPublic('autonomy_policy', policy);
     return policy;
   }

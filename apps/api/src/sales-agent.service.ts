@@ -113,9 +113,22 @@ export class SalesAgentService {
 
   async answerOwner(leadId: string, question: string) {
     const lead = await this.lead(leadId);
-    const [messages, requirements] = await Promise.all([
-      this.messages(leadId, 300),
+    const [messages, requirements, dealState, documents, activities, seller, pricingPolicy] = await Promise.all([
+      this.messages(leadId, 500),
       this.requirements(leadId),
+      this.state(leadId),
+      this.db.query(
+        `SELECT kind,version,metadata,created_at FROM documents
+         WHERE lead_id=$1 ORDER BY created_at DESC LIMIT 30`,
+        [leadId],
+      ),
+      this.db.query(
+        `SELECT actor,action,details,created_at FROM activities
+         WHERE lead_id=$1 ORDER BY created_at DESC LIMIT 100`,
+        [leadId],
+      ),
+      this.settings.getPublic<Record<string, unknown>>('seller_profile'),
+      this.settings.getPublic<Record<string, unknown>>('pricing_policy'),
     ]);
     return this.tasks.run<{ answer: string; evidence_message_ids: string[] }>(
       'owner_query',
@@ -124,8 +137,48 @@ export class SalesAgentService {
         lead: this.publicLeadContext(lead),
         messages,
         structured_requirements: requirements,
+        deal_state: dealState,
+        documents: documents.rows,
+        activities: activities.rows,
+        seller_profile: seller || {},
+        pricing_policy: pricingPolicy || {},
       },
-      3 * 60_000,
+      4 * 60_000,
+    );
+  }
+
+  async answerOwnerOverview(question: string) {
+    const [leads, seller, pricingPolicy] = await Promise.all([
+      this.db.query(
+        `SELECT l.id,l.title,l.source,l.status,l.pipeline_stage,l.score,l.confidence,
+                l.recommended_price,l.recommended_days,l.conversation_summary,l.next_action,
+                l.discovery_readiness,l.build_readiness,l.updated_at,
+                (SELECT json_build_object(
+                   'direction',m.direction,'content',left(m.content,1200),'created_at',m.created_at
+                 ) FROM messages m WHERE m.lead_id=l.id ORDER BY m.created_at DESC LIMIT 1) AS latest_message
+         FROM leads l
+         WHERE l.status<>'archived'
+         ORDER BY COALESCE(
+           (SELECT max(m.created_at) FROM messages m WHERE m.lead_id=l.id),
+           l.updated_at
+         ) DESC LIMIT 30`,
+      ),
+      this.settings.getPublic<Record<string, unknown>>('seller_profile'),
+      this.settings.getPublic<Record<string, unknown>>('pricing_policy'),
+    ]);
+    return this.tasks.run<{ answer: string; evidence_lead_ids: string[] }>(
+      'owner_overview',
+      {
+        question: question.trim().slice(0, 4_000),
+        active_leads: leads.rows,
+        seller_profile: seller || {},
+        pricing_policy: pricingPolicy || {},
+        policy: {
+          on_demand_only: true,
+          never_send_without_separate_owner_command: true,
+        },
+      },
+      4 * 60_000,
     );
   }
 
