@@ -5,8 +5,8 @@ import {
   DEFAULT_PRESENCE_PROFILE,
   followupDueAt,
   normalizePresenceProfile,
+  presenceAwareReplyDelaySeconds,
   PresenceProfile,
-  replyDelaySeconds,
 } from './research-controls';
 
 type DueFollowup = {
@@ -40,7 +40,7 @@ export class ResearchService {
   }
 
   async autoReplyDelayMs(characters: number, seed: string): Promise<number> {
-    return replyDelaySeconds(characters, seed, await this.presenceProfile()) * 1_000;
+    return presenceAwareReplyDelaySeconds(characters, seed, new Date(), await this.presenceProfile()) * 1_000;
   }
 
   async scheduleAfterOutbound(draftId: string): Promise<number> {
@@ -105,6 +105,8 @@ export class ResearchService {
          SELECT f.id FROM followup_schedule f
          JOIN leads l ON l.id=f.lead_id
          WHERE f.status='pending' AND f.due_at<=now() AND l.source<>'sandbox'
+           AND l.pipeline_stage IN ('contacted','discovery','proposal','negotiation','telegram_handoff','contract')
+           AND l.status NOT IN ('won','lost','rejected')
          ORDER BY f.due_at LIMIT 1 FOR UPDATE OF f SKIP LOCKED
        ), claimed AS (
          UPDATE followup_schedule f SET status='drafting',updated_at=now()

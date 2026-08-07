@@ -586,7 +586,33 @@ export class ProcessorService implements OnModuleDestroy {
       await this.telegram.notifyOwnerSystem(message, '/sales/?page=settings')
         .catch((error) => this.logger.warn(`Watchdog Telegram notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
     }
-    return { failed: failed.rows.length };
+    const unhealthy = await this.db.query<{ connector: string; status_text: string | null }>(
+      `SELECT connector,status_text FROM connector_state
+       WHERE NOT healthy ORDER BY connector`,
+    );
+    let connectorAlerts = 0;
+    for (const connector of unhealthy.rows) {
+      const fingerprint = createHash('sha256')
+        .update(`${connector.connector}:${connector.status_text || 'unhealthy'}`)
+        .digest('hex');
+      const inserted = await this.db.query(
+        `INSERT INTO activities(actor,action,details)
+         SELECT 'watchdog','connector_health_alert',$1
+         WHERE NOT EXISTS (
+           SELECT 1 FROM activities WHERE action='connector_health_alert'
+             AND details->>'fingerprint'=$2 AND created_at>=now()-interval '1 hour'
+         ) RETURNING id`,
+        [JSON.stringify({ connector: connector.connector, status: connector.status_text, fingerprint }), fingerprint],
+      );
+      if (!inserted.rows[0]) continue;
+      connectorAlerts += 1;
+      const message = `Коннектор ${connector.connector} требует внимания: ${String(connector.status_text || 'нет подтверждения здоровья').slice(0, 240)}`;
+      await this.push.notify('Freelance Sales: коннектор недоступен', message, '/sales/?page=settings')
+        .catch((error) => this.logger.warn(`Connector push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+      await this.telegram.notifyOwnerSystem(message, '/sales/?page=settings')
+        .catch((error) => this.logger.warn(`Connector Telegram notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    }
+    return { failed: failed.rows.length, connectorAlerts };
   }
 
   private async generateDocuments(leadId: string) {

@@ -127,6 +127,20 @@ describe('smart autonomy fail-closed policy', () => {
     expect(result.signals).toContain('initial_response');
   });
 
+  test('never lets an active mission bypass FL manual review', () => {
+    const result = evaluateAutonomy(
+      {
+        inbound: 'Как вы обычно работаете?',
+        outbound: 'Сначала уточняю вводные.',
+        mode: 'chat',
+        channel: 'fl',
+        mission: { instruction: 'общайся сам', turnsLeft: 3, expired: false, exhausted: false },
+      },
+      smart,
+    );
+    expect(result).toMatchObject({ decision: 'ask_owner', signals: ['platform_manual_review'] });
+  });
+
   test('respects a stricter confidence threshold', () => {
     const result = evaluateAutonomy(
       { inbound: 'Какой у вас процесс работы?', outbound: 'Сначала уточняю вводные.', mode: 'chat' },

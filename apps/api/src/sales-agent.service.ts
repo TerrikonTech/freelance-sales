@@ -181,6 +181,9 @@ export class SalesAgentService {
       priorAgentReplies: priorTurns.rows.map((item) => item.reply),
       previousConversationStage: String(priorTurns.rows[0]?.decision?.conversationStage || '') || null,
     });
+    if (chatPolicy.stopReasons.includes('negative_tone')) {
+      await this.recordLatestNegativeReaction(leadId);
+    }
 
     const taskPayload = {
       lead: this.publicLeadContext(lead),
@@ -1155,6 +1158,18 @@ export class SalesAgentService {
         : stopReasons.slice(0, 12),
       requirements,
     };
+  }
+
+  private async recordLatestNegativeReaction(leadId: string) {
+    const result = await this.db.query<{ draft_id: string }>(
+      `SELECT d.id AS draft_id FROM messages m
+       JOIN drafts d ON d.id::text=m.metadata->>'draft_id'
+       WHERE m.lead_id=$1 AND m.direction='outbound'
+       ORDER BY m.created_at DESC LIMIT 1`,
+      [leadId],
+    );
+    const draftId = result.rows[0]?.draft_id;
+    if (draftId) await this.autonomy.recordOwnerFeedback(draftId, 'negative');
   }
 
   private stage(value: string): PipelineStage {
