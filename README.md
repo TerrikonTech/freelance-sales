@@ -96,7 +96,8 @@ sudo ./deploy.sh
 
 1. создаёт `.env` с уникальными секретами, если его ещё нет;
 2. собирает и запускает API, PWA, PostgreSQL, Redis и FL-воркер;
-3. выбирает и запускает ровно один host-side AI-брокер;
+3. выбирает и запускает ровно один AI-брокер: изолированный Compose Hermes или
+   host-side Codex fallback;
 4. проверяет готовность API.
 
 По умолчанию `SALES_AI_BROKER=auto`: если локальный Hermes полностью готов
@@ -109,7 +110,8 @@ sudo SALES_AI_BROKER=codex ./deploy.sh
 ```
 
 Оба брокера используют одну очередь `ai_tasks`, поэтому одновременно они не
-запускаются. systemd units дополнительно объявлены конфликтующими.
+запускаются. Перед переключением `deploy.sh` останавливает Compose `ai-broker`
+и оба systemd unit, затем включает только выбранный контур.
 
 Данные, cookies FL.ru и настройки подключений не хранятся в Git. После первого
 запуска откройте `PUBLIC_URL/setup?token=<SETUP_TOKEN>`; оба значения находятся
@@ -123,8 +125,9 @@ sudo CODEX_BIN=/path/to/codex ./deploy.sh
 
 ## Hermes-брокер
 
-`ops/sales_hermes_broker.py` — отдельный host-side worker без сетевого
-listener. Он:
+`ops/sales_hermes_broker.py` — отдельный worker без сетевого listener. В штатном
+развёртывании он работает как Compose-сервис `ai-broker`; тот же файл можно
+запускать на host в диагностическом режиме. Он:
 
 - читает ключ Hermes только из `/etc/codex-mesh/hermes-api-key`;
 - читает `SALES_BROKER_TOKEN` только из root-only
@@ -182,11 +185,13 @@ sudo python3 ops/sales_hermes_broker.py --health-check
 sudo python3 ops/sales_hermes_broker.py --once
 ```
 
-Допустимые настройки находятся только в окружении systemd:
+Допустимые настройки задаются в окружении Compose (значения моделей — через
+`.env`, секреты — только через root-only mounted files):
 `SALES_HERMES_REQUEST_TIMEOUT_SECONDS` (1–60),
 `SALES_HERMES_RUN_TIMEOUT_SECONDS` (60–1100),
 `SALES_HERMES_POLL_INTERVAL_SECONDS` (0.5–15) и необязательный
-`SALES_HERMES_MODEL`. Пути к Telegram token и channel directory можно
+`SALES_HERMES_MODEL`. Для маршрутизации также поддерживаются
+`SALES_HERMES_MODEL_FAST` и `SALES_HERMES_MODEL_SMART`. Пути к Telegram token и channel directory можно
 переопределить через `SALES_HERMES_TELEGRAM_TOKEN_FILE` и
 `SALES_HERMES_CHANNEL_DIRECTORY`. Секреты через `Environment=` не передаются.
 

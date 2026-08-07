@@ -268,6 +268,10 @@ export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: Autonom
   const safeSignals = SAFE_CHAT_PATTERNS
     .filter((rule) => matches(inbound, rule.patterns))
     .map((rule) => rule.signal);
+  // A scheduled follow-up is classified by the scheduler rather than by the
+  // client's last message. It may reach auto_send only after every hard gate
+  // above and the measured class gate in AutonomyService.evaluate.
+  if (input.automationClass === 'followup') safeSignals.push('followup');
   const confidence = safeSignals.length ? 0.95 : 0.55;
   if (safeSignals.length && confidence >= policy.minAutoConfidence) {
     return {

@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DOCKER_CONFIG="${DOCKER_CONFIG:-${PROJECT_ROOT}/.docker-config}"
+COMPOSE_BAKE="${COMPOSE_BAKE:-false}"
+export DOCKER_CONFIG COMPOSE_BAKE
 CODEX_SERVICE_NAME="sales-codex-broker.service"
 HERMES_SERVICE_NAME="sales-hermes-broker.service"
 BROKER_ENV_FILE="/etc/freelance-sales-broker.env"
@@ -116,6 +119,18 @@ install_codex_broker_service() {
   systemctl enable --now "${CODEX_SERVICE_NAME}"
 }
 
+use_compose_hermes_broker() {
+  prepare_hermes_directories || return 1
+  systemctl disable --now "${CODEX_SERVICE_NAME}" 2>/dev/null || true
+  systemctl disable --now "${HERMES_SERVICE_NAME}" 2>/dev/null || true
+  compose up -d ai-broker
+  compose exec -T ai-broker \
+    python3 /project/ops/sales_hermes_broker.py --health-check >/dev/null || {
+      compose stop ai-broker
+      return 1
+    }
+}
+
 prepare_hermes_directories() {
   if [[ ! -f "${HERMES_KEY_FILE}" ]]; then
     echo "Hermes API key не настроен: ${HERMES_KEY_FILE}" >&2
@@ -167,18 +182,20 @@ install_hermes_broker_service() {
 install_broker_service() {
   case "${BROKER_MODE}" in
     hermes)
-      install_hermes_broker_service
+      use_compose_hermes_broker
       ;;
     codex)
+      compose stop ai-broker 2>/dev/null || true
       install_codex_broker_service
       ;;
     auto)
       if [[ -f "${HERMES_KEY_FILE}" ]] \
         && systemctl is-active --quiet codex-mesh-hermes.service \
-        && install_hermes_broker_service; then
-        echo "AI-брокер: Hermes."
+        && use_compose_hermes_broker; then
+        echo "AI-брокер: Hermes в изолированном Compose-сервисе."
       else
-        echo "Hermes не готов; используется существующий Codex-брокер." >&2
+        compose stop ai-broker 2>/dev/null || true
+        echo "Hermes не готов; используется host-side Codex-брокер." >&2
         install_codex_broker_service
       fi
       ;;
@@ -213,11 +230,17 @@ case "${COMMAND}" in
     require_command docker
     require_command python3
     require_command curl
+    install -d -m 0700 "${DOCKER_CONFIG}"
     docker compose version >/dev/null
     create_env_if_missing
     ensure_broker_token
     ensure_owner_token
-    compose up -d --build
+    # Stop both possible consumers before the application rollout. This keeps
+    # the shared ai_tasks queue single-consumer even across mode switches.
+    systemctl disable --now "${HERMES_SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable --now "${CODEX_SERVICE_NAME}" 2>/dev/null || true
+    compose stop ai-broker 2>/dev/null || true
+    compose up -d --build postgres redis api worker router-loader telegram-sync
     wait_for_api
     install_broker_service
     echo "Freelance Sales запущен."

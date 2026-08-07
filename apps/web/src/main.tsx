@@ -263,7 +263,7 @@ function ResearchDashboard({ data }: { data: any }) {
   const evalTotal = numberOf(evals.total);
   const evalRate = evalTotal > 0 ? Math.round((numberOf(evals.passed) / evalTotal) * 100) : 100;
   return <section className="researchDashboard">
-    <div className="researchHead"><div><span className="eyebrow">Контур доказуемой автономности</span><h2>Воронка, follow-up и качество агента</h2><p>Автоматические классы открываются только после нужного числа одобрений без правок. FL.ru всегда остаётся ручным.</p></div><span className="researchSafety">L3 · безопасная лестница</span></div>
+    <div className="researchHead"><div><span className="eyebrow">Контур доказуемой автономности</span><h2>Воронка, follow-up и качество агента</h2><p>Автоматические классы открываются только после нужного числа одобрений без правок. FL.ru всегда остаётся ручным.</p></div><span className="researchSafety">L1–L2 · сбор доказательств для L3</span></div>
     <div className="researchMetrics">
       <article><small>Отклики отправлены</small><b>{proposals}</b><span>Reply rate: {replyRate}%</span></article>
       <article><small>Ответили / диалог</small><b>{replied} / {funnel.engaged || 0}</b><span>Discovery: {funnel.discovery_complete || 0}</span></article>
@@ -279,7 +279,7 @@ function ResearchDashboard({ data }: { data: any }) {
       <article className="researchClasses"><b>Классы Telegram</b>{(data.autonomyClasses || []).length
         ? data.autonomyClasses.map((item: any) => <div key={item.class}><span><i className={item.auto_enabled ? 'on' : ''} />{item.class}</span><strong>{item.approved_asis}/{item.shown}</strong><small>{item.auto_enabled ? 'авто открыт' : 'ручной сбор доказательств'}</small></div>)
         : <p>Статистика начнёт заполняться с новых черновиков. До порогов всё остаётся ручным.</p>}</article>
-      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
+      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются в безопасных автоответах</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
     </div>
   </section>;
 }

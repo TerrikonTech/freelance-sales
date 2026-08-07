@@ -115,11 +115,11 @@ export class ResearchService {
        )
        SELECT c.id,c.lead_id,c.touch_no,c.channel,c.basis_message_id,
               l.title,l.source,l.client,
-              COALESCE(
-                NULLIF(l.client->>'telegram_chat_id',''),
-                NULLIF(l.client->>'fl_dialog_id',''),
-                lc.external_id
-              ) AS target_external_id
+              CASE c.channel
+                WHEN 'telegram' THEN COALESCE(NULLIF(l.client->>'telegram_chat_id',''),lc.external_id)
+                WHEN 'fl' THEN COALESCE(NULLIF(l.client->>'fl_dialog_id',''),lc.external_id)
+                ELSE lc.external_id
+              END AS target_external_id
        FROM claimed c JOIN leads l ON l.id=c.lead_id
        LEFT JOIN LATERAL (
          SELECT external_id FROM lead_channels
