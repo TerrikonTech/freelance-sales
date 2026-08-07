@@ -443,6 +443,26 @@ CREATE TABLE IF NOT EXISTS followup_schedule (
 CREATE INDEX IF NOT EXISTS followup_schedule_due_idx
   ON followup_schedule(status,due_at) WHERE status='pending';
 
+-- Cancel the complete initiative series as soon as any ingestion path records
+-- a client reply. The worker repeats this check before drafting as defence in
+-- depth, but the trigger keeps dashboard state accurate immediately.
+CREATE OR REPLACE FUNCTION cancel_followups_after_inbound_message()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.direction='inbound' THEN
+    UPDATE followup_schedule
+       SET status='cancelled',cancel_reason='client_replied',updated_at=now()
+     WHERE lead_id=NEW.lead_id
+       AND status IN ('pending','drafting','drafted','approved');
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS messages_cancel_followups_after_inbound ON messages;
+CREATE TRIGGER messages_cancel_followups_after_inbound
+AFTER INSERT ON messages
+FOR EACH ROW EXECUTE FUNCTION cancel_followups_after_inbound_message();
+
 -- Every shown/edited/approved/rejected draft is evidence.  The aggregate table
 -- is the progressive-autonomy gate; the per-draft ledger prevents double count.
 CREATE TABLE IF NOT EXISTS autonomy_class_stats (

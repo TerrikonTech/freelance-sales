@@ -141,6 +141,21 @@ describe('smart autonomy fail-closed policy', () => {
     expect(result).toMatchObject({ decision: 'ask_owner', signals: ['platform_manual_review'] });
   });
 
+  test('recognizes a scheduled follow-up as a gated safe class', () => {
+    const result = evaluateAutonomy(
+      {
+        inbound: 'Предыдущий контекст сделки',
+        outbound: 'Есть полезная деталь по вашему вопросу. Продолжим?',
+        mode: 'chat',
+        channel: 'telegram',
+        automationClass: 'followup',
+      },
+      smart,
+    );
+    expect(result).toMatchObject({ decision: 'auto_send', confidence: 0.95 });
+    expect(result.signals).toContain('followup');
+  });
+
   test('respects a stricter confidence threshold', () => {
     const result = evaluateAutonomy(
       { inbound: 'Какой у вас процесс работы?', outbound: 'Сначала уточняю вводные.', mode: 'chat' },
