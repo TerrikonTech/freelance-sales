@@ -32,10 +32,12 @@ export class CodexTaskService {
        WHERE id=(
          SELECT id FROM ai_tasks WHERE status='pending'
          ORDER BY CASE kind
-           WHEN 'draft_review' THEN 0
-           WHEN 'draft_candidates' THEN 1
-           WHEN 'draft_reply' THEN 2
-           ELSE 3
+           WHEN 'owner_query' THEN 0
+           WHEN 'owner_overview' THEN 0
+           WHEN 'draft_review' THEN 1
+           WHEN 'draft_candidates' THEN 2
+           WHEN 'draft_reply' THEN 3
+           ELSE 4
          END, created_at
          FOR UPDATE SKIP LOCKED LIMIT 1
        )

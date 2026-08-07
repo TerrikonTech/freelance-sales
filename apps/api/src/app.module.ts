@@ -12,6 +12,7 @@ import { CryptoService } from './crypto.service';
 import { CodexInternalController } from './codex-internal.controller';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
+import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { InternalOwnerController } from './internal-owner.controller';
@@ -21,6 +22,7 @@ import { PushController } from './push.controller';
 import { PushService } from './push.service';
 import { QueueService } from './queue.service';
 import { SalesAgentService } from './sales-agent.service';
+import { SandboxService } from './sandbox.service';
 import { SettingsService } from './settings.service';
 import { TelegramController } from './telegram.controller';
 import { TelegramInternalController } from './telegram-internal.controller';
@@ -32,6 +34,6 @@ import { TelegramService } from './telegram.service';
     JwtModule.register({ global: true, secret: process.env.JWT_SECRET, signOptions: { expiresIn: '7d', issuer: 'freelance-sales-v2' } }),
   ],
   controllers: [AuthController, AppController, TelegramController, TelegramInternalController, CodexInternalController, InternalOwnerController, PushController, AutonomyController],
-  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, SalesAgentService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, AutonomyService, ProcessorService],
+  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, DesignConceptService, SalesAgentService, SandboxService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, AutonomyService, ProcessorService],
 })
 export class AppModule {}

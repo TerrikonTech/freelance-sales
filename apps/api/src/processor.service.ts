@@ -5,10 +5,12 @@ import { createHash } from 'node:crypto';
 import { AiService } from './ai.service';
 import { AutonomyService } from './autonomy.service';
 import { DatabaseService } from './database.service';
+import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { QueueService } from './queue.service';
 import { SalesAgentService } from './sales-agent.service';
+import { isSandboxLead } from './sandbox';
 import { PushService } from './push.service';
 import { TelegramService } from './telegram.service';
 import { isDeliveryUnknown, OutboundPreflightError } from './outbound-errors';
@@ -17,12 +19,15 @@ import { isDeliveryUnknown, OutboundPreflightError } from './outbound-errors';
 export class ProcessorService implements OnModuleDestroy {
   private readonly logger = new Logger(ProcessorService.name);
   private worker?: Worker;
-  private timer?: NodeJS.Timeout;
+  private scanTimer?: NodeJS.Timeout;
+  private chatTimer?: NodeJS.Timeout;
+  private announceTimer?: NodeJS.Timeout;
   private connection?: IORedis;
 
   constructor(
     private readonly db: DatabaseService,
     private readonly ai: AiService,
+    private readonly design: DesignConceptService,
     private readonly docs: DocumentsService,
     private readonly fl: FlService,
     private readonly telegram: TelegramService,
@@ -43,17 +48,68 @@ export class ProcessorService implements OnModuleDestroy {
       maxStalledCount: 1,
     });
     this.worker.on('failed', (job, error) => this.logger.error(`Job ${job?.name || 'unknown'} failed: ${error.message}`));
-    const interval = Math.max(60, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 120)) * 1_000;
-    const schedule = async () => {
-      const bucket = Math.floor(Date.now() / interval);
-      await Promise.all([
-        this.queue.add('scan-fl', {}, `scan-${bucket}`),
-        this.queue.add('sync-fl-chats', {}, `sync-fl-chats-${bucket}`),
-      ]).catch((error) => this.logger.warn(error.message));
+    const scanInterval = Math.max(60, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 120)) * 1_000;
+    const chatInterval = Math.max(60, Number(process.env.FL_CHAT_SCAN_INTERVAL_SECONDS || 300)) * 1_000;
+    const scheduleScan = async () => {
+      const bucket = Math.floor(Date.now() / scanInterval);
+      await this.queue.add('scan-fl', {}, `scan-${bucket}`).catch((error) => this.logger.warn(error.message));
     };
-    this.timer = setInterval(schedule, interval);
-    await schedule();
+    const scheduleChats = async () => {
+      const bucket = Math.floor(Date.now() / chatInterval);
+      await this.queue.add('sync-fl-chats', {}, `sync-fl-chats-${bucket}`).catch((error) => this.logger.warn(error.message));
+    };
+    this.scanTimer = setInterval(scheduleScan, scanInterval);
+    this.chatTimer = setInterval(scheduleChats, chatInterval);
+    await Promise.all([scheduleScan(), scheduleChats()]);
+    // The owner's own session finishes handed-off sends, so nothing in this process
+    // ever learns the outcome. Poll fast and keep the promise the bot already made.
+    this.announceTimer = setInterval(
+      () => this.announceHandedOffDeliveries().catch((error) => this.logger.warn(
+        `Handed-off delivery announcement skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+      )),
+      15_000,
+    );
     this.logger.log('Worker started');
+  }
+
+  /**
+   * Deliveries the bot could not make itself are completed by the owner's Telegram session.
+   * That path updates the database directly, so without this the owner is told
+   * "I will report back" and then never hears the outcome.
+   */
+  private async announceHandedOffDeliveries() {
+    const claimed = await this.db.query<{
+      id: string;
+      channel: string;
+      status: string;
+      error: string | null;
+      lead_title: string;
+    }>(
+      `UPDATE outbound_deliveries SET error = coalesce(error,'') || ' [userbot] announced',
+         updated_at = now()
+       WHERE id IN (
+         SELECT id FROM outbound_deliveries
+         WHERE error LIKE '%[userbot] delivered%' OR error LIKE '%[userbot] outbox %'
+         ORDER BY updated_at LIMIT 10
+       )
+       AND error NOT LIKE '%[userbot] announced%'
+       RETURNING id, channel, status, error,
+         (SELECT COALESCE(l.client->>'name', l.title, 'клиент')
+            FROM leads l WHERE l.id = outbound_deliveries.lead_id) AS lead_title`,
+    );
+    for (const row of claimed.rows) {
+      const delivered = /\[userbot\] delivered/i.test(String(row.error || ''));
+      await this.telegram.notifyOwnerDeliveryResult({
+        status: delivered ? 'sent' : 'failed',
+        leadTitle: row.lead_title,
+        channel: row.channel,
+        error: delivered
+          ? row.error
+          : `отправка с вашего аккаунта не прошла: ${String(row.error || '').slice(-200)}`,
+      });
+      this.logger.log(`Reported handed-off delivery ${row.id} as ${delivered ? 'sent' : 'failed'}`);
+    }
+    return claimed.rows.length;
   }
 
   private async recoverAmbiguousDeliveries() {
@@ -92,7 +148,15 @@ export class ProcessorService implements OnModuleDestroy {
   async process(job: Job) {
     switch (job.name) {
       case 'scan-fl': return this.fl.scan();
-      case 'sync-fl-chats': return this.fl.syncChats();
+      case 'sync-fl-chats': {
+        const result = await this.fl.syncChats();
+        for (const alert of result.alerts || []) {
+          await this.telegram.notifyOwnerFlMessage(alert).catch((error) => this.logger.warn(
+            `Telegram FL message notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+          ));
+        }
+        return result;
+      }
       case 'owner-command': return this.telegram.processOwnerMessage(job.data.message || {});
       case 'analyze-lead': return this.analyze(String(job.data.leadId), Boolean(job.data.force));
       case 'draft-reply': return this.draft(
@@ -104,8 +168,58 @@ export class ProcessorService implements OnModuleDestroy {
         Boolean(job.data.ownerRequested),
       );
       case 'generate-documents': return this.generateDocuments(String(job.data.leadId));
+      case 'generate-design': return this.generateDesign(job);
       case 'send-draft': return this.sendDraft(String(job.data.draftId));
       default: throw new Error(`Unknown job ${job.name}`);
+    }
+  }
+
+  private async generateDesign(job: Job) {
+    const leadId = String(job.data.leadId || '');
+    const ownerExternalId = String(job.data.ownerExternalId || '');
+    const lead = (await this.db.query<{ title: string; source: string; client: unknown }>('SELECT title,source,client FROM leads WHERE id=$1', [leadId])).rows[0];
+    const sandbox = isSandboxLead(lead);
+    if (!lead || (!ownerExternalId && !sandbox)) return { failed: true, error: 'Клиент или владелец не найден' };
+    try {
+      const result = await this.design.generate(
+        leadId,
+        String(job.data.instructions || ''),
+        job.data.referenceUrl ? String(job.data.referenceUrl) : null,
+        Number(job.data.count || 4),
+      );
+      if (sandbox) {
+        await this.db.query(
+          "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'sandbox','sandbox_design_ready',$2)",
+          [leadId, JSON.stringify({ assets: result.assets.length, externalNotificationBlocked: true })],
+        );
+        return { ok: true, sandbox: true, assets: result.assets.length };
+      }
+      const prepared = await this.salesAgent.prepareDesignOutbound(ownerExternalId, leadId, result);
+      await this.telegram.notifyOwnerDesignReady({
+        ownerExternalId,
+        leadTitle: prepared.leadTitle,
+        content: prepared.content,
+        previewUrls: prepared.previewUrls,
+        visualDirection: prepared.visualDirection,
+      });
+      await this.db.query(
+        "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'ai','design_concept_ready',$2)",
+        [leadId, JSON.stringify({ draftId: prepared.draftId, assets: result.assets.length })],
+      );
+      return { ok: true, draftId: prepared.draftId, assets: result.assets.length };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      if (!sandbox) {
+        await this.telegram.notifyOwnerDesignFailure(ownerExternalId, lead.title, message)
+          .catch((notifyError) => this.logger.warn(
+            `Design failure notification skipped: ${notifyError instanceof Error ? notifyError.message : 'unknown'}`,
+          ));
+      }
+      await this.db.query(
+        "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'system','design_concept_failed',$2)",
+        [leadId, JSON.stringify({ error: message.slice(0, 1_000), automaticRetry: false })],
+      );
+      return { failed: true, error: message };
     }
   }
 
@@ -170,12 +284,26 @@ export class ProcessorService implements OnModuleDestroy {
         [leadId, localAnalysis ? 'system' : 'ai', JSON.stringify({ score: analysis.score, mode: analysisMode })],
       );
       if (shouldRespond && lead.source === 'fl') {
-        await this.queue.add('draft-reply', { leadId, channel: 'fl', targetExternalId: lead.external_id }, `initial-draft-${leadId}-${Date.now()}`);
+        // The owner decides which orders are worth a reply: scoring is cheap, drafting is not.
+        // AUTO_DRAFT_FL=true restores the old behaviour of drafting every qualified lead.
+        if (/^(?:1|true|on|yes)$/i.test(String(process.env.AUTO_DRAFT_FL || 'false').trim())) {
+          await this.queue.add('draft-reply', { leadId, channel: 'fl', targetExternalId: lead.external_id }, `initial-draft-${leadId}-${Date.now()}`);
+        }
         await this.push.notify(
           'Подходящий заказ на FL.ru',
           `${lead.title} · ${analysis.score}/100 · ${analysis.recommended_price.toLocaleString('ru-RU')} ₽`,
           `/sales/?lead=${leadId}`,
         ).catch((error) => this.logger.warn(`Push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+        await this.telegram.notifyOwnerQualifiedLead({
+          leadId,
+          title: lead.title,
+          score: analysis.score,
+          price: analysis.recommended_price,
+          days: analysis.recommended_days,
+          fitReason: analysis.fit_reason,
+        }).catch((error) => this.logger.warn(
+          `Telegram qualified lead notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+        ));
       }
       return { score: analysis.score, mode: analysisMode, gptCalls: localAnalysis ? 0 : 1 };
     } catch (error) {
@@ -199,11 +327,17 @@ export class ProcessorService implements OnModuleDestroy {
     const lead = leadResult.rows[0];
     if (!lead) return;
     const initialFlResponse = channel === 'fl' && !requestedMode && !lead.client?.fl_dialog_id;
-    if (initialFlResponse && lead.status !== 'qualified') {
+    if (initialFlResponse && lead.status !== 'qualified' && !ownerRequested) {
       this.logger.log(`Skipping initial FL draft for non-qualified lead ${leadId}`);
       return;
     }
     const mode = requestedMode || (lead.client?.fl_dialog_id ? 'chat' : 'response');
+    // A live mission both steers the wording ("reply in Elvish") and unlocks autonomy
+    // for this one lead.  Owner instructions typed right now still win over it.
+    const mission = await this.autonomy.missionRuntime(leadId);
+    const missionUsable = Boolean(mission && !mission.expired && !mission.exhausted);
+    const effectiveInstructions = ownerInstructions
+      || (missionUsable && mission ? mission.instruction : '');
     const messages = await this.db.query(
       `SELECT * FROM (
          SELECT id,direction,author,content,created_at FROM messages
@@ -211,7 +345,7 @@ export class ProcessorService implements OnModuleDestroy {
        ) recent ORDER BY created_at`,
       [leadId],
     );
-    const agentTurn = mode === 'chat' && !ownerInstructions
+    const agentTurn = mode === 'chat' && !effectiveInstructions
       ? await this.salesAgent.prepareTurn(leadId, channel)
       : null;
     const content = agentTurn?.reply
@@ -219,7 +353,7 @@ export class ProcessorService implements OnModuleDestroy {
         lead,
         messages: messages.rows,
         mode,
-        ownerInstructions: ownerInstructions.slice(0, 4_000),
+        ownerInstructions: effectiveInstructions.slice(0, 4_000),
       });
     const hash = createHash('sha256').update(content).digest('hex');
     const dialogId = channel === 'fl' ? String(lead.client?.fl_dialog_id || targetExternalId || '') : '';
@@ -233,31 +367,39 @@ export class ProcessorService implements OnModuleDestroy {
           agent: agentTurn
             ? {
               stage: agentTurn.stage,
+              conversationStage: agentTurn.conversation_stage,
+              confidence: agentTurn.confidence,
               intent: agentTurn.intent,
               discoveryReadiness: agentTurn.discovery_readiness,
               buildReadiness: agentTurn.build_readiness,
               discoveryComplete: agentTurn.discovery_complete,
               requiresOwner: agentTurn.requires_owner,
+              ownerBrief: agentTurn.owner_brief,
+              replyDeadline: agentTurn.reply_deadline,
               riskFlags: agentTurn.risk_flags,
             }
             : null,
         }
-        : { mode: 'response', strategy: 'buyer-dialogue-v4', projectUrl: lead.url, price: lead.recommended_price, days: lead.recommended_days, priceDisplayedSeparately: true, regenerated: Boolean(ownerInstructions) }
+        : { mode: 'response', strategy: 'proposal-research-v1', projectUrl: lead.url, price: lead.recommended_price, days: lead.recommended_days, priceDisplayedSeparately: true, regenerated: Boolean(ownerInstructions) }
       : {
         mode: 'chat',
         agent: agentTurn
           ? {
             stage: agentTurn.stage,
+            conversationStage: agentTurn.conversation_stage,
+            confidence: agentTurn.confidence,
             intent: agentTurn.intent,
             discoveryReadiness: agentTurn.discovery_readiness,
             buildReadiness: agentTurn.build_readiness,
             discoveryComplete: agentTurn.discovery_complete,
             requiresOwner: agentTurn.requires_owner,
+            ownerBrief: agentTurn.owner_brief,
+            replyDeadline: agentTurn.reply_deadline,
             riskFlags: agentTurn.risk_flags,
           }
           : null,
       };
-    if (initialFlResponse) {
+    if (initialFlResponse && !ownerRequested) {
       const latestStatus = (await this.db.query('SELECT status FROM leads WHERE id=$1', [leadId])).rows[0]?.status;
       if (latestStatus !== 'qualified') {
         this.logger.log(`Discarding initial FL draft after lead ${leadId} was reclassified`);
@@ -304,6 +446,7 @@ export class ProcessorService implements OnModuleDestroy {
       duplicate,
       leadConfidence: typeof lead.confidence === 'number' ? lead.confidence : null,
       runtimeSignals,
+      mission,
     });
     await this.autonomy.recordDecision({
       leadId,
@@ -338,19 +481,22 @@ export class ProcessorService implements OnModuleDestroy {
         [draftId],
       );
       if (approved.rows[0]) {
+        if (decision.signals.includes('mission')) await this.autonomy.consumeMissionTurn(leadId);
         await this.db.query(
           "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'autonomy','draft_auto_approved',$2)",
-          [leadId, JSON.stringify({ draftId, confidence: decision.confidence, reason: decision.reason })],
+          [leadId, JSON.stringify({ draftId, confidence: decision.confidence, reason: decision.reason, mission: decision.signals.includes('mission') })],
         );
         await this.queue.add('send-draft', { draftId }, `auto-send-${draftId}-${hash.slice(0, 16)}`);
       }
       return { draftId, decision: decision.decision };
     }
 
-    await this.push.notify('Нужен ваш ответ', `${lead.title} · ${decision.reason}`, '/sales/?page=approvals')
-      .catch((error) => this.logger.warn(`Push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
-    await this.telegram.notifyOwnerDraft(leadId, draftId, lead.title, content)
-      .catch((error) => this.logger.warn(`Telegram owner notification skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    if (!isSandboxLead(lead)) {
+      await this.push.notify('Нужен ваш ответ', `${lead.title} · ${decision.reason}`, '/sales/?page=approvals')
+        .catch((error) => this.logger.warn(`Push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+      await this.telegram.notifyOwnerDraft(leadId, draftId, lead.title, content)
+        .catch((error) => this.logger.warn(`Telegram owner notification skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    }
     return { draftId, decision: decision.decision };
   }
 
@@ -399,15 +545,35 @@ export class ProcessorService implements OnModuleDestroy {
 
   private async sendDraft(draftId: string) {
     const draft = await this.db.transaction(async (client) => {
-      const result = await client.query('SELECT d.*,l.last_inbound_message_id,l.url,l.recommended_price,l.recommended_days FROM drafts d JOIN leads l ON l.id=d.lead_id WHERE d.id=$1 FOR UPDATE', [draftId]);
+      const result = await client.query('SELECT d.*,l.title AS lead_title,l.source AS lead_source,l.client AS lead_client,l.last_inbound_message_id,l.url,l.recommended_price,l.recommended_days FROM drafts d JOIN leads l ON l.id=d.lead_id WHERE d.id=$1 FOR UPDATE', [draftId]);
       const row = result.rows[0];
       if (!row) throw new Error('Черновик не найден');
       if (row.status !== 'approved') return null;
       const actualHash = createHash('sha256').update(row.content).digest('hex');
-      if (actualHash !== row.content_hash) throw new Error('Текст изменён после одобрения');
+      if (actualHash !== row.content_hash) {
+        const error = 'Текст изменён после одобрения';
+        await client.query("UPDATE drafts SET status='failed',error=$2,updated_at=now() WHERE id=$1", [draftId, error]);
+        return { beforeSendFailure: true, lead_title: row.lead_title, channel: row.channel, error };
+      }
+      const mediaAssetIds = Array.isArray(row.metadata?.mediaAssetIds)
+        ? row.metadata.mediaAssetIds.map(String).slice(0, 10)
+        : [];
+      if (mediaAssetIds.length) {
+        const actualMediaHash = createHash('sha256').update(JSON.stringify(mediaAssetIds)).digest('hex');
+        if (actualMediaHash !== row.metadata?.mediaHash) {
+          const error = 'Состав изображений изменён после одобрения';
+          await client.query("UPDATE drafts SET status='failed',error=$2,updated_at=now() WHERE id=$1", [draftId, error]);
+          return { beforeSendFailure: true, lead_title: row.lead_title, channel: row.channel, error };
+        }
+      }
       if ((row.source_last_message_id || null) !== (row.last_inbound_message_id || null)) {
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE id=$1", [draftId]);
-        return null;
+        return {
+          beforeSendFailure: true,
+          lead_title: row.lead_title,
+          channel: row.channel,
+          error: 'Клиент прислал новое сообщение до отправки; старый черновик отменён',
+        };
       }
       const idempotencyKey = createHash('sha256').update(JSON.stringify([
         'outbound-v1',
@@ -452,6 +618,41 @@ export class ProcessorService implements OnModuleDestroy {
       return { ...row, deliveryId: reserved.rows[0].id, idempotencyKey };
     });
     if (!draft) return;
+    if (draft.beforeSendFailure) {
+      if (!isSandboxLead({ source: draft.lead_source, client: draft.lead_client })) {
+        await this.telegram.notifyOwnerDeliveryResult({
+          status: 'failed',
+          leadTitle: draft.lead_title,
+          channel: draft.channel,
+          error: draft.error,
+        }).catch((error) => this.logger.warn(
+          `Telegram delivery result notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+        ));
+      }
+      return { failed: true, deliveryUnknown: false, error: draft.error };
+    }
+
+    if (isSandboxLead({ source: draft.lead_source, client: draft.lead_client })) {
+      const externalId = `sandbox:${draft.deliveryId}`;
+      await this.db.transaction(async (client) => {
+        await client.query(
+          `UPDATE outbound_deliveries SET status='sent',external_id=$2,error='[sandbox] external write blocked',
+           completed_at=now(),updated_at=now() WHERE id=$1 AND status='sending'`,
+          [draft.deliveryId, externalId],
+        );
+        await client.query("UPDATE drafts SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1", [draftId]);
+        await client.query(
+          `INSERT INTO messages(lead_id,channel,external_id,direction,author,content,metadata)
+           VALUES($1,$2,$3,'outbound','owner',$4,$5) ON CONFLICT(channel,external_id) DO NOTHING`,
+          [draft.lead_id, draft.channel, externalId, draft.content, JSON.stringify({ draft_id: draftId, sandbox: true })],
+        );
+        await client.query(
+          "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'sandbox','sandbox_delivery_captured',$2)",
+          [draft.lead_id, JSON.stringify({ draftId, channel: draft.channel, externalWriteBlocked: true })],
+        );
+      });
+      return { sent: true, sandbox: true };
+    }
 
     // Deliberately kept next to the external write.  A pause is durable and is
     // checked again after the operation has acquired its idempotency slot.
@@ -474,15 +675,32 @@ export class ProcessorService implements OnModuleDestroy {
           [draft.lead_id, JSON.stringify({ draftId, scope: pause.scope, reason: pause.reason })],
         );
       });
+      await this.telegram.notifyOwnerDeliveryResult({
+        status: 'blocked',
+        leadTitle: draft.lead_title,
+        channel: draft.channel,
+        error: pause.reason,
+      }).catch((error) => this.logger.warn(
+        `Telegram delivery result notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+      ));
       return { blocked: true, reason: pause.reason };
     }
 
     try {
       let externalId: string | null = null;
       if (draft.channel === 'telegram') {
-        externalId = (await this.telegram.sendBusinessMessage(draft.target_external_id, draft.content)).externalId;
+        const mediaAssetIds = Array.isArray(draft.metadata?.mediaAssetIds)
+          ? draft.metadata.mediaAssetIds.map(String).slice(0, 10)
+          : [];
+        externalId = mediaAssetIds.length
+          ? (await this.telegram.sendBusinessMediaGroup(
+              draft.target_external_id,
+              draft.content,
+              await this.design.urls(mediaAssetIds),
+            )).externalId
+          : (await this.telegram.sendBusinessMessage(draft.target_external_id, draft.content)).externalId;
       } else if (draft.channel === 'fl') {
-        if (draft.metadata?.mode === 'chat') {
+        if (draft.kind !== 'initial_response' && draft.metadata?.mode !== 'response') {
           await this.fl.sendChatMessage(String(draft.metadata.dialogId || draft.target_external_id), draft.content);
         } else {
           await this.fl.sendResponse({ projectUrl: draft.url, content: draft.content, price: draft.recommended_price, days: draft.recommended_days });
@@ -500,6 +718,13 @@ export class ProcessorService implements OnModuleDestroy {
         await client.query('INSERT INTO messages(lead_id,channel,external_id,direction,author,content,metadata) VALUES($1,$2,$3,\'outbound\',\'owner\',$4,$5) ON CONFLICT(channel,external_id) DO NOTHING', [draft.lead_id, draft.channel, externalId, draft.content, JSON.stringify({ draft_id: draftId })]);
         await client.query("INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'system','draft_sent',$2)", [draft.lead_id, JSON.stringify({ draftId, channel: draft.channel, idempotencyKey: draft.idempotencyKey })]);
       });
+      await this.telegram.notifyOwnerDeliveryResult({
+        status: 'sent',
+        leadTitle: draft.lead_title,
+        channel: draft.channel,
+      }).catch((error) => this.logger.warn(
+        `Telegram delivery result notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+      ));
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
       const deliveryUnknown = isDeliveryUnknown(error);
@@ -545,13 +770,23 @@ export class ProcessorService implements OnModuleDestroy {
         await this.push.notify('Нужна проверка FL.ru', message, '/sales/?page=approvals')
           .catch((pushError) => this.logger.warn(`Push skipped: ${pushError instanceof Error ? pushError.message : 'unknown'}`));
       }
+      await this.telegram.notifyOwnerDeliveryResult({
+        status: deliveryUnknown ? 'send_unknown' : 'failed',
+        leadTitle: draft.lead_title,
+        channel: draft.channel,
+        error: message,
+      }).catch((notifyError) => this.logger.warn(
+        `Telegram delivery result notification skipped: ${notifyError instanceof Error ? notifyError.message : 'unknown'}`,
+      ));
       return { failed: true, deliveryUnknown, error: message };
     }
     return { sent: true };
   }
 
   async onModuleDestroy() {
-    if (this.timer) clearInterval(this.timer);
+    if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.chatTimer) clearInterval(this.chatTimer);
+    if (this.announceTimer) clearInterval(this.announceTimer);
     await this.worker?.close();
     await this.connection?.quit();
   }

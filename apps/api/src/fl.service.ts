@@ -8,6 +8,36 @@ import { QueueService } from './queue.service';
 import { PushService } from './push.service';
 import { SettingsService } from './settings.service';
 
+export type FlProfileIdentity = {
+  name: string | null;
+  username: string | null;
+};
+
+export function flProfileIdentity(
+  href: string | null | undefined,
+  label: string | null | undefined,
+): FlProfileIdentity {
+  let username: string | null = null;
+  try {
+    const url = new URL(String(href || ''), 'https://www.fl.ru');
+    if (url.hostname === 'fl.ru' || url.hostname === 'www.fl.ru') {
+      const match = url.pathname.match(/^\/users\/([^/?#]+)/iu);
+      username = match?.[1] ? decodeURIComponent(match[1]).trim().slice(0, 100) : null;
+    }
+  } catch {
+    username = null;
+  }
+  const cleaned = String(label || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const plausibleName = /^[\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*){0,2}$/u.test(cleaned);
+  const name = username
+    && cleaned
+    && plausibleName
+    && !/^(?:profile|профиль|пользователь|заказчик|клиент)$/iu.test(cleaned)
+      ? cleaned
+      : null;
+  return { name, username };
+}
+
 @Injectable()
 export class FlService {
   private readonly logger = new Logger(FlService.name);
@@ -102,10 +132,18 @@ export class FlService {
           },
         };
         const result = await this.db.query<{ id: string }>(
-          `INSERT INTO leads(source,external_id,title,description,url,budget_text,requirements)
-           VALUES('fl',$1,$2,$3,$4,$5,$6)
+          `INSERT INTO leads(source,external_id,title,description,url,budget_text,requirements,client)
+           VALUES('fl',$1,$2,$3,$4,$5,$6,$7)
            ON CONFLICT(source,external_id) DO NOTHING RETURNING id`,
-          [item.externalId, detail?.title || item.title, detail?.description || item.description, item.url, detail?.budget || item.budget, JSON.stringify(requirements)],
+          [
+            item.externalId,
+            detail?.title || item.title,
+            detail?.description || item.description,
+            item.url,
+            detail?.budget || item.budget,
+            JSON.stringify(requirements),
+            JSON.stringify(detail?.client || {}),
+          ],
         );
         const lead = result.rows[0];
         if (!lead) continue;
@@ -121,7 +159,12 @@ export class FlService {
           [items.length, created, skippedKnown, durationMs],
         ),
         this.db.query(
-          `UPDATE connector_state SET healthy=true,status_text=$1,last_success_at=now(),
+          `UPDATE connector_state SET
+           healthy=NOT (cursor ? 'cookie_auth_alert'),
+           status_text=CASE WHEN cursor ? 'cookie_auth_alert'
+             THEN 'Проекты проверены, но cookies FL.ru недействительны'
+             ELSE $1 END,
+           last_success_at=CASE WHEN cursor ? 'cookie_auth_alert' THEN last_success_at ELSE now() END,
            cursor=cursor || $2::jsonb,updated_at=now() WHERE connector='fl'`,
           [`Проверено ${items.length}, новых ${created} · ${durationMs} мс`, JSON.stringify({
             last_project_id: items[0]?.externalId || null,
@@ -173,8 +216,9 @@ export class FlService {
       };
       await this.db.query(
         `UPDATE leads SET title=$2,description=$3,budget_text=$4,
-         requirements=requirements || jsonb_build_object('project',$5::jsonb),updated_at=now() WHERE id=$1`,
-        [leadId, detail.title, detail.description, detail.budget, JSON.stringify(project)],
+         requirements=requirements || jsonb_build_object('project',$5::jsonb),
+         client=client || $6::jsonb,updated_at=now() WHERE id=$1`,
+        [leadId, detail.title, detail.description, detail.budget, JSON.stringify(project), JSON.stringify(detail.client)],
       );
       return { enriched: true, attachments: files.length, responses: detail.response_count };
     } finally {
@@ -184,23 +228,42 @@ export class FlService {
 
   async syncChats() {
     const state = await this.flState();
-    if (!state.enabled) return { chats: 0, messages: 0, disabled: true };
+    if (!state.enabled) return { chats: 0, messages: 0, drafts: 0, alerts: [], disabled: true };
     const cookiesRaw = await this.settings.getSecret('fl_cookies');
-    if (!cookiesRaw) return { chats: 0, messages: 0, disabled: true, reason: 'FL cookies не настроены' };
+    if (!cookiesRaw) return { chats: 0, messages: 0, drafts: 0, alerts: [], disabled: true, reason: 'FL cookies не настроены' };
     const cookies = JSON.parse(cookiesRaw) as CookieData[];
     await this.checkCookieExpiry(cookies);
     const browser = await this.browser();
     let insertedMessages = 0;
     let queuedDrafts = 0;
+    const alerts: Array<{ leadId: string; title: string; author: string; content: string }> = [];
     try {
       const page = await browser.newPage();
       await page.setCookie(...cookies);
       await page.goto('https://www.fl.ru/messages/', { waitUntil: 'networkidle2', timeout: 40_000 });
       await this.assertSession(page);
-      const chats = await page.evaluate(() => Array.from(document.querySelectorAll('[data-id^="qa-chat-list-item-"]')).map((element) => ({
-        dialogId: (element.getAttribute('data-id') || '').replace('qa-chat-list-item-', ''),
-        title: element.querySelector('[data-id="qa-chat-card-title"]')?.textContent?.trim() || 'Диалог FL.ru',
-      })).filter((chat) => chat.dialogId));
+      // FL renders the chat list after navigation has already become network-idle.
+      // Reading immediately intermittently produced a false, healthy "0 chats" result.
+      await page.waitForSelector('[data-id^="qa-chat-list-item-"]', { timeout: 10_000 }).catch(() => undefined);
+      const rawChats = await page.evaluate(() => Array.from(document.querySelectorAll('[data-id^="qa-chat-list-item-"]')).map((element) => {
+        const profileLink = Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]'))
+          .find((anchor) => /\/users\/[^/?#]+/iu.test(anchor.getAttribute('href') || anchor.href || ''));
+        const profileImage = profileLink?.querySelector('img');
+        return {
+          dialogId: (element.getAttribute('data-id') || '').replace('qa-chat-list-item-', ''),
+          title: element.querySelector('[data-id="qa-chat-card-title"]')?.textContent?.trim() || 'Диалог FL.ru',
+          profileHref: profileLink?.getAttribute('href') || profileLink?.href || null,
+          profileLabel: profileLink?.getAttribute('aria-label')
+            || profileLink?.getAttribute('title')
+            || profileImage?.getAttribute('alt')
+            || profileLink?.textContent?.trim()
+            || null,
+        };
+      }).filter((chat) => chat.dialogId));
+      const chats = rawChats.map((chat) => ({
+        ...chat,
+        identity: flProfileIdentity(chat.profileHref, chat.profileLabel),
+      }));
       const lastFullSync = state.cursor?.last_full_chat_sync_at || state.cursor?.cookie_last_verified_at;
       const lastFullSyncMs = lastFullSync ? Date.parse(lastFullSync) : 0;
       const fullSync = !lastFullSyncMs || Date.now() - lastFullSyncMs >= 6 * 60 * 60 * 1_000;
@@ -212,16 +275,36 @@ export class FlService {
           await chatPage.setCookie(...cookies);
           await chatPage.goto(`https://www.fl.ru/messages/?dialogId=${encodeURIComponent(chat.dialogId)}&dialogType=offer`, { waitUntil: 'networkidle2', timeout: 40_000 });
           await this.assertSession(chatPage);
-          const parsed = await chatPage.evaluate(() => Array.from(document.querySelectorAll('[id^="mes-"]')).map((element) => {
+          await chatPage.waitForSelector('[id^="mes-"]', { timeout: 10_000 }).catch(() => undefined);
+          const rawParsed = await chatPage.evaluate(() => Array.from(document.querySelectorAll('[id^="mes-"]')).map((element) => {
             const messageId = element.getAttribute('id') || '';
             const textElement = element.querySelector('.fl-message-text .text-pre-line, .fl-message-text .d-inline-block, .fl-message-text');
+            const profileLink = Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]'))
+              .find((anchor) => /\/users\/[^/?#]+/iu.test(anchor.getAttribute('href') || anchor.href || ''));
+            const profileImage = profileLink?.querySelector('img');
             return {
               messageId,
               text: textElement?.textContent?.trim() || '',
               owner: Boolean(element.querySelector('.owner')),
+              profileHref: profileLink?.getAttribute('href') || profileLink?.href || null,
+              profileLabel: profileLink?.getAttribute('aria-label')
+                || profileLink?.getAttribute('title')
+                || profileImage?.getAttribute('alt')
+                || profileLink?.textContent?.trim()
+                || null,
             };
           }).filter((message) => message.messageId !== 'mes-end' && message.text));
-          const result = await this.persistChat(chat.dialogId, chat.title, parsed, chatRank);
+          const parsed = rawParsed.map((message) => {
+            const identity = flProfileIdentity(message.profileHref, message.profileLabel);
+            return {
+              messageId: message.messageId,
+              text: message.text,
+              owner: message.owner,
+              author: message.owner ? 'owner' : identity.name || identity.username || 'client',
+              identity,
+            };
+          });
+          const result = await this.persistChat(chat.dialogId, chat.title, parsed, chatRank, chat.identity);
           insertedMessages += result.inserted;
           if (result.lastInboundId && result.lastDirection === 'inbound') {
             await this.push.notify(
@@ -236,6 +319,12 @@ export class FlService {
               mode: 'chat',
             }, `fl-chat-draft-${result.lastInboundId}`);
             queuedDrafts += 1;
+            alerts.push({
+              leadId: result.leadId,
+              title: chat.title,
+              author: result.lastInboundAuthor || 'Заказчик',
+              content: result.lastInboundContent || '',
+            });
           }
         } finally {
           await chatPage.close();
@@ -252,7 +341,7 @@ export class FlService {
         })],
       );
       await this.settings.setConnectorState('fl', { healthy: true, statusText: `Чаты: ${chats.length}, новых сообщений: ${insertedMessages}`, success: true });
-      return { chats: chats.length, messages: insertedMessages, drafts: queuedDrafts };
+      return { chats: chats.length, messages: insertedMessages, drafts: queuedDrafts, alerts };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка FL.ru';
       if (message.includes('Сессия FL.ru недействительна') || message.includes('Cookies FL.ru истекли')) {
@@ -372,7 +461,30 @@ export class FlService {
     }
   }
 
-  private async persistChat(dialogId: string, title: string, parsed: Array<{ messageId: string; text: string; owner: boolean }>, chatRank: number) {
+  private async persistChat(
+    dialogId: string,
+    title: string,
+    parsed: Array<{
+      messageId: string;
+      text: string;
+      owner: boolean;
+      author: string;
+      identity: FlProfileIdentity;
+    }>,
+    chatRank: number,
+    chatIdentity: FlProfileIdentity = { name: null, username: null },
+  ) {
+    const messageIdentity = parsed.find((message) => !message.owner && (message.identity.name || message.identity.username))?.identity;
+    const identity = {
+      name: messageIdentity?.name || chatIdentity.name,
+      username: messageIdentity?.username || chatIdentity.username,
+    };
+    const clientPatch = {
+      fl_dialog_id: dialogId,
+      fl_chat_rank: chatRank,
+      ...(identity.name ? { fl_name: identity.name } : {}),
+      ...(identity.username ? { fl_username: identity.username } : {}),
+    };
     let lead = await this.db.query<{ id: string }>(
       `SELECT id FROM leads WHERE source='fl' AND (client->>'fl_dialog_id'=$1 OR lower(title)=lower($2)) ORDER BY updated_at DESC LIMIT 1`,
       [dialogId, title],
@@ -383,10 +495,10 @@ export class FlService {
          VALUES('fl',$1,$2,'Диалог FL.ru','contacted',$3)
          ON CONFLICT(source,external_id) DO UPDATE SET title=EXCLUDED.title,updated_at=now()
          RETURNING id`,
-        [`dialog:${dialogId}`, title, JSON.stringify({ fl_dialog_id: dialogId, fl_chat_rank: chatRank })],
+        [`dialog:${dialogId}`, title, JSON.stringify(clientPatch)],
       );
     } else {
-      await this.db.query(`UPDATE leads SET client=client || $2::jsonb,updated_at=now() WHERE id=$1`, [lead.rows[0].id, JSON.stringify({ fl_dialog_id: dialogId, fl_chat_rank: chatRank })]);
+      await this.db.query(`UPDATE leads SET client=client || $2::jsonb,updated_at=now() WHERE id=$1`, [lead.rows[0].id, JSON.stringify(clientPatch)]);
     }
     const leadId = lead.rows[0].id;
     await this.db.query(
@@ -398,6 +510,8 @@ export class FlService {
     );
     let inserted = 0;
     let lastInboundId: string | null = null;
+    let lastInboundContent: string | null = null;
+    let lastInboundAuthor: string | null = null;
     let lastDirection: 'inbound' | 'outbound' | null = null;
     for (const message of parsed) {
       const direction = message.owner ? 'outbound' : 'inbound';
@@ -405,13 +519,20 @@ export class FlService {
         `INSERT INTO messages(lead_id,channel,external_id,direction,author,content,metadata)
          VALUES($1,'fl',$2,$3,$4,$5,$6)
          ON CONFLICT(channel,external_id) DO NOTHING RETURNING id`,
-        [leadId, `${dialogId}:${message.messageId}`, direction, message.owner ? 'owner' : 'client', message.text, JSON.stringify({ dialog_id: dialogId })],
+        [leadId, `${dialogId}:${message.messageId}`, direction, message.author, message.text, JSON.stringify({ dialog_id: dialogId })],
       );
       if (!result.rows[0]) continue;
       inserted += 1;
       lastDirection = direction;
-      if (direction === 'inbound') lastInboundId = result.rows[0].id;
-      else lastInboundId = null;
+      if (direction === 'inbound') {
+        lastInboundId = result.rows[0].id;
+        lastInboundContent = message.text;
+        lastInboundAuthor = message.author;
+      } else {
+        lastInboundId = null;
+        lastInboundContent = null;
+        lastInboundAuthor = null;
+      }
     }
     if (lastInboundId && lastDirection === 'inbound') {
       await this.db.transaction(async (client) => {
@@ -426,7 +547,7 @@ export class FlService {
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE lead_id=$1 AND status='pending'", [leadId]);
       });
     }
-    return { leadId, inserted, lastInboundId, lastDirection };
+    return { leadId, inserted, lastInboundId, lastDirection, lastInboundContent, lastInboundAuthor };
   }
 
   private async readProject(browser: Browser, url: string, cookies: CookieData[]) {
@@ -459,6 +580,9 @@ export class FlService {
           ...Array.from(root.querySelectorAll('a[href]')).map((element) => ({ url: (element as HTMLAnchorElement).href, name: clean(element.textContent) })),
           ...Array.from(root.querySelectorAll('img[src]')).map((element) => ({ url: (element as HTMLImageElement).src, name: clean((element as HTMLImageElement).alt) })),
         ]);
+        const profileLink = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
+          .find((anchor) => /\/users\/[^/?#]+\/?(?:[?#].*)?$/iu.test(anchor.getAttribute('href') || anchor.href || ''));
+        const profileImage = profileLink?.querySelector('img');
         return {
           title: clean(document.querySelector('h1')?.textContent),
           description: clean(document.querySelector('.fl-project-content__description-text')?.textContent),
@@ -470,11 +594,18 @@ export class FlService {
           priceMax: pricesMatch?.[2] || '',
           daysMin: daysMatch?.[1] || '',
           daysMax: daysMatch?.[2] || '',
+          profileHref: profileLink?.getAttribute('href') || profileLink?.href || null,
+          profileLabel: profileLink?.getAttribute('aria-label')
+            || profileLink?.getAttribute('title')
+            || profileImage?.getAttribute('alt')
+            || profileLink?.textContent?.trim()
+            || null,
           candidates,
         };
       });
       const number = (value: string) => value ? Number(value.replace(/\s+/g, '')) : null;
       const publishedAt = this.parseFlDate(raw.published);
+      const identity = flProfileIdentity(raw.profileHref, raw.profileLabel);
       const attachmentLinks = raw.candidates.filter((item) => {
         try {
           const candidate = new URL(item.url);
@@ -498,6 +629,10 @@ export class FlService {
         response_days_min: number(raw.daysMin),
         response_days_max: number(raw.daysMax),
         age_minutes_at_parse: publishedAt ? Math.max(0, Math.round((Date.now() - publishedAt.getTime()) / 60_000)) : null,
+        client: {
+          ...(identity.name ? { fl_name: identity.name } : {}),
+          ...(identity.username ? { fl_username: identity.username } : {}),
+        },
         attachment_links: attachmentLinks,
       };
     } finally {
@@ -511,7 +646,11 @@ export class FlService {
       const page = await browser.newPage();
       try {
         await page.setCookie(...cookies);
-        await page.goto('https://www.fl.ru/my_portfolio/', { waitUntil: 'networkidle2', timeout: 40_000 });
+        const portfolioLogin = String((await this.settings.getPublic<{ login?: string }>('fl_account'))?.login
+          || process.env.FL_LOGIN || '').trim();
+        if (!portfolioLogin) throw new Error('Не задан логин FL для синхронизации портфолио');
+        // /my_portfolio/ does not exist on FL.ru and answers 404.
+        await page.goto(`https://www.fl.ru/users/${encodeURIComponent(portfolioLogin)}/portfolio/`, { waitUntil: 'networkidle2', timeout: 40_000 });
         await this.assertSession(page);
         const path = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]'))
           .map((element) => element.getAttribute('href') || '')
@@ -528,7 +667,7 @@ export class FlService {
     if (!response.ok) throw new Error(`FL portfolio HTTP ${response.status}`);
     const $ = cheerio.load(await response.text());
     const urls = $('.portfolio-item__description[href*="/portfolio/"]').map((_, element) => new URL($(element).attr('href') || '', 'https://www.fl.ru').toString()).get();
-    const uniqueUrls = [...new Set(urls)].slice(0, 40);
+    const uniqueUrls = [...new Set(urls)].slice(0, 120); // was 40: the owner has 87 published works
     const cases: Array<{ title: string; description: string; url: string }> = [];
     for (const caseUrl of uniqueUrls) {
       const caseResponse = await fetch(caseUrl, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' }, signal: AbortSignal.timeout(25_000) });

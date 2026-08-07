@@ -264,9 +264,24 @@ INSERT INTO connector_state(connector, enabled, healthy, status_text)
 VALUES
   ('openai', false, false, 'Не настроен'),
   ('codex', false, false, 'Не настроен'),
+  ('images', false, false, 'Не настроен'),
   ('fl', false, false, 'Не настроен'),
   ('telegram', false, false, 'Не настроен')
 ON CONFLICT (connector) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS design_assets (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id uuid NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  file_path text NOT NULL,
+  content_type text NOT NULL DEFAULT 'image/png',
+  bytes integer NOT NULL CHECK (bytes > 0),
+  sha256 text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS design_assets_lead_idx
+  ON design_assets(lead_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS ai_tasks (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -385,3 +400,24 @@ CREATE TABLE IF NOT EXISTS owner_notifications (
 
 CREATE INDEX IF NOT EXISTS owner_notifications_status_created_idx
   ON owner_notifications(status, created_at);
+
+-- A standing, per-lead order from the owner ("lead Oleg yourself, in Elvish, until
+-- end of day").  It is the only thing that lets the agent answer without approval,
+-- and it is always bounded by max_turns plus an optional deadline.
+CREATE TABLE IF NOT EXISTS lead_missions (
+  lead_id uuid PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
+  instruction text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  deadline timestamptz,
+  max_turns integer NOT NULL DEFAULT 10,
+  turns_used integer NOT NULL DEFAULT 0,
+  stopped_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS lead_missions_active_idx ON lead_missions(active) WHERE active;
+
+-- What the bot last offered the owner to choose from ("1. Oleg Zotov  2. oleg blin"),
+-- together with the command that is waiting for that choice.
+ALTER TABLE owner_agent_sessions ADD COLUMN IF NOT EXISTS pending_choice jsonb;
+ALTER TABLE owner_agent_sessions ADD COLUMN IF NOT EXISTS pending_intent jsonb;

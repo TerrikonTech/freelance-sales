@@ -167,6 +167,31 @@ class HermesBrokerTests(unittest.TestCase):
                 broker.SCHEMAS["draft_reply"],
             )
 
+    def test_conversation_turn_schema_carries_research_controls(self) -> None:
+        result = {
+            "intent": "clarify_catalog",
+            "stage": "discovery",
+            "conversation_stage": "s2_discovery",
+            "confidence": 93,
+            "reply": "Каталог уже есть, поэтому источник остатков важнее экранов. Он приходит из МойСклад?",
+            "summary": "Каталог существует, источник остатков уточняется.",
+            "next_action": "Уточнить источник остатков",
+            "discovery_readiness": 45,
+            "build_readiness": 20,
+            "should_move_to_telegram": False,
+            "discovery_complete": False,
+            "requires_owner": False,
+            "value_before_question": True,
+            "owner_brief": None,
+            "reply_deadline": None,
+            "risk_flags": [],
+            "requirements": [],
+        }
+        broker._validate_schema(result, broker.SCHEMAS["conversation_turn"])
+        result["conversation_stage"] = "invented_stage"
+        with self.assertRaises(broker.BrokerError):
+            broker._validate_schema(result, broker.SCHEMAS["conversation_turn"])
+
     def test_large_context_stays_valid_and_bounded(self) -> None:
         text = broker._bounded_context(
             {

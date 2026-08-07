@@ -6,6 +6,7 @@ export type JobName =
   | 'analyze-lead'
   | 'draft-reply'
   | 'generate-documents'
+  | 'generate-design'
   | 'send-draft'
   | 'scan-fl'
   | 'sync-fl-chats'
@@ -21,7 +22,7 @@ export class QueueService implements OnModuleDestroy {
       jobId,
       // Outbound operations own their retry semantics through the durable
       // delivery ledger.  BullMQ must never replay a possibly delivered send.
-      attempts: name === 'send-draft' ? 1 : name === 'analyze-lead' ? 2 : 3,
+      attempts: name === 'send-draft' || name === 'generate-design' ? 1 : name === 'analyze-lead' ? 2 : 3,
       backoff: { type: 'exponential', delay: 3_000 },
       removeOnComplete: 500,
       removeOnFail: 500,

@@ -125,4 +125,59 @@ describe('AiService analyzer optimization', () => {
     expect(result.recommended_days).toBe(110);
     expect(result.pricing_modifiers).toEqual([]);
   });
+
+  test('does not double-charge the backend integration already included in a mobile MVP', async () => {
+    const tasks = {
+      run: jest.fn().mockResolvedValue({
+        score: 82,
+        confidence: 90,
+        technical_fit: 90,
+        commercial_fit: 80,
+        brief_quality: 85,
+        delivery_risk: 40,
+        recommended_price: 500_000,
+        recommended_days: 80,
+        fit_reason: 'Подходит',
+        client_value: 'Ценность',
+        risks: [],
+        questions: [],
+        should_respond: true,
+        pricing_category: 'mobile_mvp',
+        pricing_level: 'high',
+        pricing_modifiers: ['integration_large'],
+        understanding: {
+          summary: 'Мобильный магазин',
+          project_kind: 'new_build',
+          buyer_intent: 'ready',
+          existing_system: 'unknown',
+          confirmed_scope: ['iOS', 'Android', 'backend', 'админ-панель'],
+          wishlist_or_future_scope: [],
+          separate_costs: [],
+          critical_unknowns: [],
+          assumption_for_quote: 'Один магазин',
+          pricing_category_hint: 'mobile_mvp',
+          pricing_level_hint: 'high',
+          relevance_signals: ['Мобильный продукт'],
+          mismatch_signals: [],
+          confidence: 90,
+        },
+      }),
+    };
+    const optimized = new AiService(
+      { getPublic: jest.fn().mockResolvedValue(null) } as never,
+      tasks as never,
+      {} as never,
+    );
+
+    const result = await optimized.analyzeLead({
+      source: 'fl',
+      title: 'Мобильный интернет-магазин',
+      description: 'Каталог, корзина, backend и админ-панель',
+      requirements: {},
+    });
+
+    expect(result.recommended_price).toBe(350_000);
+    expect(result.recommended_days).toBe(60);
+    expect(result.pricing_modifiers).toEqual([]);
+  });
 });
