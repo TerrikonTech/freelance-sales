@@ -57,6 +57,23 @@ type ModelCombinedLeadAnalysis = ModelLeadAnalysis & { understanding: LeadUnders
 
 type DraftCandidate = { content: string; angle: string };
 
+type DraftStrategy = {
+  buyer_goal: string;
+  buyer_risk: string;
+  unique_signals: string[];
+  micro_plan: string[];
+  done_criterion: string;
+  message_type: string;
+  proof: string;
+  conversation_goal: string;
+  dialogue_question: string;
+  psychology_angles: string[];
+  mention_price_in_body: boolean;
+  hook_pattern: ProposalHookPattern;
+  acceptance_label: ProposalAcceptanceLabel;
+  avoid_phrases: string[];
+};
+
 type DraftReview = {
   content: string;
   selected_index: number;
@@ -68,50 +85,281 @@ type DraftReview = {
 };
 
 const DEFAULT_STYLE_PROFILE = {
-  response_greeting: ['Добрый день.', 'Здравствуйте.'],
-  response_sentences: '2–5 простых предложений',
-  response_length: '90–440 знаков; длина и структура зависят от самого заказа',
-  punctuation: 'Обычные точки и запятые; без типографских кавычек, длинных тире, точек с запятой и слишком идеальной литературной пунктуации',
-  tone: 'Спокойное личное сообщение сильного разработчика. Без позы консультанта, рекламного пафоса и попытки доказать ум каждой фразой',
+  response_greeting: 'Короткое обращение по имени, если имя подтверждено; иначе сразу содержательный хук без приветствия-филлера',
+  response_structure: 'Не более трёх коротких абзацев: вариативный хук; микро-план и измеримый критерий приёмки; один кейс, цена, срок, старт и один лёгкий вопрос',
+  response_length: 'FL.ru: обычно 100–200 слов; компактная точечная задача 60–120; дорогой сложный проект 170–260, жёсткий потолок 300 слов',
+  punctuation: 'Естественная русская пунктуация. Короткий список из 2–3 шагов допустим, если он делает план сканируемым',
+  tone: 'Спокойное личное сообщение сильного разработчика. Зеркалировать терминологию и регистр заказчика, не давить и не изображать рекламный текст',
   rules: [
-    'За первые две строки дать заказчику причину открыть диалог: точное попадание в результат, близкое доказательство или полезную ясность.',
-    'Не выдавливать технический инсайт из каждого заказа. Для простого или короткого брифа лучше прямой человеческий отклик.',
-    'Цена и срок уже заполняются отдельными полями FL.ru, поэтому в тексте их повторять только если нужно объяснить границу или заметное расхождение с ожиданиями.',
-    'Доказательство, вопрос и цена не обязательны одновременно. Оставлять только то, что реально усиливает именно этот отклик.',
-    'Менять не только слова, но сам ход сообщения: кейс, точное решение, важное решение по реализации, вопрос с порога или короткий следующий шаг.',
+    'Первая содержательная фраза — о задаче или риске заказчика, а не об исполнителе. В ней должна быть уникальная деталь этого брифа.',
+    'Использовать минимум две конкретные детали заказа, но не пересказывать список функций.',
+    'Дать микро-план из 2–3 шагов и измеримый критерий приёмки. Формулировку критерия чередовать, а не копировать «Готово =» в каждый отклик.',
+    'Использовать ровно одно самое релевантное доказательство. Если назван кейс, сразу дать точную ссылку.',
+    'В каждом отклике естественно назвать цену, срок и условие старта, даже если цифры также попадут в отдельные поля FL.ru.',
+    'Закончить одним простым вопросом или бинарным выбором, на который легко ответить.',
+    'Из психологии использовать только честные приёмы: зеркалирование, конкретное социальное доказательство, снижение риска, взаимность через полезное наблюдение. Никакой искусственной срочности.',
   ],
 };
 
+export type ProposalProfile = 'compact' | 'standard' | 'premium';
+export type ProposalHookPattern = 'observation_detail' | 'result_first' | 'proof_first' | 'direct_commitment' | 'first_step';
+export type ProposalAcceptanceLabel = 'ready_equals' | 'acceptance' | 'stage_closed' | 'result_accepted' | 'result_check';
+
+export type ProposalCommercialContext = {
+  price?: number;
+  days?: number;
+  availability?: string;
+  clientName?: string;
+  hookPattern?: ProposalHookPattern;
+  acceptanceLabel?: ProposalAcceptanceLabel;
+};
+
+const PROPOSAL_LIMITS: Record<ProposalProfile, { minWords: number; maxWords: number; minChars: number; maxChars: number }> = {
+  compact: { minWords: 60, maxWords: 120, minChars: 350, maxChars: 850 },
+  standard: { minWords: 100, maxWords: 200, minChars: 600, maxChars: 1_400 },
+  premium: { minWords: 170, maxWords: 260, minChars: 950, maxChars: 1_900 },
+};
+
+const PROPOSAL_HOOK_PATTERNS: ProposalHookPattern[] = [
+  'observation_detail', 'result_first', 'proof_first', 'direct_commitment', 'first_step',
+];
+
+const PROPOSAL_ACCEPTANCE_LABELS: ProposalAcceptanceLabel[] = [
+  'ready_equals', 'acceptance', 'stage_closed', 'result_accepted', 'result_check',
+];
+
+const ACCEPTANCE_LABEL_TEXT: Record<ProposalAcceptanceLabel, string> = {
+  ready_equals: 'Готово =',
+  acceptance: 'Приёмка:',
+  stage_closed: 'Этап считается закрытым, когда',
+  result_accepted: 'Результат можно принимать, когда',
+  result_check: 'Проверка результата:',
+};
+
+export function proposalVariationPlan(recentDrafts: string[], seed: string) {
+  const joined = recentDrafts.join('\n').toLowerCase();
+  const acceptanceCounts: Record<ProposalAcceptanceLabel, number> = {
+    ready_equals: (joined.match(/готово\s*=/gu) || []).length,
+    acceptance: (joined.match(/при[ёе]мка\s*:/gu) || []).length,
+    stage_closed: (joined.match(/этап\s+считается\s+закрыт/gu) || []).length,
+    result_accepted: (joined.match(/результат\s+можно\s+принимать/gu) || []).length,
+    result_check: (joined.match(/проверка\s+результата\s*:/gu) || []).length,
+  };
+  const seedNumber = Number.parseInt(createHash('sha256').update(seed).digest('hex').slice(0, 8), 16);
+  const acceptanceLabel = [...PROPOSAL_ACCEPTANCE_LABELS]
+    .sort((left, right) => acceptanceCounts[left] - acceptanceCounts[right]
+      || ((PROPOSAL_ACCEPTANCE_LABELS.indexOf(left) - seedNumber) % PROPOSAL_ACCEPTANCE_LABELS.length)
+      - ((PROPOSAL_ACCEPTANCE_LABELS.indexOf(right) - seedNumber) % PROPOSAL_ACCEPTANCE_LABELS.length))[0];
+  const hookPattern = PROPOSAL_HOOK_PATTERNS[seedNumber % PROPOSAL_HOOK_PATTERNS.length];
+  return {
+    hookPattern,
+    acceptanceLabel,
+    acceptanceText: ACCEPTANCE_LABEL_TEXT[acceptanceLabel],
+  };
+}
+
+export function proposalProfileForLead(lead: Record<string, unknown>): ProposalProfile {
+  const description = String(lead.description || '').trim();
+  const price = Number(lead.recommended_price) || 0;
+  if (description.length <= 220 || (price > 0 && price <= 40_000)) return 'compact';
+  if (price >= 500_000) return 'premium';
+  return 'standard';
+}
+
+export function proposalResearchIssues(
+  content: string,
+  profile: ProposalProfile,
+  commercial: ProposalCommercialContext = {},
+): string[] {
+  const issues: string[] = [];
+  const limits = PROPOSAL_LIMITS[profile];
+  const words = content.match(/[\p{L}\p{N}]+(?:[-'][\p{L}\p{N}]+)*/gu) || [];
+  if (words.length < limits.minWords || words.length > limits.maxWords) {
+    issues.push(`Длина для режима ${profile}: нужно ${limits.minWords}–${limits.maxWords} слов, сейчас ${words.length}.`);
+  }
+  if (content.length < limits.minChars || content.length > limits.maxChars) {
+    issues.push(`Объём для режима ${profile}: нужно ${limits.minChars}–${limits.maxChars} знаков, сейчас ${content.length}.`);
+  }
+  const paragraphs = content.trim().split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
+  if (paragraphs.length > 3) issues.push('Оставь не более трёх коротких абзацев.');
+  if (paragraphs.length === 1 && content.length > 650) issues.push('Разбей стену текста на 2–3 сканируемых абзаца.');
+
+  const withoutGreeting = content.trim().replace(/^(?:(?:[\p{L} -]{2,40},\s*)?(?:добрый день|здравствуйте|привет)[.!]?\s*)/iu, '');
+  const firstSentence = withoutGreeting.split(/[.!?\n]/, 1)[0].trim().toLowerCase();
+  if (/^(?:я|мы|мне|мой|моя|мои|наш|наша)\b/u.test(firstSentence)) {
+    issues.push('Первая содержательная фраза должна быть о задаче или риске заказчика, а не об исполнителе.');
+  }
+  if (/^(?:внимательно (?:прочитал|изучил)|готов (?:выполнить|приступить)|задача понятна)/iu.test(firstSentence)) {
+    issues.push('Первый экран занят шаблонным филлером: начни с конкретной детали этого заказа.');
+  }
+  const acceptancePatterns: Record<ProposalAcceptanceLabel, RegExp> = {
+    ready_equals: /готово\s*=/iu,
+    acceptance: /при[ёе]мка\s*:/iu,
+    stage_closed: /этап\s+считается\s+закрыт/iu,
+    result_accepted: /результат\s+можно\s+принимать/iu,
+    result_check: /проверка\s+результата\s*:/iu,
+  };
+  const acceptancePattern = commercial.acceptanceLabel
+    ? acceptancePatterns[commercial.acceptanceLabel]
+    : new RegExp(Object.values(acceptancePatterns).map((pattern) => pattern.source).join('|'), 'iu');
+  if (!acceptancePattern.test(content)) {
+    const expected = commercial.acceptanceLabel ? ACCEPTANCE_LABEL_TEXT[commercial.acceptanceLabel] : 'одна из вариативных формул приёмки';
+    issues.push(`Добавь измеримый критерий приёмки через «${expected}».`);
+  }
+  if (/(?:…|\.{3})/u.test(content)) {
+    issues.push('В готовом отклике осталось многоточие-заглушка: замени его конкретным текстом.');
+  }
+  const numberedPlan = /(?:^|\s)1[.)]\s+[\s\S]{0,700}(?:^|\s)2[.)]\s+/mu.test(content);
+  const bulletSteps = (content.match(/(?:^|\n)\s*[-•]\s+/gmu) || []).length;
+  const hasPlan = numberedPlan
+    || bulletSteps >= 2
+    || /сначала[\s\S]{0,500}(?:затем|после этого|дальше)/iu.test(content);
+  if (!hasPlan) issues.push('Добавь микро-план из 2–3 последовательных шагов.');
+  const questions = (content.match(/\?/g) || []).length;
+  if (questions !== 1) issues.push(`В финале нужен ровно один лёгкий вопрос, сейчас вопросов: ${questions}.`);
+  const urls = content.match(/https?:\/\/[^\s)]+/giu) || [];
+  if (urls.length > 1) issues.push('Оставь ровно одно самое релевантное доказательство, без россыпи ссылок.');
+
+  const exactNumberPattern = (value: number) => new RegExp(
+    String(Math.round(value)).split('').join('[\\s\\u00a0\\u202f]*'),
+    'u',
+  );
+  if (Number(commercial.price) > 0 && !exactNumberPattern(Number(commercial.price)).test(content)) {
+    issues.push(`Назови в тексте цену ${Math.round(Number(commercial.price)).toLocaleString('ru-RU')} ₽.`);
+  }
+  if (Number(commercial.days) > 0) {
+    const daysPattern = new RegExp(`${Math.round(Number(commercial.days))}\\s*(?:рабоч(?:их|ие)?\\s*)?д(?:ень|ня|ней|\\.)`, 'iu');
+    if (!daysPattern.test(content)) issues.push(`Назови в тексте срок ${Math.round(Number(commercial.days))} дней.`);
+  }
+  if (commercial.availability && !/(?:старт|начну|начать|приступлю|могу\s+приступить)/iu.test(content)) {
+    issues.push('Добавь честное условие или дату старта.');
+  }
+  const clientName = String(commercial.clientName || '').trim().split(/\s+/)[0];
+  if (clientName) {
+    const escapedName = clientName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!(new RegExp(`^(?:(?:добрый\\s+день|здравствуйте|привет)[,!]?\\s+)?${escapedName}[,!]`, 'iu')).test(content.trim())) {
+      issues.push(`Имя заказчика подтверждено: начни с короткого обращения «${clientName},».`);
+    }
+  }
+  return issues;
+}
+
+const GENERIC_CASE_TITLES = new Set([
+  'сайт', 'лендинг', 'магазин', 'приложение', 'дизайн', 'бот', 'сервис',
+  'платформа', 'портал', 'система', 'каталог', 'маркетплейс', 'дашборд',
+]);
+
+/** Naming a case and then not linking it is the single most common miss in real drafts. */
+export function portfolioLinkIssues(content: string, portfolio: Record<string, unknown>[]): string[] {
+  if (!content || !Array.isArray(portfolio) || !portfolio.length) return [];
+  if (/fl\.ru\/user[^\s]*\/portfolio\//i.test(content)) return [];
+  const lower = content.toLowerCase();
+  for (const item of portfolio) {
+    const title = String((item || {}).title || '').trim();
+    const url = String((item || {}).url || '').trim();
+    if (!title || !url) continue;
+    const name = title.split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3).slice(0, 2).join(' ');
+    // A generic word like "Сайт" would match almost any draft and drag in a wrong link.
+    if (name.length < 6 || GENERIC_CASE_TITLES.has(name.toLowerCase())) continue;
+    if (lower.includes(name.toLowerCase())) {
+      return [`Назван кейс «${title}», но без ссылки. Приложи его адрес дословно: ${url}`];
+    }
+  }
+  return [];
+}
+
+export function portfolioEvidenceIssues(content: string, portfolio: Record<string, unknown>[]): string[] {
+  const relevant = portfolio.filter((item) => Number(item.relevance_score) > 0 && String(item.url || '').trim());
+  if (!relevant.length) return [];
+  const exactUrls = relevant.map((item) => String(item.url).trim());
+  const used = exactUrls.filter((url) => content.includes(url));
+  if (used.length === 0) {
+    return ['Для заказа найден релевантный подтверждённый кейс: выбери один, объясни сходство и приложи его точную ссылку.'];
+  }
+  if (used.length > 1) return ['Оставь один самый релевантный кейс и одну ссылку, без портфолио-дампа.'];
+  return [];
+}
+
 const RESPONSE_PRINCIPLES = [
-  'Цель первого отклика — получить осмысленный ответ, а не уместить в него консультацию, смету и резюме.',
-  'Показывать понимание конкретной деталью или результатом, но не повторять бриф другими словами.',
-  'Техническая мысль допустима только когда она важна заказчику сейчас и объяснена через пользу, риск, деньги или скорость.',
-  'Доверие строить самым сильным уместным сигналом: близкий реальный кейс, точное решение, разумный первый шаг, 6 лет опыта или Яндекс. Не вставлять стаж как заполнитель.',
-  'Завершать лёгким действием: один вопрос, просьба прислать материал либо предложение показать близкий кейс. Не превращать каждый отклик в анкету.',
+  'Цель первого отклика — получить осмысленный ответ и снизить тревогу заказчика, а не пересказать бриф или показать весь стек.',
+  'Первые 150–200 символов должны содержать конкретную проблему, наблюдение, результат или близкое доказательство именно по этому заказу. Не начинать с «я», стажа или приветствия-филлера.',
+  'Использовать минимум две уникальные детали задания и лексику клиента, но не перечислять уже написанные функции для вида.',
+  'Структура: один из пяти вариативных хуков → понимание цели → микро-план 2–3 шага → вариативный критерий приёмки → один кейс → цена, срок и старт → один простой вопрос.',
+  'Техническая мысль допустима только когда объясняет пользу, риск, деньги или скорость. На дорогом проекте показать управляемость: этапность, QA, прозрачность или обратимость.',
+  'Доверие строить одним сильным уместным сигналом: близкий реальный кейс с прямой ссылкой, подтверждённый опыт или конкретный способ снять главный риск. 6 лет и Яндекс не вставлять как заполнитель.',
+  'Если называешь кейс из portfolio — сразу давай его ссылку из portfolio[].url. Не писать «могу показать» без ссылки: заказчик должен мочь открыть работу в один клик.',
+  'Ссылку брать только из portfolio[].url дословно. Никогда не выдумывать адрес и не ссылаться на кейс, которого нет в portfolio.',
+  'Завершать ровно одним лёгким вопросом или бинарным выбором, который двигает разговор на один шаг. Не превращать отклик в анкету.',
   'Не ругать постановку задачи, бюджет, конкурентов или выбранную технологию в первом сообщении.',
   'Не писать по обязательной формуле: структура и длина должны следовать брифу и выбранному углу.',
+  'Цена, срок и старт обязательны в самом тексте: люди сканируют ленту и не обязаны замечать отдельные поля FL.ru.',
+  'Если подтверждёно имя из FL-профиля или чата, обратиться по имени. Не угадывать имя по логину.',
+  'Не использовать манипуляции, искусственную срочность и давление. Рабочая психология отклика — персонализация, конкретное доказательство, снижение риска и простой следующий шаг.',
 ];
+
+const PORTFOLIO_CONCEPTS: Array<{ lead: RegExp; item: RegExp }> = [
+  { lead: /(?:telegram|телеграм|max|макс|мессендж|бот)/iu, item: /(?:telegram|телеграм|max|макс|мессендж|бот|чат)/iu },
+  { lead: /(?:партн[её]р|реферал|дилер|агентск)/iu, item: /(?:партн[её]р|реферал|дилер|франшиз|нетворкинг|участник)/iu },
+  { lead: /(?:регистрац|анкет|фио|телефон|профил)/iu, item: /(?:регистрац|анкет|онбординг|профил|участник|личн.{0,8}кабинет)/iu },
+  { lead: /(?:документ|файл|скриншот|свидетельств)/iu, item: /(?:документ|файл|фото|скриншот|ocr|акт|сч[её]т)/iu },
+  { lead: /(?:qr|qr-код|ссылк|partner_id)/iu, item: /(?:qr|qr-код|ссылк|код|билет|идентификатор)/iu },
+  { lead: /(?:уведомлен|менеджер|crm|амо|битрикс)/iu, item: /(?:уведомлен|менеджер|crm|амо|битрикс|диспетчер|оператор)/iu },
+];
+
+/** Cheap semantic-ish portfolio routing used only after the owner asks for a draft. */
+export function selectRelevantPortfolio(value: unknown, leadText: string): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const stopWords = new Set([
+    'который', 'нужно', 'сайт', 'сайта', 'сайте', 'разработка', 'сделать', 'работа',
+    'проект', 'через', 'будет', 'можно', 'также', 'данные', 'система', 'должен',
+  ]);
+  const tokens = (text: string) => new Set(
+    text.toLowerCase().match(/[а-яёa-z0-9]{4,}/g)?.filter((word) => !stopWords.has(word)) || [],
+  );
+  const leadTokens = tokens(leadText);
+  return value
+    .map((item, index) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+      const itemText = `${row.title || ''} ${row.description || ''}`;
+      const caseTokens = tokens(itemText);
+      let score = 0;
+      for (const word of leadTokens) if (caseTokens.has(word)) score += 1;
+      for (const concept of PORTFOLIO_CONCEPTS) {
+        if (concept.lead.test(leadText) && concept.item.test(itemText)) score += 3;
+      }
+      return { index, score, row };
+    })
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .filter(({ score }) => score > 0)
+    .slice(0, 6)
+    .map(({ row, score }) => ({
+      title: String(row.title || '').slice(0, 180),
+      description: String(row.description || '').slice(0, 900),
+      url: String(row.url || '').slice(0, 500),
+      relevance_score: score,
+    }));
+}
 
 const RESPONSE_CALIBRATION = [
   {
     kind: 'Сложная интеграция с неясной существующей основой',
-    example: 'Добрый день. Тут по описанию получается не просто подключить hh и GPT, а связать поиск кандидатов, оценку, историю и аналитику в один процесс. Похожие кабинеты с ролями и внешними API делал, могу показать близкий по логике проект. Если основа у вас уже есть и нужно встроить именно поиск и AI-разбор, ориентир 250к и 35 дней. Подскажите, кабинет уже работает или интерфейс и базу тоже нужно делать с нуля?',
-    why: 'Понравившаяся владельцу планка: живой язык, нормальное укрупнение задачи, правдоподобное доказательство, условная оценка и один вопрос о главной границе.',
+    example: 'По связке hh.ru и GPT главный риск не в самом API, а в том, чтобы поиск, оценка кандидата и история решений не разъехались по разным процессам. Похожие кабинеты с ролями и внешними интеграциями делал: https://www.fl.ru/user/sporyshevsaveli/portfolio/8067026/\n\nПредлагаю начать с короткого этапа: 1) проверить доступные методы hh.ru и текущую основу; 2) собрать один сквозной сценарий поиска и AI-разбора; 3) зафиксировать границы следующего этапа. Готово = кандидат проходит путь от поиска до сохранённого заключения, а у вас есть проверенная схема и точная смета. Так риск закрытого API снимается до основной разработки.\n\nЕсли кабинет уже работает, начну с его аудита после получения тестового доступа. Интерфейс и база у вас уже есть или их тоже нужно делать с нуля?',
+    why: 'Исследовательская структура: риск в первом экране, один кейс, микро-план, критерий приёмки, логистика и один вопрос о границе.',
   },
   {
     kind: 'Простая понятная задача по вёрстке',
-    example: 'Добрый день. Если в макете много SVG-графики, повторяющиеся элементы сразу вынесу отдельно, чтобы потом не править каждый экран вручную. Пришлите полную Figma, посмотрю компоненты и скажу точный срок по всем страницам.',
-    why: 'Одна деталь из брифа превращена в понятную пользу. Нет резюме, пересказа задания и вопроса ради вопроса.',
+    example: 'Повторяющиеся SVG-элементы лучше вынести в общие компоненты сразу: тогда правка одного элемента не разъедется между экранами.\n\nПлан короткий: 1) сверю полную Figma и состояния; 2) соберу адаптив и общие компоненты; 3) проверю основные ширины. Готово = страницы совпадают с макетом на согласованных разрешениях, а повторяющаяся графика меняется в одном месте.\n\nНачну после получения полной Figma. В макете уже есть мобильные версии всех страниц или адаптив нужно определить по desktop?',
+    why: 'Компактный режим без воды: две детали, польза, короткий план, измеримое «Готово» и один вопрос.',
   },
   {
     kind: 'Продукт, для которого есть близкий реальный кейс',
-    example: 'Добрый день. Магазины такого уровня делал, могу показать TERRA MARKET с каталогом, фильтрами, вариантами товара и оформлением заказа. Здесь сначала посмотрю шаблон и объём каталога, после этого зафиксирую этапы без сюрпризов по смете. Сколько товаров и вариантов планируется на запуске?',
-    why: 'Кейс назван конкретно и связан с заказом по сути, а не общей фразой про портфолио.',
+    example: 'В мобильном магазине сложность обычно не в карточке товара, а в согласованности каталога, вариантов, остатков и оформления заказа между iOS и Android. Близкий по механике кейс — TERRA MARKET: каталог, фильтры, варианты товара и корзина уже собраны в одном пользовательском пути: https://www.fl.ru/user/sporyshevsaveli/portfolio/8057737/\n\nНачал бы с этапа-фундамента: 1) зафиксировать источник каталога и остатков; 2) собрать кликабельный путь «каталог → товар → корзина → заказ»; 3) проверить его на обеих платформах. Готово = тестовый заказ проходит без ручных обходов, а интеграционные границы подтверждены до основной разработки.\n\nПосле доступа к API смогу зафиксировать этапы и риски без сюрпризов по смете. Каталог и оформление заказа уже имеют готовый API или серверную часть тоже нужно проектировать?',
+    why: 'Кейс связан с конкретной механикой, ссылка одна, риск снят обратимым первым этапом и понятным критерием.',
   },
   {
     kind: 'Лендинг услуги, где сначала нужно сформировать доверие',
-    example: 'Добрый день. На ремонте рулевых реек я бы строил лендинг не вокруг обычного списка услуг, а вокруг реальных кейсов: с чем приехали, что нашли, что сделали и какую дали гарантию. Так ваши фото будут продавать доверие к сервису. Если дизайн нужен с нуля, ориентир 80к. Фото и отзывы уже собраны?',
-    why: 'Не повторяет задание, а показывает сильную идею именно для этого бизнеса, объясняет пользу и даёт уместную коммерческую рамку.',
+    example: 'Для ремонта рулевых реек сильнее обычного списка услуг сработают реальные случаи: с чем приехали, что нашли, что сделали и какую гарантию дали. Тогда фотографии показывают не просто мастерскую, а причину доверить вам дорогой узел автомобиля.\n\nПредлагаю: 1) собрать 3–5 таких историй и вопросы клиентов; 2) построить вокруг них первый экран и структуру; 3) проверить форму заявки и мобильную версию. Готово = посетитель за полминуты понимает, какие неисправности вы решаете, видит доказательство и может записаться без звонка.\n\nДизайн смогу начать после материалов; если он нужен с нуля, цену зафиксируем отдельно от вёрстки. Фото ремонтов и отзывы уже собраны или их ещё нужно подготовить?',
+    why: 'Полезное наблюдение даёт взаимность, истории создают доказательство, план снижает риск, финал легко продолжает диалог.',
   },
 ];
 
@@ -244,12 +492,13 @@ export class AiService {
     const seller = await this.settings.getPublic('seller_profile') || {};
     const style = await this.settings.getPublic('style_profile') || DEFAULT_STYLE_PROFILE;
     const sourceLead = (context.lead || {}) as Record<string, unknown>;
-    const portfolio = this.compactPortfolio(
+    const portfolio = selectRelevantPortfolio(
       await this.settings.getPublic('fl_portfolio_cases') || [],
       `${sourceLead.title || ''} ${sourceLead.description || ''}`,
     );
     const sourceMessages = Array.isArray(context.messages) ? context.messages : [];
     const mode = context.mode === 'chat' ? 'chat' : 'response';
+    const proposalProfile = proposalProfileForLead(sourceLead);
     const [voiceResult, approvedResult, recentDraftResult] = await Promise.all([
       mode === 'chat'
         ? this.db.query<{ content: string }>(
@@ -276,6 +525,31 @@ export class AiService {
          ORDER BY created_at DESC LIMIT 8`,
       ),
     ]);
+    const recentDrafts = recentDraftResult.rows.map((row) => row.content);
+    const client = sourceLead.client && typeof sourceLead.client === 'object'
+      ? sourceLead.client as Record<string, unknown>
+      : {};
+    const clientName = String(client.fl_name || client.name || '').trim().slice(0, 80);
+    const configuredAvailability = String(
+      (seller as Record<string, unknown>).available_from
+      || (seller as Record<string, unknown>).availability
+      || '',
+    ).trim().slice(0, 160);
+    const availability = configuredAvailability
+      ? `Старт: ${configuredAvailability}`
+      : 'Старт — после согласования объёма и получения необходимых материалов и доступов.';
+    const variationPlan = proposalVariationPlan(
+      recentDrafts,
+      String(sourceLead.external_id || sourceLead.id || sourceLead.title || ''),
+    );
+    const commercialTerms: ProposalCommercialContext = {
+      price: Number(sourceLead.recommended_price) || undefined,
+      days: Number(sourceLead.recommended_days) || undefined,
+      availability,
+      clientName: clientName || undefined,
+      hookPattern: variationPlan.hookPattern,
+      acceptanceLabel: variationPlan.acceptanceLabel,
+    };
     const compactContext = {
       lead: {
         title: sourceLead.title,
@@ -286,6 +560,10 @@ export class AiService {
         recommended_days: sourceLead.recommended_days,
         analysis: sourceLead.analysis,
         requirements: sourceLead.requirements,
+        client: {
+          name: clientName || null,
+          username: client.fl_username || null,
+        },
       },
       messages: sourceMessages.slice(-50).map((message: Record<string, unknown>) => ({
         direction: message.direction,
@@ -298,12 +576,33 @@ export class AiService {
       style,
       portfolio,
       mode,
+      proposal_profile: {
+        name: proposalProfile,
+        ...PROPOSAL_LIMITS[proposalProfile],
+        reason: proposalProfile === 'compact'
+          ? 'Точечная задача: сохранить всю продающую логику, но не раздувать простой объём.'
+          : proposalProfile === 'premium'
+            ? 'Дорогой сложный проект: показать этапность, критерии приёмки и управляемое снижение риска.'
+            : 'Обычный отклик FL.ru по исследовательской норме 100–200 слов.',
+      },
       response_principles: RESPONSE_PRINCIPLES,
       calibration_examples: RESPONSE_CALIBRATION,
+      variation_plan: {
+        required_hook_pattern: variationPlan.hookPattern,
+        required_acceptance_label: variationPlan.acceptanceLabel,
+        required_acceptance_text: variationPlan.acceptanceText,
+      },
+      commercial_terms: {
+        price_rub: commercialTerms.price,
+        duration_days: commercialTerms.days,
+        availability,
+        client_name: clientName || null,
+        greeting_required: Boolean(clientName),
+      },
       submission_fields: {
         price: 'FL.ru получает recommended_price отдельным числовым полем',
         days: 'FL.ru получает recommended_days отдельным числовым полем',
-        cover_letter: 'content — только сопроводительное сообщение; не дублируй цену и срок без коммерческой причины',
+        cover_letter: 'content обязательно повторяет цену, срок и старт: эти три пункта должны быть видны при быстром чтении ленты',
       },
       owner_instructions: String(context.ownerInstructions || '').slice(0, 4_000),
       voice_examples: voiceResult.rows.map((row) => row.content.slice(0, 300)),
@@ -315,7 +614,7 @@ export class AiService {
     if (mode === 'chat') {
       let result = await this.tasks.run<{ content: string }>('draft_reply', payload);
       let content = String(result.content || '').trim();
-      const issues = this.draftQualityIssues(content, mode);
+      const issues = [...this.draftQualityIssues(content, mode), ...portfolioLinkIssues(content, portfolio)];
       if (issues.length) {
         result = await this.tasks.run<{ content: string }>('draft_reply', {
           ...payload,
@@ -326,11 +625,20 @@ export class AiService {
       return content;
     }
 
-    const generated = await this.tasks.run<{ candidates: DraftCandidate[] }>('draft_candidates', payload);
+    const strategy = await this.tasks.run<DraftStrategy>('draft_strategy', payload);
+    const generated = await this.tasks.run<{ candidates: DraftCandidate[] }>('draft_candidates', { ...payload, strategy });
     const candidates = Array.isArray(generated.candidates) ? generated.candidates.slice(0, 3) : [];
-    let reviewed = await this.tasks.run<DraftReview>('draft_review', { ...payload, candidates });
+    let reviewed = await this.tasks.run<DraftReview>('draft_review', { ...payload, strategy, candidates });
     let content = String(reviewed.content || '').trim();
-    const issues = this.draftQualityIssues(content, mode, recentDraftResult.rows.map((row) => row.content));
+    const issues = this.draftQualityIssues(
+      content,
+      mode,
+      recentDraftResult.rows.map((row) => row.content),
+      proposalProfile,
+      commercialTerms,
+    );
+    issues.push(...portfolioLinkIssues(content, portfolio));
+    issues.push(...portfolioEvidenceIssues(content, portfolio));
     if (Number(reviewed.human_score) < 85) issues.push('Редактор оценил естественность ниже 85/100: перепиши как личное сообщение человека.');
     if (Number(reviewed.sales_score) < 85) issues.push('Редактор оценил причину ответить ниже 85/100: усили конкретную ценность следующего шага.');
     if (Number(reviewed.specificity_score) < 90) issues.push('Текст можно отправить другому заказчику почти без изменений: добавь один уникальный якорь именно этого проекта.');
@@ -338,21 +646,46 @@ export class AiService {
     if (issues.length) {
       reviewed = await this.tasks.run<DraftReview>('draft_review', {
         ...payload,
+        strategy,
         candidates,
         revision: { previous_content: content, issues },
       });
       content = String(reviewed.content || '').trim();
     }
+    const finalIssues = this.draftQualityIssues(
+      content,
+      mode,
+      recentDraftResult.rows.map((row) => row.content),
+      proposalProfile,
+      commercialTerms,
+    );
+    finalIssues.push(...portfolioLinkIssues(content, portfolio));
+    finalIssues.push(...portfolioEvidenceIssues(content, portfolio));
+    if (Number(reviewed.human_score) < 85) finalIssues.push('Итоговый текст звучит как AI-шаблон.');
+    if (Number(reviewed.sales_score) < 85) finalIssues.push('Итоговый текст не даёт достаточной причины ответить.');
+    if (Number(reviewed.specificity_score) < 90) finalIssues.push('Итоговому тексту не хватает деталей конкретного заказа.');
+    if (Number(reviewed.factual_score) < 100) finalIssues.push('Итоговый текст содержит неподтверждённый факт.');
+    if (finalIssues.length) {
+      throw new Error(`Отклик не прошёл финальную проверку качества: ${finalIssues.join(' ')}`);
+    }
     return content.charAt(0).toUpperCase() + content.slice(1);
   }
 
-  private draftQualityIssues(content: string, mode: 'response' | 'chat', recentDrafts: string[] = []) {
+  private draftQualityIssues(
+    content: string,
+    mode: 'response' | 'chat',
+    recentDrafts: string[] = [],
+    profile: ProposalProfile = 'standard',
+    commercial: ProposalCommercialContext = {},
+  ) {
     if (mode === 'chat') return [];
-    const issues: string[] = [];
+    const issues: string[] = proposalResearchIssues(content, profile, commercial);
     const lower = content.toLowerCase();
     const banned = [
       'ключевой риск', 'ключевой узел', 'ближайший по механике кейс',
-      'готов реализовать', 'имею большой опыт', 'качественно и в срок',
+      'доброго времени суток', 'уважаемый заказчик', 'я внимательно прочитал',
+      'я внимательно изучил', 'готов приступить', 'готов реализовать',
+      'имею большой опыт', 'качественно и в срок', 'сделаю качественно и в срок',
       'индивидуальный подход', 'современное решение', 'уже прикинул концепт',
       'в обозначенных границах', 'коммерческая рамка',
       'тут по описанию получается', 'я понял задачу как', 'вам нужно',
@@ -360,26 +693,15 @@ export class AiService {
       'нужно уточнить границу', 'в описании есть', 'по описанию',
       'готов собрать', 'рабочий контур', 'первый контур',
       'в портфолио есть fullstack', 'сложная бизнес-логика',
-      'fullstack',
+      'обращайтесь, обсудим детали', 'fullstack',
     ];
     const found = banned.filter((phrase) => lower.includes(phrase));
     if (found.length) issues.push(`Шаблонные или AI-фразы: ${found.join(', ')}`);
-    if (!/^(?:добрый день|здравствуйте|добрый)(?:[,.!?\s]|$)/i.test(content)) issues.push('Начни с короткого человеческого приветствия.');
-    if (content.length < 90) issues.push('Слишком коротко: не хватает конкретного якоря именно этого проекта.');
-    if (content.length > 460) issues.push('Слишком длинно для первого касания: оставь только сильное попадание и простой следующий шаг.');
-    const questions = (content.match(/\?/g) || []).length;
-    if (questions > 1) issues.push('Оставь максимум один действительно важный вопрос.');
-    const sentences = (content.match(/[.!?]+(?:\s|$)/g) || []).length;
-    if (sentences < 2 || sentences > 6) issues.push('Сделай 2–5 естественных предложений, соразмерных брифу.');
-    const listLike = (content.match(/[;•]|(?:^|\n)\s*[-–—]\s/g) || []).length;
-    if (listLike > 0) issues.push('Не используй список, точку с запятой и длинное тире.');
-    const typographicMarks = (content.match(/[«»—]/g) || []).length;
-    if (typographicMarks > 0) issues.push('Убери типографские кавычки и длинные тире, пунктуация должна быть простой.');
     if (/\b(?:лучше|стоит)\b[^.!?]{0,160}\bиначе\b/i.test(content)) {
       issues.push('Получилась заезженная формула «лучше сделать X, иначе Y»: перепиши как нормальное личное сообщение, без мини-лекции.');
     }
-    if ((lower.match(/\b(?:цена|стоимость|срок|ориентир)\b/g) || []).length > 2) {
-      issues.push('Не превращай сопроводительный текст в повтор числовых полей FL.ru.');
+    if (/^(?:[^.!?\n]{0,80})(?:лучше|стоит|нужно)[^.!?\n]{0,100}(?:провер|фиксац|уточн)/iu.test(content.trim())) {
+      issues.push('Не повторяй шаблонный заход «X стоит делать после проверки Y»: используй назначенный вариант хука.');
     }
     const similarity = Math.max(0, ...recentDrafts.map((draft) => this.textSimilarity(content, draft)));
     if (similarity >= 0.35) issues.push('Текст слишком похож на один из недавних откликов: поменяй тип захода, длину, синтаксис и доказательство.');
@@ -420,6 +742,7 @@ export class AiService {
       'crm_admin_analytics',
       'platform_mvp',
       'platform_large',
+      'mobile_mvp',
     ];
     const pricingModifiers = selfContainedIntegrationCategories.includes(result.pricing_category)
       ? (Array.isArray(result.pricing_modifiers)
@@ -577,33 +900,6 @@ export class AiService {
       pricing_modifiers: [],
       understanding,
     };
-  }
-
-  private compactPortfolio(value: unknown, leadText: string): Record<string, unknown>[] {
-    if (!Array.isArray(value)) return [];
-    const stopWords = new Set([
-      'который', 'нужно', 'сайт', 'сайта', 'сайте', 'разработка', 'сделать', 'работа',
-      'проект', 'через', 'будет', 'можно', 'также', 'данные', 'система', 'должен',
-    ]);
-    const tokens = (text: string) => new Set(
-      text.toLowerCase().match(/[а-яёa-z0-9]{4,}/g)?.filter((word) => !stopWords.has(word)) || [],
-    );
-    const leadTokens = tokens(leadText);
-    return value
-      .map((item, index) => {
-        const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
-        const caseTokens = tokens(`${row.title || ''} ${row.description || ''}`);
-        let score = 0;
-        for (const word of leadTokens) if (caseTokens.has(word)) score += 1;
-        return { index, score, row };
-      })
-      .sort((left, right) => right.score - left.score || left.index - right.index)
-      .slice(0, 4)
-      .map(({ row }) => ({
-        title: String(row.title || '').slice(0, 180),
-        description: String(row.description || '').slice(0, 900),
-        url: String(row.url || '').slice(0, 500),
-      }));
   }
 
   async generateSpecification(context: Record<string, unknown>): Promise<string> {

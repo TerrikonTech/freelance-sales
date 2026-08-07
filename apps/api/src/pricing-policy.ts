@@ -42,7 +42,7 @@ type PriceRange = {
 };
 
 export const PRICING_CATALOG: Record<PricingCategory, PriceRange> = {
-  small_fix: { label: 'Небольшая доработка или исправления', price: [25_000, 40_000, 60_000], days: [2, 4, 7] },
+  small_fix: { label: 'Точечная правка без разработки новой функции', price: [500, 1_500, 5_000], days: [1, 1, 2] },
   site_revision: { label: 'Средняя доработка сайта', price: [60_000, 90_000, 120_000], days: [7, 14, 20] },
   technical_seo: { label: 'Техническое SEO с исправлениями', price: [60_000, 90_000, 120_000], days: [7, 10, 14] },
   landing_standard: { label: 'Обычный лендинг', price: [80_000, 80_000, 100_000], days: [10, 14, 18] },
@@ -56,10 +56,12 @@ export const PRICING_CATALOG: Record<PricingCategory, PriceRange> = {
   store_complex: { label: 'Сложный магазин с учётом и интеграциями', price: [550_000, 625_000, 700_000], days: [75, 85, 100] },
   account_or_internal_service: { label: 'Личный кабинет или внутренний сервис', price: [250_000, 325_000, 400_000], days: [45, 60, 75] },
   crm_admin_analytics: { label: 'CRM, админка или аналитическая система', price: [300_000, 375_000, 450_000], days: [45, 60, 75] },
-  automation_or_bot: { label: 'Бот, автоматизация или интеграционный сервис', price: [100_000, 175_000, 250_000], days: [14, 30, 45] },
+  // Calibrated against comparable FL.ru bot projects: a shared bot core should not
+  // inherit agency/platform pricing merely because the brief mentions two channels.
+  automation_or_bot: { label: 'Бот, автоматизация или интеграционный сервис', price: [60_000, 110_000, 180_000], days: [7, 16, 28] },
   platform_mvp: { label: 'MVP платформы или SaaS', price: [600_000, 600_000, 750_000], days: [75, 90, 110] },
   platform_large: { label: 'Большая платформа', price: [800_000, 1_000_000, 1_200_000], days: [120, 150, 180] },
-  mobile_mvp: { label: 'MVP мобильного приложения', price: [500_000, 600_000, 700_000], days: [75, 90, 105] },
+  mobile_mvp: { label: 'MVP мобильного приложения', price: [250_000, 300_000, 350_000], days: [35, 45, 60] },
   support_monthly: { label: 'Ежемесячная поддержка и развитие', price: [50_000, 75_000, 100_000], days: [30, 30, 30] },
 };
 
@@ -174,7 +176,7 @@ export function calculateCatalogPrice(input: PricingInput): PricingResult | null
     label: entry.label,
     level,
     modifiers,
-    price: roundPrice(price),
+    price: category === 'small_fix' ? Math.ceil(price / 500) * 500 : roundPrice(price),
     days: Math.max(1, Math.ceil(days)),
   };
 }

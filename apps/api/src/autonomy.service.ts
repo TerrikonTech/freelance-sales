@@ -25,6 +25,25 @@ export type AutonomyEvaluationInput = {
   duplicate?: boolean;
   leadConfidence?: number | null;
   runtimeSignals?: string[];
+  mission?: MissionRuntime | null;
+};
+
+/** A standing task the owner attached to one lead ("lead Oleg yourself, in Elvish"). */
+export type LeadMission = {
+  lead_id: string;
+  instruction: string;
+  active: boolean;
+  deadline: string | null;
+  max_turns: number;
+  turns_used: number;
+  stopped_reason: string | null;
+};
+
+export type MissionRuntime = {
+  instruction: string;
+  turnsLeft: number;
+  expired: boolean;
+  exhausted: boolean;
 };
 
 const DEFAULT_POLICY: AutonomyPolicyConfig = {
@@ -32,6 +51,15 @@ const DEFAULT_POLICY: AutonomyPolicyConfig = {
   globalPaused: false,
   minAutoConfidence: 0.92,
 };
+
+export function strictApprovalEnabled(value = process.env.STRICT_APPROVAL): boolean {
+  return !/^(?:0|false|off|no)$/i.test(String(value || 'true').trim());
+}
+
+/** Global rollback for per-lead missions.  MISSIONS_ENABLED=false disables them everywhere. */
+export function missionsEnabled(value = process.env.MISSIONS_ENABLED): boolean {
+  return !/^(?:0|false|off|no)$/i.test(String(value ?? 'true').trim());
+}
 
 const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLowerCase();
 
@@ -51,7 +79,7 @@ const RISK_RULES: Array<{ signal: string; patterns: RegExp[] }> = [
   {
     signal: 'price_or_discount',
     patterns: [
-      /(?:цен[ауы]|стоимост|бюджет|руб(?:\.|лей)?|₽|доллар|евро|оплат|предоплат|скидк|дешевле|дорого|торг|смет[аы]|price|cost|budget|payment|discount)/iu,
+      /(?:цен[ауы]|стоимост|стои(?:т|ть|л[аои]?)|поч[ёе]м|бюджет|руб(?:\.|лей)?|₽|доллар|евро|оплат|предоплат|скидк|дешевле|дорого|торг|смет[аы]|price|cost|budget|payment|discount)/iu,
       /\d[\d\s]{2,}\s*(?:₽|руб|р\.|usd|eur|\$|€)/iu,
     ],
   },
@@ -133,7 +161,18 @@ const SAFE_CHAT_PATTERNS: Array<{ signal: string; patterns: RegExp[] }> = [
 ];
 
 export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: AutonomyPolicyConfig): AutonomyEvaluation {
-  if (policy.mode !== 'smart') {
+  // A mission is an explicit, per-lead order from the owner.  It overrides the global
+  // manual mode for that one lead only — never for anybody else.
+  const mission = input.mission && missionsEnabled() ? input.mission : null;
+  const missionActive = Boolean(mission && !mission.expired && !mission.exhausted);
+
+  if (!missionActive && policy.mode !== 'smart') {
+    if (mission?.expired) {
+      return { decision: 'ask_owner', confidence: 1, reason: 'Срок задачи истёк — вернулся к ручному режиму', signals: ['mission_expired'] };
+    }
+    if (mission?.exhausted) {
+      return { decision: 'ask_owner', confidence: 1, reason: 'Исчерпан потолок ходов по задаче', signals: ['mission_turn_cap'] };
+    }
     return { decision: 'ask_owner', confidence: 1, reason: 'Ручное одобрение включено', signals: ['manual_mode'] };
   }
 
@@ -175,6 +214,17 @@ export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: Autonom
     return { decision: 'skip', confidence: 0.98, reason: 'Простое подтверждение не требует ответа', signals: ['ack_without_question'] };
   }
 
+  // All hard guardrails above still apply to a mission: spam, duplicates, a broken
+  // connector and every stop-topic (price, contract, deadlines, promises) go to the owner.
+  if (missionActive && mission) {
+    return {
+      decision: 'auto_send',
+      confidence: 0.9,
+      reason: 'Веду по вашей задаче',
+      signals: ['mission', `mission_turns_left:${mission.turnsLeft}`],
+    };
+  }
+
   const leadConfidence = input.leadConfidence;
   if (typeof leadConfidence === 'number' && Number.isFinite(leadConfidence) && leadConfidence < 70) {
     return { decision: 'ask_owner', confidence: 0.96, reason: 'Низкая уверенность в контексте лида', signals: ['low_lead_confidence'] };
@@ -210,12 +260,14 @@ export class AutonomyService {
 
   async getPolicy(): Promise<AutonomyPolicyConfig> {
     const stored = await this.settings.getPublic<Partial<AutonomyPolicyConfig>>('autonomy_policy');
-    return this.normalizePolicy(stored);
+    const policy = this.normalizePolicy(stored);
+    return strictApprovalEnabled() ? { ...policy, mode: 'manual' } : policy;
   }
 
   async setPolicy(input: Partial<AutonomyPolicyConfig>): Promise<AutonomyPolicyConfig> {
     const current = await this.getPolicy();
     const policy = this.normalizePolicy({ ...current, ...input });
+    if (strictApprovalEnabled()) policy.mode = 'manual';
     await this.settings.setPublic('autonomy_policy', policy);
     return policy;
   }
@@ -290,6 +342,77 @@ export class AutonomyService {
     if (policy.globalPaused) return { paused: true, reason: 'Глобальная пауза отправки', scope: 'global' };
     if (client.rows[0]?.paused) return { paused: true, reason: client.rows[0].reason || 'Клиент на паузе', scope: 'client' };
     return { paused: false, reason: null, scope: null };
+  }
+
+  // ---------------------------------------------------------------- missions
+
+  async getMission(leadId: string): Promise<LeadMission | null> {
+    const result = await this.db.query<LeadMission>(
+      `SELECT lead_id,instruction,active,deadline,max_turns,turns_used,stopped_reason
+       FROM lead_missions WHERE lead_id=$1`,
+      [leadId],
+    );
+    return result.rows[0] || null;
+  }
+
+  async setMission(input: {
+    leadId: string;
+    instruction: string;
+    deadline?: Date | null;
+    maxTurns?: number;
+  }): Promise<LeadMission> {
+    const maxTurns = Math.min(50, Math.max(1, Number(input.maxTurns) || 10));
+    const result = await this.db.query<LeadMission>(
+      `INSERT INTO lead_missions(lead_id,instruction,active,deadline,max_turns,turns_used,stopped_reason,updated_at)
+       VALUES($1,$2,true,$3,$4,0,NULL,now())
+       ON CONFLICT(lead_id) DO UPDATE SET
+         instruction=EXCLUDED.instruction,active=true,deadline=EXCLUDED.deadline,
+         max_turns=EXCLUDED.max_turns,turns_used=0,stopped_reason=NULL,updated_at=now()
+       RETURNING lead_id,instruction,active,deadline,max_turns,turns_used,stopped_reason`,
+      [input.leadId, input.instruction.trim().slice(0, 2_000), input.deadline || null, maxTurns],
+    );
+    return result.rows[0];
+  }
+
+  async stopMission(leadId: string, reason = 'Остановлено владельцем'): Promise<boolean> {
+    const result = await this.db.query(
+      `UPDATE lead_missions SET active=false,stopped_reason=$2,updated_at=now()
+       WHERE lead_id=$1 AND active=true RETURNING lead_id`,
+      [leadId, reason.slice(0, 500)],
+    );
+    return Boolean(result.rows[0]);
+  }
+
+  /** Runtime view used by evaluateAutonomy: null when there is no live mission. */
+  async missionRuntime(leadId: string): Promise<MissionRuntime | null> {
+    const mission = await this.getMission(leadId);
+    if (!mission || !mission.active) return null;
+    const expired = Boolean(mission.deadline && new Date(mission.deadline).getTime() <= Date.now());
+    const turnsLeft = Math.max(0, Number(mission.max_turns) - Number(mission.turns_used));
+    return { instruction: mission.instruction, turnsLeft, expired, exhausted: turnsLeft <= 0 };
+  }
+
+  /** Counts one autonomous reply and closes the mission when the cap is reached. */
+  async consumeMissionTurn(leadId: string): Promise<void> {
+    await this.db.query(
+      `UPDATE lead_missions SET turns_used=turns_used+1,updated_at=now()
+       WHERE lead_id=$1 AND active=true`,
+      [leadId],
+    );
+    await this.db.query(
+      `UPDATE lead_missions SET active=false,stopped_reason='Исчерпан потолок ходов',updated_at=now()
+       WHERE lead_id=$1 AND active=true AND turns_used>=max_turns`,
+      [leadId],
+    );
+  }
+
+  async activeMissions(): Promise<Array<LeadMission & { title: string }>> {
+    const result = await this.db.query<LeadMission & { title: string }>(
+      `SELECT m.lead_id,m.instruction,m.active,m.deadline,m.max_turns,m.turns_used,m.stopped_reason,l.title
+       FROM lead_missions m JOIN leads l ON l.id=m.lead_id
+       WHERE m.active=true ORDER BY m.updated_at DESC LIMIT 50`,
+    );
+    return result.rows;
   }
 
   private normalizePolicy(value: Partial<AutonomyPolicyConfig> | null | undefined): AutonomyPolicyConfig {

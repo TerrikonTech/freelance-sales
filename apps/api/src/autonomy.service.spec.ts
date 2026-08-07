@@ -1,4 +1,8 @@
-import { AutonomyPolicyConfig, evaluateAutonomy } from './autonomy.service';
+import {
+  AutonomyPolicyConfig,
+  evaluateAutonomy,
+  strictApprovalEnabled,
+} from './autonomy.service';
 
 describe('smart autonomy fail-closed policy', () => {
   const smart: AutonomyPolicyConfig = {
@@ -17,6 +21,12 @@ describe('smart autonomy fail-closed policy', () => {
       { ...smart, mode: 'manual' },
     );
     expect(result).toMatchObject({ decision: 'ask_owner', signals: ['manual_mode'] });
+  });
+
+  test('strict approval is fail-closed by default', () => {
+    expect(strictApprovalEnabled(undefined)).toBe(true);
+    expect(strictApprovalEnabled('true')).toBe(true);
+    expect(strictApprovalEnabled('false')).toBe(false);
   });
 
   test.each([

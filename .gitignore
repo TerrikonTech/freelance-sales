@@ -13,9 +13,6 @@ runtime/codex-jobs/
 .backups/
 ops/backups/
 runtime/
-portfolio-assets/
-CASE_LIBRARY_50.md
-case_visual_specs.json
 .pytest-cache/
 *.dump
 *.tgz

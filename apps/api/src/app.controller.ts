@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, NotFoundException, Param, Patch, Post, Req, Res, UnauthorizedException, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, NotFoundException, Param, Patch, Post, Query, Req, Res, UnauthorizedException, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
@@ -6,10 +6,12 @@ import { resolve } from 'node:path';
 import { AiService } from './ai.service';
 import { AuthGuard, AuthenticatedRequest } from './auth.guard';
 import { DatabaseService } from './database.service';
+import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { QueueService } from './queue.service';
 import { SalesAgentService } from './sales-agent.service';
+import { SandboxService } from './sandbox.service';
 import { SettingsService } from './settings.service';
 import { TelegramService } from './telegram.service';
 
@@ -20,10 +22,12 @@ export class AppController {
     private readonly queue: QueueService,
     private readonly settings: SettingsService,
     private readonly ai: AiService,
+    private readonly design: DesignConceptService,
     private readonly fl: FlService,
     private readonly telegram: TelegramService,
     private readonly documents: DocumentsService,
     private readonly salesAgent: SalesAgentService,
+    private readonly sandbox: SandboxService,
   ) {}
 
   @Get('health')
@@ -32,10 +36,27 @@ export class AppController {
     return { ok: true, service: 'freelance-sales-v2', strictApproval: process.env.STRICT_APPROVAL !== 'false' };
   }
 
+  @Get('public/design-assets/:id')
+  async publicDesignAsset(
+    @Param('id') id: string,
+    @Query('expires') expires: string,
+    @Query('signature') signature: string,
+    @Res() res: Response,
+  ) {
+    try {
+      const asset = await this.design.publicAsset(id, String(expires || ''), String(signature || ''));
+      res.setHeader('Content-Type', asset.contentType);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return res.sendFile(asset.path);
+    } catch {
+      throw new NotFoundException();
+    }
+  }
+
   @Get('dashboard')
   @UseGuards(AuthGuard)
   async dashboard() {
-    const [counts, recent, connectors, scan] = await Promise.all([
+    const [counts, recent, connectors, scan, architecture] = await Promise.all([
       this.db.query<{ leads: string; new24: string; analyzed24: string; qualified24: string; pending: string; qualified: string; rejected: string; active: string }>(`SELECT
         count(*)::text AS leads,
         count(*) FILTER (WHERE created_at >= now()-interval '24 hours')::text AS new24,
@@ -44,9 +65,11 @@ export class AppController {
         count(*) FILTER (WHERE status='qualified')::text AS qualified,
         count(*) FILTER (WHERE status='rejected')::text AS rejected,
         count(*) FILTER (WHERE status IN ('contacted','discovery','proposal','negotiation'))::text AS active,
-        (SELECT count(*) FROM drafts WHERE status='pending')::text AS pending FROM leads WHERE status<>'archived'`),
+        (SELECT count(*) FROM drafts d JOIN leads dl ON dl.id=d.lead_id WHERE d.status='pending' AND dl.source<>'sandbox')::text AS pending
+        FROM leads WHERE status<>'archived' AND source<>'sandbox'`),
       this.db.query(`SELECT id,title,source,status,score,recommended_price,updated_at FROM leads
-        WHERE status<>'archived' ORDER BY CASE status WHEN 'qualified' THEN 0 WHEN 'new' THEN 1 ELSE 2 END,updated_at DESC LIMIT 10`),
+        WHERE status<>'archived' AND source<>'sandbox'
+        ORDER BY CASE status WHEN 'qualified' THEN 0 WHEN 'new' THEN 1 ELSE 2 END,updated_at DESC LIMIT 10`),
       this.settings.connectorSummary(),
       this.db.query(`SELECT
         COALESCE(sum(found_count),0)::text AS found24,
@@ -56,14 +79,29 @@ export class AppController {
         COALESCE(round(avg(duration_ms)),0)::text AS avg_duration_ms,
         max(created_at) AS last_scan_at
         FROM scan_runs WHERE connector='fl' AND created_at >= now()-interval '24 hours'`),
+      this.db.query(`SELECT
+        (SELECT count(*) FROM conversation_handoffs h JOIN leads l ON l.id=h.lead_id WHERE h.status='used' AND l.source<>'sandbox')::text AS handoffs_used,
+        (SELECT count(DISTINCT r.lead_id) FROM sales_requirements r JOIN leads l ON l.id=r.lead_id WHERE l.source<>'sandbox')::text AS discovery_leads,
+        (SELECT count(*) FROM documents d JOIN leads l ON l.id=d.lead_id WHERE d.kind='specification' AND l.source<>'sandbox')::text AS specifications,
+        (SELECT count(*) FROM documents d JOIN leads l ON l.id=d.lead_id WHERE d.kind='contract' AND l.source<>'sandbox')::text AS contracts,
+        (SELECT count(*) FROM design_assets a JOIN leads l ON l.id=a.lead_id WHERE l.source<>'sandbox')::text AS designs,
+        (SELECT count(*) FROM lead_missions m JOIN leads l ON l.id=m.lead_id WHERE m.active AND l.source<>'sandbox')::text AS active_missions,
+        (SELECT count(*) FROM ai_tasks t WHERE t.status='failed' AND t.created_at >= now()-interval '24 hours'
+          AND COALESCE(t.payload->'lead'->>'source',t.payload->'context'->'lead'->>'source','')<>'sandbox'
+          AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.id::text=t.payload->>'leadId' AND l.source='sandbox'))::text AS ai_failed_24h,
+        (SELECT count(*) FROM ai_tasks t WHERE t.status IN ('pending','claimed') AND t.created_at < now()-interval '15 minutes'
+          AND COALESCE(t.payload->'lead'->>'source',t.payload->'context'->'lead'->>'source','')<>'sandbox'
+          AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.id::text=t.payload->>'leadId' AND l.source='sandbox'))::text AS ai_stuck,
+        (SELECT count(*) FROM outbound_deliveries o JOIN leads l ON l.id=o.lead_id
+          WHERE o.status IN ('failed_before_send','send_unknown') AND o.created_at >= now()-interval '24 hours' AND l.source<>'sandbox')::text AS delivery_failed_24h`),
     ]);
-    return { metrics: counts.rows[0], recent: recent.rows, connectors, scan: scan.rows[0] };
+    return { metrics: counts.rows[0], recent: recent.rows, connectors, scan: scan.rows[0], architecture: architecture.rows[0] };
   }
 
   @Get('leads')
   @UseGuards(AuthGuard)
   async leads() {
-    return (await this.db.query("SELECT id,title,source,status,score,confidence,recommended_price,recommended_days,budget_text,url,updated_at FROM leads WHERE status<>'archived' ORDER BY updated_at DESC LIMIT 300")).rows;
+    return (await this.db.query("SELECT id,title,source,status,score,confidence,recommended_price,recommended_days,budget_text,url,updated_at FROM leads WHERE status<>'archived' AND source<>'sandbox' ORDER BY updated_at DESC LIMIT 300")).rows;
   }
 
   @Get('chats')
@@ -79,7 +117,7 @@ export class AppController {
       LEFT JOIN LATERAL (
         SELECT content,direction,created_at FROM messages WHERE lead_id=l.id ORDER BY created_at DESC LIMIT 1
       ) last_message ON true
-      WHERE l.client ? 'fl_dialog_id' OR EXISTS (SELECT 1 FROM messages m WHERE m.lead_id=l.id)
+      WHERE l.source<>'sandbox' AND (l.client ? 'fl_dialog_id' OR EXISTS (SELECT 1 FROM messages m WHERE m.lead_id=l.id))
       ORDER BY COALESCE(NULLIF(l.client->>'fl_chat_rank','')::int,999999),last_message.created_at DESC NULLS LAST,l.updated_at DESC LIMIT 300`)).rows;
   }
 
@@ -208,8 +246,77 @@ export class AppController {
     return (await this.db.query(`SELECT d.*,l.title AS lead_title,l.score,l.recommended_price,l.recommended_days,
       CASE WHEN d.metadata->>'mode'='chat' THEN 'message' ELSE 'response' END AS draft_type
       FROM drafts d JOIN leads l ON l.id=d.lead_id
-      WHERE d.status IN ('pending','approved','sending','failed','stale','send_unknown')
+      WHERE d.status IN ('pending','approved','sending','failed','stale','send_unknown') AND l.source<>'sandbox'
       ORDER BY d.created_at DESC LIMIT 300`)).rows;
+  }
+
+  @Get('sandbox')
+  @UseGuards(AuthGuard)
+  async sandboxRuns() {
+    return this.sandbox.list();
+  }
+
+  @Post('sandbox')
+  @UseGuards(AuthGuard)
+  async createSandbox(@Body() body: { scenario?: string }) {
+    return this.sandbox.create(String(body.scenario || 'web_service'));
+  }
+
+  @Get('sandbox/:id')
+  @UseGuards(AuthGuard)
+  async sandboxState(@Param('id') id: string) {
+    return this.sandbox.state(id);
+  }
+
+  @Post('sandbox/:id/draft')
+  @UseGuards(AuthGuard)
+  async sandboxDraft(@Param('id') id: string) {
+    return this.sandbox.draftInitial(id);
+  }
+
+  @Post('sandbox/:id/client-message')
+  @UseGuards(AuthGuard)
+  async sandboxClientMessage(@Param('id') id: string, @Body() body: { content?: string }) {
+    return this.sandbox.clientMessage(id, String(body.content || ''));
+  }
+
+  @Post('sandbox/:id/handoff')
+  @UseGuards(AuthGuard)
+  async sandboxHandoff(@Param('id') id: string) {
+    return this.sandbox.handoff(id);
+  }
+
+  @Post('sandbox/:id/telegram-message')
+  @UseGuards(AuthGuard)
+  async sandboxTelegramMessage(@Param('id') id: string, @Body() body: { content?: string }) {
+    return this.sandbox.telegramMessage(id, String(body.content || ''));
+  }
+
+  @Post('sandbox/:id/documents')
+  @UseGuards(AuthGuard)
+  async sandboxDocuments(@Param('id') id: string) {
+    return this.sandbox.documents(id);
+  }
+
+  @Post('sandbox/:id/design')
+  @UseGuards(AuthGuard)
+  async sandboxDesign(@Param('id') id: string) {
+    return this.sandbox.design(id);
+  }
+
+  @Post('sandbox/:id/archive')
+  @UseGuards(AuthGuard)
+  async sandboxArchive(@Param('id') id: string) {
+    return this.sandbox.archive(id);
+  }
+
+  @Get('sandbox/assets/:id')
+  @UseGuards(AuthGuard)
+  async sandboxAsset(@Param('id') id: string, @Res() res: Response) {
+    const asset = await this.sandbox.asset(id);
+    res.setHeader('Content-Type', asset.contentType);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    return res.sendFile(asset.path);
   }
 
   @Patch('drafts/:id')
@@ -292,13 +399,13 @@ export class AppController {
   @Get('settings')
   @UseGuards(AuthGuard)
   async getSettings() {
-    const [seller, style, connectors, telegram, fl, contractTemplate, flCookies] = await Promise.all([
+    const [seller, style, connectors, telegram, fl, images, contractTemplate, flCookies] = await Promise.all([
       this.settings.getPublic('seller_profile'), this.settings.getPublic('style_profile'), this.settings.connectorSummary(),
       this.settings.getSecret('telegram_bot_token'), this.settings.getSecret('fl_cookies'),
-      this.documents.hasContractTemplate(), this.fl.cookieStatus(),
+      this.design.configured(), this.documents.hasContractTemplate(), this.fl.cookieStatus(),
     ]);
     const codex = connectors.find((item) => String(item.connector) === 'codex');
-    return { seller: seller || {}, style: style || {}, connectors, flCookies, configured: { codex: Boolean(codex?.healthy), telegram: Boolean(telegram), fl: Boolean(fl), contractTemplate } };
+    return { seller: seller || {}, style: style || {}, connectors, flCookies, configured: { codex: Boolean(codex?.healthy), telegram: Boolean(telegram), fl: Boolean(fl), images: Boolean(images), contractTemplate } };
   }
 
   @Patch('settings/profile')
@@ -332,6 +439,21 @@ export class AppController {
     await this.settings.setSecret('telegram_bot_token', body.botToken.trim());
     await this.settings.setSecret('telegram_webhook_secret', randomBytes(32).toString('hex'));
     return this.telegram.configureWebhook();
+  }
+
+  @Post('settings/images')
+  @UseGuards(AuthGuard)
+  async configureImages(@Body() body: { apiKey?: string }) {
+    const apiKey = String(body.apiKey || '').trim();
+    if (apiKey.length < 20 || !apiKey.startsWith('sk-')) throw new ConflictException('Некорректный OpenAI API key');
+    await this.settings.setSecret('openai_image_api_key', apiKey);
+    await this.settings.setConnectorState('images', {
+      enabled: true,
+      healthy: true,
+      statusText: 'OpenAI Images key сохранён; используется только по команде владельца',
+      success: true,
+    });
+    return { ok: true };
   }
 
   @Post('settings/contract-template')

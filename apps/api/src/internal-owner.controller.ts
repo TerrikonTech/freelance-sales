@@ -89,7 +89,8 @@ export class InternalOwnerController {
            SELECT n.id FROM owner_notifications n
            JOIN autonomy_decisions a ON a.id=n.decision_id
            JOIN drafts d ON d.id=a.draft_id
-           WHERE n.status='pending' AND a.decision='ask_owner' AND d.status='pending'
+           JOIN leads l ON l.id=a.lead_id
+           WHERE n.status='pending' AND a.decision='ask_owner' AND d.status='pending' AND l.source<>'sandbox'
            ORDER BY n.created_at
            FOR UPDATE OF n SKIP LOCKED
            LIMIT 1
@@ -156,7 +157,7 @@ export class InternalOwnerController {
          FROM autonomy_decisions a
          JOIN leads l ON l.id=a.lead_id
          JOIN drafts d ON d.id=a.draft_id
-         WHERE a.decision='ask_owner' AND d.status='pending'
+         WHERE a.decision='ask_owner' AND d.status='pending' AND l.source<>'sandbox'
          ORDER BY a.created_at DESC
          LIMIT 10`,
       ),
@@ -265,7 +266,8 @@ export class InternalOwnerController {
        SELECT a.id
        FROM autonomy_decisions a
        JOIN drafts d ON d.id=a.draft_id
-       WHERE a.decision='ask_owner' AND d.status='pending'
+       JOIN leads l ON l.id=a.lead_id
+       WHERE a.decision='ask_owner' AND d.status='pending' AND l.source<>'sandbox'
        ON CONFLICT(decision_id) DO NOTHING`,
     );
   }
