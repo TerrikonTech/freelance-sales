@@ -37,6 +37,15 @@ describe('research-backed chat policy', () => {
     expect(classifyChatStopReasons(message)).toContain(reason);
   });
 
+  test.each([
+    'Срок хранения файла — 30 дней',
+    'Цена вопроса — корректно связать каталоги',
+    'Работаем без созвонов, только текстом',
+    'Проверю доступность API',
+  ])('does not escalate a known regex false positive: %s', (message) => {
+    expect(classifyChatStopReasons(message)).toEqual([]);
+  });
+
   test('counts and caps the full discovery question budget at seven', () => {
     const snapshot = buildChatPolicySnapshot({
       channel: 'telegram',
@@ -113,6 +122,23 @@ describe('research-backed chat policy', () => {
     const reply = ownerEscalationReply(['ai_identity'], 'сегодня до 18:00 по Москве');
     expect(reply).toContain('ИИ-инструмент');
     expect(reply).toContain('решения');
+  });
+
+  test('rotates escalation copy and avoids a reply already used for the lead', () => {
+    const first = ownerEscalationReply(['commitment'], 'завтра', 'lead-1');
+    const second = ownerEscalationReply(['commitment'], 'завтра', 'lead-1', [first]);
+    expect(second).not.toBe(first);
+    expect(second).toContain('завтра');
+  });
+
+  test('blocks an unreviewed numeric commitment in a safe reply', () => {
+    expect(reviewChatReply({
+      reply: 'Сделаю за 5 дней. Подходит?',
+      conversationStage: 's2_discovery',
+      valueBeforeQuestion: true,
+      discoveryQuestionsRemaining: 2,
+      requiresOwner: false,
+    })).toContain('В безопасном автоответе обнаружен срок или длительность.');
   });
 
   test('counts only actual question marks', () => {

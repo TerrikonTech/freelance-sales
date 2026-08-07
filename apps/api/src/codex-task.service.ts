@@ -7,9 +7,12 @@ export class CodexTaskService {
   constructor(private readonly db: DatabaseService, private readonly settings: SettingsService) {}
 
   async run<T>(kind: string, payload: Record<string, unknown>, timeoutMs = 20 * 60_000): Promise<T> {
+    const modelTier = ['owner_query', 'owner_overview', 'draft_strategy', 'draft_review', 'conversation_turn'].includes(kind)
+      ? 'smart'
+      : 'fast';
     const created = await this.db.query<{ id: string }>(
-      'INSERT INTO ai_tasks(kind,payload) VALUES($1,$2) RETURNING id',
-      [kind, JSON.stringify(payload)],
+      'INSERT INTO ai_tasks(kind,payload,model_tier) VALUES($1,$2,$3) RETURNING id',
+      [kind, JSON.stringify(payload), modelTier],
     );
     const id = created.rows[0].id;
     const deadline = Date.now() + timeoutMs;
@@ -26,7 +29,6 @@ export class CodexTaskService {
   }
 
   async claim(workerId: string) {
-    await this.db.query("UPDATE ai_tasks SET status='pending',claimed_by=NULL,claimed_at=NULL,updated_at=now() WHERE status='claimed' AND claimed_at < now() - interval '25 minutes'");
     const result = await this.db.query(
       `UPDATE ai_tasks SET status='claimed',claimed_by=$1,claimed_at=now(),updated_at=now()
        WHERE id=(
@@ -41,7 +43,7 @@ export class CodexTaskService {
          END, created_at
          FOR UPDATE SKIP LOCKED LIMIT 1
        )
-       RETURNING id,kind,payload,created_at`,
+       RETURNING id,kind,payload,model_tier,created_at`,
       [workerId.slice(0, 120)],
     );
     return result.rows[0] || null;
@@ -49,7 +51,9 @@ export class CodexTaskService {
 
   async complete(id: string, result: Record<string, unknown>) {
     const updated = await this.db.query(
-      "UPDATE ai_tasks SET status='completed',result=$2,error=NULL,completed_at=now(),updated_at=now() WHERE id=$1 AND status='claimed' RETURNING id",
+      `UPDATE ai_tasks SET status='completed',result=$2,error=NULL,completed_at=now(),
+       duration_ms=GREATEST(0,extract(epoch FROM (now()-created_at))*1000)::int,updated_at=now()
+       WHERE id=$1 AND status='claimed' RETURNING id`,
       [id, JSON.stringify(result)],
     );
     if (!updated.rows[0]) throw new Error('AI-задача уже завершена или не найдена');

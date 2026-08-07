@@ -1,5 +1,6 @@
 import {
   AutonomyPolicyConfig,
+  classifySafeAutonomyClass,
   evaluateAutonomy,
   strictApprovalEnabled,
 } from './autonomy.service';
@@ -21,6 +22,11 @@ describe('smart autonomy fail-closed policy', () => {
       { ...smart, mode: 'manual' },
     );
     expect(result).toMatchObject({ decision: 'ask_owner', signals: ['manual_mode'] });
+  });
+
+  test('safe class can be measured while global sending stays manual', () => {
+    expect(classifySafeAutonomyClass('Как вы обычно работаете?')).toBe('safe_process_faq');
+    expect(classifySafeAutonomyClass('Обсудим цену и срок?')).toBeNull();
   });
 
   test('strict approval is fail-closed by default', () => {

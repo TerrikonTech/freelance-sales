@@ -21,6 +21,7 @@ import { ProjectAttachmentsService } from './project-attachments.service';
 import { PushController } from './push.controller';
 import { PushService } from './push.service';
 import { QueueService } from './queue.service';
+import { ResearchService } from './research.service';
 import { SalesAgentService } from './sales-agent.service';
 import { SandboxService } from './sandbox.service';
 import { SettingsService } from './settings.service';
@@ -34,6 +35,6 @@ import { TelegramService } from './telegram.service';
     JwtModule.register({ global: true, secret: process.env.JWT_SECRET, signOptions: { expiresIn: '7d', issuer: 'freelance-sales-v2' } }),
   ],
   controllers: [AuthController, AppController, TelegramController, TelegramInternalController, CodexInternalController, InternalOwnerController, PushController, AutonomyController],
-  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, DesignConceptService, SalesAgentService, SandboxService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, AutonomyService, ProcessorService],
+  providers: [DatabaseService, CryptoService, SettingsService, AuthService, AuthGuard, QueueService, CodexTaskService, AiService, DesignConceptService, SalesAgentService, SandboxService, DocumentsService, ProjectAttachmentsService, FlService, TelegramService, PushService, AutonomyService, ResearchService, ProcessorService],
 })
 export class AppModule {}
