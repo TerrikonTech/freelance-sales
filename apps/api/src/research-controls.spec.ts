@@ -4,6 +4,7 @@ import {
   followupDueAt,
   followupInstruction,
   outboundCommitmentIssues,
+  presenceAwareReplyDelaySeconds,
   replyDelaySeconds,
   spotlightClientData,
 } from './research-controls';
@@ -43,5 +44,27 @@ describe('research roadmap controls', () => {
     const long = replyDelaySeconds(500, 'same');
     expect(long).toBeGreaterThan(short);
     expect(replyDelaySeconds(500, 'same')).toBe(long);
+  });
+
+  test('normalizes an inverted reply-delay range', () => {
+    const delay = replyDelaySeconds(500, 'range', {
+      minReplyDelaySeconds: 600,
+      maxReplyDelaySeconds: 10,
+    });
+    expect(delay).toBeGreaterThanOrEqual(600);
+  });
+
+  test('defers an overnight auto reply until the next Moscow workday', () => {
+    const fridayNight = new Date('2026-08-07T20:30:00.000Z'); // 23:30 Moscow
+    const delay = presenceAwareReplyDelaySeconds(100, 'night', fridayNight, { jitterSeconds: 0 });
+    const due = new Date(fridayNight.getTime() + delay * 1_000);
+    expect(due.toISOString()).toBe('2026-08-10T06:00:00.000Z');
+  });
+
+  test('does not let a long reply spill past the end of the workday', () => {
+    const lateEvening = new Date('2026-08-06T18:59:30.000Z'); // 21:59:30 Moscow
+    const delay = presenceAwareReplyDelaySeconds(500, 'late', lateEvening, { jitterSeconds: 0 });
+    const due = new Date(lateEvening.getTime() + delay * 1_000);
+    expect(due.toISOString()).toBe('2026-08-07T06:00:00.000Z');
   });
 });

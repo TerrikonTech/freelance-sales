@@ -31,12 +31,17 @@ const boundedInteger = (value: unknown, fallback: number, min: number, max: numb
 export function normalizePresenceProfile(value: Partial<PresenceProfile> | null | undefined): PresenceProfile {
   const start = boundedInteger(value?.workdayStartHour, DEFAULT_PRESENCE_PROFILE.workdayStartHour, 0, 22);
   const end = boundedInteger(value?.workdayEndHour, DEFAULT_PRESENCE_PROFILE.workdayEndHour, start + 1, 23);
+  const minReplyDelaySeconds = boundedInteger(value?.minReplyDelaySeconds, 40, 10, 600);
+  const maxReplyDelaySeconds = Math.max(
+    minReplyDelaySeconds,
+    boundedInteger(value?.maxReplyDelaySeconds, 120, 10, 1_800),
+  );
   return {
     timezone: 'Europe/Moscow',
     workdayStartHour: start,
     workdayEndHour: Math.max(start + 1, end),
-    minReplyDelaySeconds: boundedInteger(value?.minReplyDelaySeconds, 40, 10, 600),
-    maxReplyDelaySeconds: boundedInteger(value?.maxReplyDelaySeconds, 120, 10, 1_800),
+    minReplyDelaySeconds,
+    maxReplyDelaySeconds,
     jitterSeconds: boundedInteger(value?.jitterSeconds, 90, 0, 600),
     dailyInitiativeLimit: boundedInteger(value?.dailyInitiativeLimit, 10, 1, 50),
   };
@@ -85,6 +90,32 @@ export function replyDelaySeconds(characters: number, seed: string, rawProfile?:
     + Math.round((profile.maxReplyDelaySeconds - profile.minReplyDelaySeconds) * complexity);
   const jitter = profile.jitterSeconds > 0 ? seededNumber(seed) % (profile.jitterSeconds + 1) : 0;
   return base + jitter;
+}
+
+export function presenceAwareReplyDelaySeconds(
+  characters: number,
+  seed: string,
+  now = new Date(),
+  rawProfile?: Partial<PresenceProfile> | null,
+): number {
+  const profile = normalizePresenceProfile(rawProfile);
+  const ordinaryDelay = replyDelaySeconds(characters, seed, profile);
+  const localNow = new Date(now.getTime() + MOSCOW_OFFSET_MS);
+  const localCandidate = new Date(localNow.getTime() + ordinaryDelay * 1_000);
+  const candidateInsideWorkday = !isWeekend(localCandidate)
+    && localCandidate.getUTCHours() >= profile.workdayStartHour
+    && localCandidate.getUTCHours() < profile.workdayEndHour;
+  if (candidateInsideWorkday) return ordinaryDelay;
+
+  const nextStart = new Date(localNow);
+  const canStillUseToday = !isWeekend(nextStart) && nextStart.getUTCHours() < profile.workdayStartHour;
+  if (!canStillUseToday) {
+    nextStart.setUTCDate(nextStart.getUTCDate() + 1);
+  }
+  nextStart.setUTCHours(profile.workdayStartHour, 0, 0, 0);
+  while (isWeekend(nextStart)) nextStart.setUTCDate(nextStart.getUTCDate() + 1);
+  const jitter = profile.jitterSeconds > 0 ? seededNumber(`${seed}:presence`) % (profile.jitterSeconds + 1) : 0;
+  return Math.max(ordinaryDelay, Math.ceil((nextStart.getTime() - localNow.getTime()) / 1_000) + jitter);
 }
 
 export function followupInstruction(touchNo: number): string {

@@ -314,7 +314,7 @@ export class AutonomyService {
     const evaluation = observedClass && !rawEvaluation.signals.some((signal) => signal.startsWith('class:'))
       ? { ...rawEvaluation, signals: [...rawEvaluation.signals, `class:${observedClass}`] }
       : rawEvaluation;
-    if (evaluation.decision !== 'auto_send' || evaluation.signals.includes('mission')) {
+    if (evaluation.decision !== 'auto_send' || (evaluation.signals.includes('mission') && !observedClass)) {
       return { ...evaluation, policyMode: policy.mode };
     }
     const className = observedClass || autonomyClassFromSignals(evaluation.signals);
