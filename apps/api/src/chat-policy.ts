@@ -45,7 +45,7 @@ export type ChatPolicySnapshot = {
 const STOP_PATTERNS: Array<[ChatStopReason, RegExp]> = [
   [
     'commitment',
-    /(?:цен[аыуеой]|стоить|стоимост|бюджет|скидк|срок|дедлайн|договор|гарант|предоплат|постоплат|nda|доступ(?:ы|а|ов|ом|ами|ить)?|парол|токен|api[- ]?ключ)/iu,
+    /(?:цен[аыуеой]|стоить|стоимост|бюджет|скидк|срок|дедлайн|договор|гарант|предоплат|постоплат|nda|доступ(?:ы|а|ов|ом|ами|ить)?(?!\p{L})|парол|токен|api[- ]?ключ)/iu,
   ],
   [
     'human_requested',
@@ -70,7 +70,10 @@ export function countChatQuestions(value: unknown): number {
 }
 
 export function classifyChatStopReasons(value: unknown): ChatStopReason[] {
-  const text = String(value || '').normalize('NFKC');
+  const text = String(value || '').normalize('NFKC')
+    .replace(/срок\s+хранени\p{L}*/giu, '')
+    .replace(/цен[аыуеой]\s+вопроса/giu, '')
+    .replace(/без\s+созвонов?(?:,?\s+только\s+текст(?:ом)?)?/giu, '');
   return STOP_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(([reason]) => reason);
 }
 
@@ -142,23 +145,60 @@ export function ownerReplyDeadline(now = new Date()): string {
     : 'в следующий рабочий день до 11:00 по Москве';
 }
 
-export function ownerEscalationReply(reasons: ChatStopReason[], deadline: string): string {
-  if (reasons.includes('ai_identity')) {
-    return 'Мне помогает ИИ-инструмент готовить черновики и держать контекст, но решения по проекту и обязательствам принимаю я лично.';
+export function ownerEscalationReply(
+  reasons: ChatStopReason[],
+  deadline: string,
+  seed = '',
+  recentReplies: string[] = [],
+): string {
+  const key = reasons.includes('ai_identity') ? 'ai_identity'
+    : reasons.includes('negative_tone') ? 'negative_tone'
+      : reasons.includes('human_requested') ? 'human_requested'
+        : reasons.includes('red_flag') ? 'red_flag'
+          : reasons.includes('commitment') ? 'commitment'
+            : 'fallback';
+  const variants: Record<string, string[]> = {
+    ai_identity: [
+      'Мне помогает ИИ-инструмент готовить черновики и держать контекст, но решения по проекту и обязательствам принимаю я лично.',
+      'Да, для черновиков и памяти я использую ИИ. Все условия проекта проверяю и подтверждаю лично.',
+      'ИИ помогает мне не терять детали переписки; цену, сроки и остальные решения всегда подтверждаю сам.',
+    ],
+    negative_tone: [
+      `Понял, здесь мой ответ действительно не попал в вопрос. Перечитаю контекст лично и вернусь с ответом ${deadline}.`,
+      `Согласен, сейчас ответ получился мимо сути. Сам пересмотрю переписку и дам точный ответ ${deadline}.`,
+      `Вижу, что неправильно понял акцент. Подключусь лично и исправлю ответ ${deadline}.`,
+    ],
+    human_requested: [
+      `Да, подключусь лично. Перечитаю контекст и предложу следующий шаг ${deadline}.`,
+      `Хорошо, дальше отвечу сам. Сверю всю переписку и вернусь ${deadline}.`,
+      `Принял — нужен мой личный ответ. Подготовлю его по полному контексту ${deadline}.`,
+    ],
+    red_flag: [
+      `Такой формат сначала проверю лично, чтобы не зафиксировать неверные условия. Вернусь с ответом ${deadline}.`,
+      `Здесь не хочу подтверждать условия без личной проверки. Разберу детали и отвечу ${deadline}.`,
+      `Этот вариант требует отдельной проверки с моей стороны. Вернусь с решением ${deadline}.`,
+    ],
+    commitment: [
+      `По деньгам, срокам и условиям решаю лично. Проверю объём и вернусь с конкретикой ${deadline}.`,
+      `Чтобы не назвать случайные цифры, я сам сверю объём и условия. Дам конкретный ответ ${deadline}.`,
+      `Цену и срок подтверждаю только после личной проверки контекста. Вернусь с расчётом ${deadline}.`,
+      `Это вопрос обязательств, поэтому отвечу сам после сверки объёма — ${deadline}.`,
+    ],
+    fallback: [
+      `Хороший вопрос — сначала проверю детали лично, чтобы не ответить наугад. Вернусь с конкретикой ${deadline}.`,
+      `Здесь нужна моя проверка контекста. Дам предметный ответ ${deadline}.`,
+      `Не хочу гадать по неполным данным — пересмотрю детали и отвечу ${deadline}.`,
+    ],
+  };
+  const pool = variants[key];
+  const offset = seed
+    ? Number.parseInt(createHash('sha256').update(`${seed}:${key}`).digest('hex').slice(0, 8), 16) % pool.length
+    : 0;
+  for (let index = 0; index < pool.length; index += 1) {
+    const candidate = pool[(offset + index) % pool.length];
+    if (!recentReplies.includes(candidate)) return candidate;
   }
-  if (reasons.includes('negative_tone')) {
-    return `Понял, здесь мой ответ действительно не попал в вопрос. Перечитаю контекст лично и вернусь с ответом ${deadline}.`;
-  }
-  if (reasons.includes('human_requested')) {
-    return `Да, подключусь лично. Перечитаю контекст и предложу следующий шаг ${deadline}.`;
-  }
-  if (reasons.includes('red_flag')) {
-    return `Такой формат сначала проверю лично, чтобы не зафиксировать неверные условия. Вернусь с ответом ${deadline}.`;
-  }
-  if (reasons.includes('commitment')) {
-    return `По деньгам, срокам и условиям решаю лично. Проверю объём и вернусь с конкретикой ${deadline}.`;
-  }
-  return `Хороший вопрос — сначала проверю детали лично, чтобы не ответить наугад. Вернусь с конкретикой ${deadline}.`;
+  return pool[offset];
 }
 
 export function reviewChatReply(input: {
@@ -194,5 +234,8 @@ export function reviewChatReply(input: {
   if (!input.requiresOwner && classifyChatStopReasons(reply).includes('ai_identity')) {
     issues.push('Ответ о природе ИИ должен пройти через владельца.');
   }
+  if (!input.requiresOwner) issues.push(...outboundCommitmentIssues(reply));
   return issues;
 }
+import { createHash } from 'node:crypto';
+import { outboundCommitmentIssues } from './research-controls';

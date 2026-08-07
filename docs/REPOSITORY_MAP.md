@@ -14,6 +14,7 @@
 | `docker-compose.yml` | production-like services и safety flags |
 | `deploy.sh` | первичная установка, build, health и выбор broker |
 | `.env.example` | перечень конфигурации без секретных значений |
+| `docs/RESEARCH_ROADMAP.md` | реализация исследования и safety gates фаз 0–3 |
 
 ## `apps/api/src`
 
@@ -29,6 +30,8 @@
 | `pricing-policy.ts` | детерминированные категории цены и модификаторы |
 | `sales-agent.service.ts` | единый агент сделки, требования, handoff и ответы |
 | `chat-policy.ts` | стадии общения, лимиты вопросов и stop rules |
+| `research-controls.ts` | follow-up, присутствие, spotlighting и пороги классов |
+| `research.service.ts` | расписание касаний, воронка, evals и агрегаты исследования |
 | `telegram.service.ts` | webhook, owner intents, identity и доставка |
 | `autonomy.service.ts` | решение allow/draft/block и client state |
 | `processor.service.ts` | фоновые job handlers и внешняя доставка |

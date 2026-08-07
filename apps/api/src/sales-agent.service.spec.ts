@@ -11,7 +11,7 @@ describe('Sales agent outbound target safety', () => {
 
   test('does not mistake an FL project id for a chat id', async () => {
     const db = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never);
+    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never, {} as never);
     await expect(
       (service as any).preferredOutboundTarget(lead),
     ).resolves.toBeNull();
@@ -19,7 +19,7 @@ describe('Sales agent outbound target safety', () => {
 
   test('uses only an explicitly registered FL dialog', async () => {
     const db = { query: jest.fn().mockResolvedValue({ rows: [{ channel: 'fl', external_id: 'dialog-456' }] }) };
-    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never);
+    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never, {} as never);
     await expect(
       (service as any).preferredOutboundTarget(lead),
     ).resolves.toEqual({ channel: 'fl', externalId: 'dialog-456' });
@@ -34,7 +34,7 @@ describe('Sales agent outbound target safety', () => {
         .mockResolvedValueOnce({ rows: [] }),
     };
     const ai = { draftReply: jest.fn() };
-    const service = new SalesAgentService(db as never, {} as never, {} as never, ai as never, {} as never);
+    const service = new SalesAgentService(db as never, {} as never, {} as never, ai as never, {} as never, {} as never);
     await expect(
       service.prepareOwnerOutbound('owner-1', 'в работу', 'разработку'),
     ).rejects.toThrow('Ничего не отправлено');
@@ -48,7 +48,7 @@ describe('Sales agent outbound target safety', () => {
         .mockResolvedValueOnce({ rows: [{ ...matchedLead, recipient_aliases: [] }] })
         .mockResolvedValueOnce({ rows: [] }),
     };
-    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never);
+    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never, {} as never);
     await expect(
       (service as any).resolveOwnerRecipient('owner-1', 'олегу', null),
     ).resolves.toMatchObject({ id: 'lead-1' });
@@ -64,7 +64,7 @@ describe('Sales agent outbound target safety', () => {
         ],
       }),
     };
-    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never);
+    const service = new SalesAgentService(db as never, {} as never, {} as never, {} as never, {} as never, {} as never);
     await expect(
       (service as any).resolveOwnerRecipient('owner-1', 'олегу', null),
     ).rejects.toThrow('несколько клиентов');

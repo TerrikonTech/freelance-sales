@@ -4,12 +4,15 @@ import { Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { AiService } from './ai.service';
+import { AutonomyService } from './autonomy.service';
 import { AuthGuard, AuthenticatedRequest } from './auth.guard';
 import { DatabaseService } from './database.service';
 import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { QueueService } from './queue.service';
+import { PresenceProfile } from './research-controls';
+import { ResearchService } from './research.service';
 import { SalesAgentService } from './sales-agent.service';
 import { SandboxService } from './sandbox.service';
 import { SettingsService } from './settings.service';
@@ -28,6 +31,8 @@ export class AppController {
     private readonly documents: DocumentsService,
     private readonly salesAgent: SalesAgentService,
     private readonly sandbox: SandboxService,
+    private readonly autonomy: AutonomyService,
+    private readonly research: ResearchService,
   ) {}
 
   @Get('health')
@@ -56,7 +61,7 @@ export class AppController {
   @Get('dashboard')
   @UseGuards(AuthGuard)
   async dashboard() {
-    const [counts, recent, connectors, scan, architecture] = await Promise.all([
+    const [counts, recent, connectors, scan, architecture, research] = await Promise.all([
       this.db.query<{ leads: string; new24: string; analyzed24: string; qualified24: string; pending: string; qualified: string; rejected: string; active: string }>(`SELECT
         count(*)::text AS leads,
         count(*) FILTER (WHERE created_at >= now()-interval '24 hours')::text AS new24,
@@ -94,8 +99,21 @@ export class AppController {
           AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.id::text=t.payload->>'leadId' AND l.source='sandbox'))::text AS ai_stuck,
         (SELECT count(*) FROM outbound_deliveries o JOIN leads l ON l.id=o.lead_id
           WHERE o.status IN ('failed_before_send','send_unknown') AND o.created_at >= now()-interval '24 hours' AND l.source<>'sandbox')::text AS delivery_failed_24h`),
+      this.research.overview(),
     ]);
-    return { metrics: counts.rows[0], recent: recent.rows, connectors, scan: scan.rows[0], architecture: architecture.rows[0] };
+    return { metrics: counts.rows[0], recent: recent.rows, connectors, scan: scan.rows[0], architecture: architecture.rows[0], research };
+  }
+
+  @Get('research/overview')
+  @UseGuards(AuthGuard)
+  async researchOverview() {
+    return this.research.overview();
+  }
+
+  @Patch('research/presence')
+  @UseGuards(AuthGuard)
+  async researchPresence(@Body() body: Partial<PresenceProfile>) {
+    return this.research.setPresenceProfile(body);
   }
 
   @Get('leads')
@@ -323,11 +341,25 @@ export class AppController {
   @UseGuards(AuthGuard)
   async editDraft(@Param('id') id: string, @Body() body: { content?: string }) {
     if (!body.content?.trim()) throw new ConflictException('Пустой текст');
+    const previous = (await this.db.query<{ lead_id: string; content: string; metadata: Record<string, unknown> }>(
+      'SELECT lead_id,content,metadata FROM drafts WHERE id=$1',
+      [id],
+    )).rows[0];
     const hash = createHash('sha256').update(body.content.trim()).digest('hex');
     const result = await this.db.query(`UPDATE drafts SET content=$2,content_hash=$3,version=version+1,status='pending',approved_by=NULL,approved_at=NULL,error=NULL,
       metadata=COALESCE(metadata,'{}'::jsonb) || jsonb_build_object('owner_edited',true),updated_at=now()
       WHERE id=$1 AND status IN ('pending','failed','stale') RETURNING id`, [id, body.content.trim(), hash]);
     if (!result.rows[0]) throw new ConflictException('Этот черновик уже нельзя менять');
+    await this.autonomy.recordOwnerFeedback(id, 'edited');
+    if (previous) {
+      await this.db.query(
+        `INSERT INTO quality_cases(lead_id,draft_id,input_snapshot,original_reply,expected_reply,failure_reason)
+         VALUES($1,$2,$3,$4,$5,'owner_edited')
+         ON CONFLICT(draft_id,source) DO UPDATE SET expected_reply=EXCLUDED.expected_reply,
+           failure_reason=EXCLUDED.failure_reason,updated_at=now()`,
+        [previous.lead_id, id, JSON.stringify({ metadata: previous.metadata }), previous.content, body.content.trim()],
+      );
+    }
     return { ok: true };
   }
 
@@ -381,18 +413,34 @@ export class AppController {
         throw new ConflictException('Появилось новое сообщение — нужен свежий ответ');
       }
       await client.query("UPDATE drafts SET status='approved',approved_by=$2,approved_at=now(),updated_at=now() WHERE id=$1", [id, req.user!.sub]);
+      await client.query("UPDATE followup_schedule SET status='approved',updated_at=now() WHERE draft_id=$1 AND status='drafted'", [id]);
       await client.query("INSERT INTO activities(lead_id,actor,action,details) VALUES($1,$2,'draft_approved',$3)", [draft.lead_id, req.user!.email, JSON.stringify({ draftId: id, hash: draft.content_hash })]);
       return draft;
     });
     await this.queue.add('send-draft', { draftId: id }, `send-${id}`);
+    await this.autonomy.recordOwnerFeedback(id, 'approved');
     return { queued: true, hash: approved.content_hash };
   }
 
   @Post('drafts/:id/reject')
   @UseGuards(AuthGuard)
   async reject(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
-    await this.db.query("UPDATE drafts SET status='rejected',updated_at=now() WHERE id=$1 AND status IN ('pending','failed','stale')", [id]);
+    const draft = (await this.db.query<{ lead_id: string; content: string; metadata: Record<string, unknown> }>(
+      'SELECT lead_id,content,metadata FROM drafts WHERE id=$1',
+      [id],
+    )).rows[0];
+    const updated = await this.db.query("UPDATE drafts SET status='rejected',updated_at=now() WHERE id=$1 AND status IN ('pending','failed','stale') RETURNING id", [id]);
+    if (!updated.rows[0]) throw new ConflictException('Этот черновик уже обработан');
     await this.db.query("INSERT INTO activities(actor,action,details) VALUES($1,'draft_rejected',$2)", [req.user!.email, JSON.stringify({ draftId: id })]);
+    await this.autonomy.recordOwnerFeedback(id, 'rejected');
+    await this.db.query("UPDATE followup_schedule SET status='cancelled',cancel_reason='owner_rejected',updated_at=now() WHERE draft_id=$1 AND status IN ('drafted','approved')", [id]);
+    if (draft) {
+      await this.db.query(
+        `INSERT INTO quality_cases(lead_id,draft_id,input_snapshot,original_reply,failure_reason)
+         VALUES($1,$2,$3,$4,'owner_rejected') ON CONFLICT(draft_id,source) DO NOTHING`,
+        [draft.lead_id, id, JSON.stringify({ metadata: draft.metadata }), draft.content],
+      );
+    }
     return { ok: true };
   }
 

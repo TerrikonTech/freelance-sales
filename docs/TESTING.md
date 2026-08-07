@@ -27,6 +27,18 @@ npm run build
 python3 -m unittest ops/test_sales_hermes_broker.py
 ```
 
+Для рекомендаций системного исследования отдельно полезен короткий набор:
+
+```bash
+npm test -w apps/api -- --runInBand \
+  research-controls.spec.ts chat-policy.spec.ts autonomy.service.spec.ts
+python3 -m unittest ops/test_sales_hermes_broker.py
+```
+
+Он проверяет рабочие дни/джиттер follow-up, фильтр числовых обязательств,
+spotlighting, пороги классов, regex false positives, ротацию эскалаций,
+неотключаемое ручное одобрение FL.ru и схему Hermes.
+
 Проверяются анализ, качество отклика, pricing policy, чат-политика, миссии,
 owner intents, stale drafts, Telegram-уведомления, sandbox, документы,
 автономность и дизайн.

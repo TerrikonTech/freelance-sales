@@ -247,7 +247,40 @@ function Dashboard({ openLead, notify, openApprovals, openChats }: { openLead: (
       </Card>
     </div>
     <Card title="Заказы, на которые стоит посмотреть" subtitle={`${new24} новых за сутки · ${analyzed24} уже оценены`}><LeadRows leads={data.recent.slice(0, 5)} openLead={openLead} /></Card>
+    <ResearchDashboard data={data.research} />
     <ArchitectureDashboard data={data} />
+  </section>;
+}
+
+function ResearchDashboard({ data }: { data: any }) {
+  if (!data) return null;
+  const funnel = data.funnel || {};
+  const followups = data.followups || {};
+  const evals = data.evals || {};
+  const proposals = numberOf(funnel.proposals);
+  const replied = numberOf(funnel.replied);
+  const replyRate = proposals > 0 ? Math.round((replied / proposals) * 100) : 0;
+  const evalTotal = numberOf(evals.total);
+  const evalRate = evalTotal > 0 ? Math.round((numberOf(evals.passed) / evalTotal) * 100) : 100;
+  return <section className="researchDashboard">
+    <div className="researchHead"><div><span className="eyebrow">Контур доказуемой автономности</span><h2>Воронка, follow-up и качество агента</h2><p>Автоматические классы открываются только после нужного числа одобрений без правок. FL.ru всегда остаётся ручным.</p></div><span className="researchSafety">L3 · безопасная лестница</span></div>
+    <div className="researchMetrics">
+      <article><small>Отклики отправлены</small><b>{proposals}</b><span>Reply rate: {replyRate}%</span></article>
+      <article><small>Ответили / диалог</small><b>{replied} / {funnel.engaged || 0}</b><span>Discovery: {funnel.discovery_complete || 0}</span></article>
+      <article><small>Follow-up готовы</small><b>{followups.drafted || 0}</b><span>Запланировано: {followups.pending || 0}</span></article>
+      <article><small>Бинарные evals</small><b>{evalRate}%</b><span>{evals.failed || 0} провалов за 30 дней</span></article>
+    </div>
+    <div className="researchGrid">
+      <article className="researchFunnel"><b>Полная воронка</b>{[
+        ['Отклики', funnel.proposals], ['Ответы', funnel.replied], ['Диалоги ≥3 сообщений', funnel.engaged],
+        ['Discovery завершён', funnel.discovery_complete], ['FL → Telegram', funnel.handoff],
+        ['ТЗ', funnel.specification], ['Сделки', funnel.won],
+      ].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{value || 0}</strong></div>)}</article>
+      <article className="researchClasses"><b>Классы Telegram</b>{(data.autonomyClasses || []).length
+        ? data.autonomyClasses.map((item: any) => <div key={item.class}><span><i className={item.auto_enabled ? 'on' : ''} />{item.class}</span><strong>{item.approved_asis}/{item.shown}</strong><small>{item.auto_enabled ? 'авто открыт' : 'ручной сбор доказательств'}</small></div>)
+        : <p>Статистика начнёт заполняться с новых черновиков. До порогов всё остаётся ручным.</p>}</article>
+      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
+    </div>
   </section>;
 }
 

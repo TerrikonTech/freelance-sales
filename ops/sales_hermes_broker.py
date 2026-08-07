@@ -87,6 +87,14 @@ class Config:
     telegram_chat_id: str | None
 
 
+def _model_for_tier(tier: str, fallback: str = "") -> str:
+    variable = "SALES_HERMES_MODEL_FAST" if tier == "fast" else "SALES_HERMES_MODEL_SMART"
+    value = os.getenv(variable, "").strip() or fallback
+    if value and re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", value) is None:
+        raise BrokerError(f"{variable} contains unsupported characters")
+    return value
+
+
 def _validated_loopback_url(value: str, *, field: str) -> str:
     parsed = urllib.parse.urlsplit(value.strip())
     if parsed.scheme != "http":
@@ -545,14 +553,16 @@ class HermesClient:
         session_key: str,
         input_text: str,
         instructions: str,
+        model_override: str = "",
     ) -> str:
         body: dict[str, Any] = {
             "input": input_text,
             "instructions": instructions,
             "conversation_history": [],
         }
-        if self.config.model:
-            body["model"] = self.config.model
+        selected_model = model_override or self.config.model
+        if selected_model:
+            body["model"] = selected_model
         idempotency = "sales-" + hashlib.sha256(task_id.encode()).hexdigest()
         payload = self.http.request(
             "POST",
@@ -1095,6 +1105,7 @@ class Broker:
                 session_key=_session_key(safe_payload, kind),
                 input_text=_bounded_context(safe_payload),
                 instructions=_instructions(kind),
+                model_override=_model_for_tier(str(task.get("model_tier") or ""), self.config.model),
             )
             state.update({"stage": "running", "run_id": run_id})
             self.states.write(task_id, state)

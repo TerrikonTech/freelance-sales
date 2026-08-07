@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { AiService } from './ai.service';
+import { AutonomyService } from './autonomy.service';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
 import type { DesignConceptResult } from './design-concept.service';
 import { QueueService } from './queue.service';
 import { SettingsService } from './settings.service';
+import { outboundCommitmentIssues, spotlightClientData } from './research-controls';
 import {
   buildChatPolicySnapshot,
   CHAT_STAGES,
@@ -150,17 +152,23 @@ export class SalesAgentService {
     private readonly settings: SettingsService,
     private readonly ai: AiService,
     private readonly queue: QueueService,
+    private readonly autonomy: AutonomyService,
   ) {}
 
   async prepareTurn(leadId: string, channel: string): Promise<ConversationTurn> {
     const lead = await this.lead(leadId);
-    const [messages, requirements, handoff, priorTurns] = await Promise.all([
+    const [messages, requirements, handoff, priorTurns, episodes] = await Promise.all([
       this.messages(leadId, 240),
       this.requirements(leadId),
       this.ensureTelegramHandoff(leadId, channel),
       this.db.query<{ reply: string; decision: Record<string, unknown> }>(
         `SELECT reply,decision FROM agent_turns
          WHERE lead_id=$1 ORDER BY created_at DESC LIMIT 12`,
+        [leadId],
+      ),
+      this.db.query(
+        `SELECT event_type,summary,outcome,importance,created_at FROM lead_episodes
+         WHERE lead_id=$1 ORDER BY importance DESC,created_at DESC LIMIT 8`,
         [leadId],
       ),
     ]);
@@ -178,7 +186,12 @@ export class SalesAgentService {
       lead: this.publicLeadContext(lead),
       messages,
       inbound_bundle: chatPolicy.inboundBundle,
+      spotlighted_client_data: spotlightClientData(
+        { messages, inbound_bundle: chatPolicy.inboundBundle },
+        `${lead.id}:${lead.last_inbound_message_id || 'none'}`,
+      ),
       structured_requirements: requirements,
+      relevant_episodes: episodes.rows,
       telegram_handoff: handoff,
       policy: {
         goal: 'Продвинуть сделку к полностью согласованному ТЗ без давления и выдуманных обещаний',
@@ -194,7 +207,7 @@ export class SalesAgentService {
     let result = await this.tasks.run<ConversationTurn>('conversation_turn', taskPayload, 4 * 60_000);
     let turn: ConversationTurn;
     try {
-      turn = this.normalizeTurn(result, lead.pipeline_stage, chatPolicy);
+      turn = this.normalizeTurn(result, lead.pipeline_stage, chatPolicy, lead.id, priorTurns.rows.map((item) => item.reply));
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
       if (!message.startsWith('Ответ чат-агента не прошёл контроль:')) throw error;
@@ -209,7 +222,7 @@ export class SalesAgentService {
         },
         4 * 60_000,
       );
-      turn = this.normalizeTurn(result, lead.pipeline_stage, chatPolicy);
+      turn = this.normalizeTurn(result, lead.pipeline_stage, chatPolicy, lead.id, priorTurns.rows.map((item) => item.reply));
     }
     if (turn.should_move_to_telegram && channel === 'fl' && handoff?.username) {
       const invitation = `Напишите мне в Telegram @${handoff.username} и укажите код ${handoff.token}, чтобы я сразу продолжил этот диалог.`;
@@ -848,6 +861,10 @@ export class SalesAgentService {
         [row.id],
       );
       await client.query(
+        "UPDATE followup_schedule SET status='approved',updated_at=now() WHERE draft_id=$1 AND status='drafted'",
+        [row.id],
+      );
+      await client.query(
         'UPDATE owner_agent_sessions SET pending_draft_id=NULL,updated_at=now() WHERE owner_external_id=$1',
         [ownerExternalId],
       );
@@ -866,6 +883,7 @@ export class SalesAgentService {
       { draftId: approved.draftId },
       `telegram-owner-send-${approved.draftId}`,
     );
+    await this.autonomy.recordOwnerFeedback(approved.draftId, 'approved');
     return approved;
   }
 
@@ -907,11 +925,11 @@ export class SalesAgentService {
           ],
         );
       }
-      await client.query(
+      const insertedTurn = await client.query<{ id: string }>(
         `INSERT INTO agent_turns(
            lead_id,source_message_id,channel,stage_before,stage_after,
            intent,reply,summary,decision
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
         [
           lead.id,
           lead.last_inbound_message_id,
@@ -934,6 +952,35 @@ export class SalesAgentService {
           }),
         ],
       );
+      const turnId = insertedTurn.rows[0].id;
+      const eventType = turn.requires_owner ? 'owner_escalation'
+        : turn.discovery_complete ? 'discovery_completed'
+          : turn.conversation_stage;
+      await client.query(
+        `INSERT INTO lead_episodes(lead_id,source_message_id,event_type,summary,outcome,importance)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [
+          lead.id,
+          lead.last_inbound_message_id,
+          eventType,
+          String(turn.summary || turn.reply).slice(0, 2_000),
+          JSON.stringify({ nextAction: turn.next_action, riskFlags: turn.risk_flags, stage: turn.stage }),
+          turn.requires_owner || turn.discovery_complete ? 90 : 60,
+        ],
+      );
+      const evals = [
+        { name: 'max_one_question', passed: (turn.reply.match(/\?/gu) || []).length <= 1 },
+        { name: 'max_500_characters', passed: turn.conversation_stage === 's6_spec_confirmation' || turn.reply.length <= 500 },
+        { name: 'commitment_gate', passed: turn.requires_owner || outboundCommitmentIssues(turn.reply).length === 0 },
+        { name: 'owner_stop_gate', passed: !turn.risk_flags.length || turn.requires_owner },
+      ];
+      for (const evaluation of evals) {
+        await client.query(
+          `INSERT INTO agent_eval_results(lead_id,turn_id,eval_name,passed,details)
+           VALUES($1,$2,$3,$4,$5)`,
+          [lead.id, turnId, evaluation.name, evaluation.passed, JSON.stringify({ stage: turn.conversation_stage })],
+        );
+      }
     });
   }
 
@@ -1039,6 +1086,8 @@ export class SalesAgentService {
     value: ConversationTurn,
     fallbackStage: string,
     policy: ChatPolicySnapshot,
+    escalationSeed = '',
+    recentReplies: string[] = [],
   ): ConversationTurn {
     const stage = this.stage(value?.stage || fallbackStage);
     const requirements = Array.isArray(value?.requirements)
@@ -1065,7 +1114,7 @@ export class SalesAgentService {
     const deadline = requiresOwner ? ownerReplyDeadline() : null;
     const modelReply = String(value?.reply || '').trim();
     const reply = requiresOwner
-      ? ownerEscalationReply(Array.from(new Set(stopReasons)), deadline as string)
+      ? ownerEscalationReply(Array.from(new Set(stopReasons)), deadline as string, escalationSeed, recentReplies)
       : modelReply;
     const valueBeforeQuestion = requiresOwner ? true : value?.value_before_question === true;
     const reviewIssues = reviewChatReply({

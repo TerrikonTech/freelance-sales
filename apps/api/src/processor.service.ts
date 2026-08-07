@@ -9,6 +9,8 @@ import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
 import { QueueService } from './queue.service';
+import { followupInstruction } from './research-controls';
+import { ResearchService } from './research.service';
 import { SalesAgentService } from './sales-agent.service';
 import { isSandboxLead } from './sandbox';
 import { PushService } from './push.service';
@@ -22,6 +24,7 @@ export class ProcessorService implements OnModuleDestroy {
   private scanTimer?: NodeJS.Timeout;
   private chatTimer?: NodeJS.Timeout;
   private announceTimer?: NodeJS.Timeout;
+  private researchTimer?: NodeJS.Timeout;
   private connection?: IORedis;
 
   constructor(
@@ -35,6 +38,7 @@ export class ProcessorService implements OnModuleDestroy {
     private readonly push: PushService,
     private readonly autonomy: AutonomyService,
     private readonly salesAgent: SalesAgentService,
+    private readonly research: ResearchService,
   ) {}
 
   async start() {
@@ -69,6 +73,15 @@ export class ProcessorService implements OnModuleDestroy {
       )),
       15_000,
     );
+    const scheduleResearchJobs = async () => {
+      const bucket = Math.floor(Date.now() / 300_000);
+      await Promise.all([
+        this.queue.add('process-followups', {}, `followups-${bucket}`),
+        this.queue.add('health-watchdog', {}, `health-watchdog-${bucket}`),
+      ]).catch((error) => this.logger.warn(error instanceof Error ? error.message : 'Research scheduler failed'));
+    };
+    this.researchTimer = setInterval(scheduleResearchJobs, 300_000);
+    await scheduleResearchJobs();
     this.logger.log('Worker started');
   }
 
@@ -80,6 +93,7 @@ export class ProcessorService implements OnModuleDestroy {
   private async announceHandedOffDeliveries() {
     const claimed = await this.db.query<{
       id: string;
+      draft_id: string;
       channel: string;
       status: string;
       error: string | null;
@@ -93,7 +107,7 @@ export class ProcessorService implements OnModuleDestroy {
          ORDER BY updated_at LIMIT 10
        )
        AND error NOT LIKE '%[userbot] announced%'
-       RETURNING id, channel, status, error,
+       RETURNING id, draft_id, channel, status, error,
          (SELECT COALESCE(l.client->>'name', l.title, 'клиент')
             FROM leads l WHERE l.id = outbound_deliveries.lead_id) AS lead_title`,
     );
@@ -107,6 +121,10 @@ export class ProcessorService implements OnModuleDestroy {
           ? row.error
           : `отправка с вашего аккаунта не прошла: ${String(row.error || '').slice(-200)}`,
       });
+      if (delivered) {
+        await this.research.scheduleAfterOutbound(row.draft_id)
+          .catch((error) => this.logger.warn(`Follow-up schedule skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+      }
       this.logger.log(`Reported handed-off delivery ${row.id} as ${delivered ? 'sent' : 'failed'}`);
     }
     return claimed.rows.length;
@@ -166,10 +184,15 @@ export class ProcessorService implements OnModuleDestroy {
         String(job.data.mode || ''),
         String(job.data.ownerInstructions || ''),
         Boolean(job.data.ownerRequested),
+        String(job.data.automationClass || ''),
+        String(job.data.followupId || ''),
+        Number(job.data.followupTouch || 0),
       );
       case 'generate-documents': return this.generateDocuments(String(job.data.leadId));
       case 'generate-design': return this.generateDesign(job);
       case 'send-draft': return this.sendDraft(String(job.data.draftId));
+      case 'process-followups': return this.processFollowups();
+      case 'health-watchdog': return this.healthWatchdog();
       default: throw new Error(`Unknown job ${job.name}`);
     }
   }
@@ -322,6 +345,9 @@ export class ProcessorService implements OnModuleDestroy {
     requestedMode: string,
     ownerInstructions = '',
     ownerRequested = false,
+    automationClass = '',
+    followupId = '',
+    followupTouch = 0,
   ) {
     const leadResult = await this.db.query('SELECT * FROM leads WHERE id=$1', [leadId]);
     const lead = leadResult.rows[0];
@@ -399,6 +425,13 @@ export class ProcessorService implements OnModuleDestroy {
           }
           : null,
       };
+    if (automationClass) {
+      Object.assign(metadata, {
+        automationClass,
+        ...(followupId ? { followup_schedule_id: followupId } : {}),
+        ...(followupTouch ? { followup_touch: followupTouch } : {}),
+      });
+    }
     if (initialFlResponse && !ownerRequested) {
       const latestStatus = (await this.db.query('SELECT status FROM leads WHERE id=$1', [leadId])).rows[0]?.status;
       if (latestStatus !== 'qualified') {
@@ -443,6 +476,8 @@ export class ProcessorService implements OnModuleDestroy {
       inbound: String(latestInbound?.content || lead.description || ''),
       outbound: content,
       mode: mode === 'response' ? 'response' : 'chat',
+      channel,
+      automationClass: automationClass || undefined,
       duplicate,
       leadConfidence: typeof lead.confidence === 'number' ? lead.confidence : null,
       runtimeSignals,
@@ -486,7 +521,13 @@ export class ProcessorService implements OnModuleDestroy {
           "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'autonomy','draft_auto_approved',$2)",
           [leadId, JSON.stringify({ draftId, confidence: decision.confidence, reason: decision.reason, mission: decision.signals.includes('mission') })],
         );
-        await this.queue.add('send-draft', { draftId }, `auto-send-${draftId}-${hash.slice(0, 16)}`);
+        const delayMs = await this.research.autoReplyDelayMs(content.length, `${leadId}:${sourceMessageId || draftId}`);
+        await this.queue.add(
+          'send-draft',
+          { draftId },
+          `auto-send-${draftId}-${hash.slice(0, 16)}`,
+          { delayMs },
+        );
       }
       return { draftId, decision: decision.decision };
     }
@@ -498,6 +539,54 @@ export class ProcessorService implements OnModuleDestroy {
         .catch((error) => this.logger.warn(`Telegram owner notification skipped: ${error instanceof Error ? error.message : 'unknown'}`));
     }
     return { draftId, decision: decision.decision };
+  }
+
+  private async processFollowups() {
+    const due = await this.research.claimDueFollowup();
+    if (!due) return { processed: 0 };
+    try {
+      const created = await this.draft(
+        due.lead_id,
+        due.channel,
+        due.target_external_id || '',
+        'chat',
+        followupInstruction(due.touch_no),
+        true,
+        'followup',
+        due.id,
+        due.touch_no,
+      );
+      if (!created?.draftId) {
+        await this.research.cancelFollowup(due.id, 'draft_not_created');
+        return { processed: 1, drafted: 0 };
+      }
+      await this.research.markFollowupDrafted(due.id, created.draftId);
+      await this.telegram.notifyOwnerSystem(
+        `Follow-up №${due.touch_no} для «${due.title}» готов как черновик. Клиенту ничего не отправлено.`,
+        '/sales/?page=approvals',
+      ).catch((error) => this.logger.warn(`Follow-up owner notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+      return { processed: 1, drafted: 1 };
+    } catch (error) {
+      await this.research.cancelFollowup(due.id, 'draft_generation_failed');
+      throw error;
+    }
+  }
+
+  private async healthWatchdog() {
+    const failed = await this.db.query<{ id: string; kind: string }>(
+      `UPDATE ai_tasks SET status='failed',error='AI worker heartbeat timeout; automatic replay disabled',
+       completed_at=now(),duration_ms=GREATEST(0,extract(epoch FROM (now()-created_at))*1000)::int,updated_at=now()
+       WHERE status='claimed' AND claimed_at<now()-interval '25 minutes'
+       RETURNING id,kind`,
+    );
+    if (failed.rows.length) {
+      const message = `${failed.rows.length} AI-задач остановлено watchdog: автоповтор отключён, нужна проверка.`;
+      await this.push.notify('Freelance Sales требует внимания', message, '/sales/?page=settings')
+        .catch((error) => this.logger.warn(`Watchdog push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+      await this.telegram.notifyOwnerSystem(message, '/sales/?page=settings')
+        .catch((error) => this.logger.warn(`Watchdog Telegram notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    }
+    return { failed: failed.rows.length };
   }
 
   private async generateDocuments(leadId: string) {
@@ -716,6 +805,7 @@ export class ProcessorService implements OnModuleDestroy {
         );
         await client.query("UPDATE drafts SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1", [draftId]);
         await client.query('INSERT INTO messages(lead_id,channel,external_id,direction,author,content,metadata) VALUES($1,$2,$3,\'outbound\',\'owner\',$4,$5) ON CONFLICT(channel,external_id) DO NOTHING', [draft.lead_id, draft.channel, externalId, draft.content, JSON.stringify({ draft_id: draftId })]);
+        await client.query("UPDATE followup_schedule SET status='sent',updated_at=now() WHERE draft_id=$1", [draftId]);
         await client.query("INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'system','draft_sent',$2)", [draft.lead_id, JSON.stringify({ draftId, channel: draft.channel, idempotencyKey: draft.idempotencyKey })]);
       });
       await this.telegram.notifyOwnerDeliveryResult({
@@ -725,6 +815,8 @@ export class ProcessorService implements OnModuleDestroy {
       }).catch((error) => this.logger.warn(
         `Telegram delivery result notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
       ));
+      await this.research.scheduleAfterOutbound(draftId)
+        .catch((error) => this.logger.warn(`Follow-up schedule skipped: ${error instanceof Error ? error.message : 'unknown'}`));
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
       const deliveryUnknown = isDeliveryUnknown(error);
@@ -787,6 +879,7 @@ export class ProcessorService implements OnModuleDestroy {
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.chatTimer) clearInterval(this.chatTimer);
     if (this.announceTimer) clearInterval(this.announceTimer);
+    if (this.researchTimer) clearInterval(this.researchTimer);
     await this.worker?.close();
     await this.connection?.quit();
   }

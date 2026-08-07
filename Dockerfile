@@ -12,7 +12,7 @@ RUN npm prune --omit=dev
 FROM node:22-alpine AS runtime
 RUN apk add --no-cache chromium ca-certificates freetype harfbuzz nss ttf-freefont
 ENV NODE_ENV=production
-ENV CHROMIUM_PATH=/usr/bin/chromium-browser
+ENV CHROMIUM_PATH=/usr/bin/chromium
 WORKDIR /app
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules

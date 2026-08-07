@@ -98,6 +98,18 @@ docker compose logs --since=15m api worker ai-broker telegram-sync
    `TELEGRAM_ON_DEMAND_ONLY=true`.
 8. Проверьте sandbox, затем read-only scan, затем одну явно одобренную доставку.
 
+Не включайте Telegram-классы прямой правкой БД: gate обновляется из
+`autonomy_feedback`. FL.ru auto-send не включается ни одной настройкой.
+
+### Контроль исследовательского контура
+
+- `/api/research/overview` — воронка, follow-up, evals, память и model economics.
+- `followup_schedule.status='drafted'` означает только готовый черновик.
+- зависшие `ai_tasks.status='claimed'` старше 25 минут переводятся watchdog в
+  `failed`; повтор создаётся только осознанным действием владельца.
+- точные токены/стоимость могут быть `NULL`: это корректно для провайдера без
+  usage-метаданных.
+
 ## Миграция Hermes и Telegram
 
 `ops/migrate_hermes_history.py` переносит историю сначала в dry-run, затем с

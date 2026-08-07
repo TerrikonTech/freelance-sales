@@ -421,3 +421,106 @@ CREATE INDEX IF NOT EXISTS lead_missions_active_idx ON lead_missions(active) WHE
 -- together with the command that is waiting for that choice.
 ALTER TABLE owner_agent_sessions ADD COLUMN IF NOT EXISTS pending_choice jsonb;
 ALTER TABLE owner_agent_sessions ADD COLUMN IF NOT EXISTS pending_intent jsonb;
+
+-- Research roadmap: measurable, review-first follow-ups.  Scheduling never
+-- implies permission to send: a due row becomes a pending draft first.
+CREATE TABLE IF NOT EXISTS followup_schedule (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id uuid NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  basis_message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  touch_no integer NOT NULL CHECK (touch_no BETWEEN 1 AND 3),
+  channel text NOT NULL,
+  due_at timestamptz NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending','drafting','drafted','approved','sent','cancelled','expired'
+  )),
+  draft_id uuid REFERENCES drafts(id) ON DELETE SET NULL,
+  cancel_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(lead_id,basis_message_id,touch_no)
+);
+CREATE INDEX IF NOT EXISTS followup_schedule_due_idx
+  ON followup_schedule(status,due_at) WHERE status='pending';
+
+-- Every shown/edited/approved/rejected draft is evidence.  The aggregate table
+-- is the progressive-autonomy gate; the per-draft ledger prevents double count.
+CREATE TABLE IF NOT EXISTS autonomy_class_stats (
+  class text PRIMARY KEY,
+  shown integer NOT NULL DEFAULT 0,
+  approved_asis integer NOT NULL DEFAULT 0,
+  edited integer NOT NULL DEFAULT 0,
+  rejected integer NOT NULL DEFAULT 0,
+  negative_reactions integer NOT NULL DEFAULT 0,
+  auto_enabled boolean NOT NULL DEFAULT false,
+  unlocked_at timestamptz,
+  disabled_reason text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_feedback (
+  draft_id uuid PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+  class text NOT NULL REFERENCES autonomy_class_stats(class) ON DELETE RESTRICT,
+  shown_at timestamptz NOT NULL DEFAULT now(),
+  edited_at timestamptz,
+  approved_at timestamptz,
+  rejected_at timestamptz,
+  negative_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS autonomy_feedback_class_idx
+  ON autonomy_feedback(class,created_at DESC);
+
+-- Binary production evals and owner corrections form the regression corpus.
+CREATE TABLE IF NOT EXISTS agent_eval_results (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id uuid NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  turn_id uuid REFERENCES agent_turns(id) ON DELETE CASCADE,
+  draft_id uuid REFERENCES drafts(id) ON DELETE CASCADE,
+  eval_name text NOT NULL,
+  passed boolean NOT NULL,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_eval_results_created_idx
+  ON agent_eval_results(eval_name,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS quality_cases (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id uuid NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  draft_id uuid REFERENCES drafts(id) ON DELETE SET NULL,
+  source text NOT NULL DEFAULT 'owner_feedback',
+  status text NOT NULL DEFAULT 'candidate' CHECK (status IN (
+    'candidate','golden','archived'
+  )),
+  input_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+  original_reply text NOT NULL DEFAULT '',
+  expected_reply text,
+  failure_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(draft_id,source)
+);
+
+-- Episodic memory complements the raw transcript and structured requirements.
+CREATE TABLE IF NOT EXISTS lead_episodes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id uuid NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  source_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
+  event_type text NOT NULL,
+  summary text NOT NULL,
+  outcome jsonb NOT NULL DEFAULT '{}'::jsonb,
+  importance integer NOT NULL DEFAULT 50 CHECK (importance BETWEEN 0 AND 100),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS lead_episodes_lead_idx
+  ON lead_episodes(lead_id,importance DESC,created_at DESC);
+
+-- Provider-independent accounting.  Exact token/cost values stay NULL when a
+-- provider does not return trustworthy usage; duration and model tier remain useful.
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS model_tier text NOT NULL DEFAULT 'smart';
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS input_tokens integer;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS output_tokens integer;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS estimated_cost_usd numeric(12,6);
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS duration_ms integer;

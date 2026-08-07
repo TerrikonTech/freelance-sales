@@ -1279,6 +1279,15 @@ export class TelegramService {
     return { sent: true };
   }
 
+  async notifyOwnerSystem(message: string, relativeUrl = '/sales/') {
+    const owner = await this.settings.getPublic<{ id?: number }>('telegram_owner');
+    if (!owner?.id) return { sent: false, reason: 'owner_not_configured' };
+    const base = String(process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+    const url = base ? `${base}${relativeUrl.startsWith('/') ? relativeUrl : `/${relativeUrl}`}` : null;
+    await this.sendControlMessage(String(owner.id), `${message.slice(0, 3_500)}${url ? `\n\n${url}` : ''}`);
+    return { sent: true };
+  }
+
   private async sendControlMessage(chatId: string, text: string) {
     const token = await this.settings.getSecret('telegram_bot_token');
     if (!token) throw new Error('Telegram-бот не настроен');

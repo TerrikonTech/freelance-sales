@@ -1,6 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { SettingsService } from './settings.service';
+import {
+  AUTONOMY_THRESHOLDS,
+  autonomyClassFromSignals,
+  classCanUnlock,
+  outboundCommitmentIssues,
+} from './research-controls';
 
 export type AutonomyDecision = 'auto_send' | 'ask_owner' | 'skip';
 export type AutonomyPolicyMode = 'manual' | 'smart';
@@ -22,6 +28,8 @@ export type AutonomyEvaluationInput = {
   inbound: string;
   outbound: string;
   mode: 'response' | 'chat';
+  channel?: string;
+  automationClass?: string;
   duplicate?: boolean;
   leadConfidence?: number | null;
   runtimeSignals?: string[];
@@ -160,6 +168,11 @@ const SAFE_CHAT_PATTERNS: Array<{ signal: string; patterns: RegExp[] }> = [
   },
 ];
 
+export function classifySafeAutonomyClass(value: string): string | null {
+  const inbound = normalize(value);
+  return SAFE_CHAT_PATTERNS.find((rule) => matches(inbound, rule.patterns))?.signal || null;
+}
+
 export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: AutonomyPolicyConfig): AutonomyEvaluation {
   // A mission is an explicit, per-lead order from the owner.  It overrides the global
   // manual mode for that one lead only — never for anybody else.
@@ -188,6 +201,19 @@ export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: Autonom
     return { decision: 'skip', confidence: 0.99, reason: 'Сообщение похоже на спам', signals: ['spam'] };
   }
 
+  // Platform boundary, not a configurable preference: FL.ru proposals and chat
+  // messages always remain human-reviewed, even when smart mode or a mission is on.
+  if (input.channel === 'fl' || input.mode === 'response') {
+    return {
+      decision: 'ask_owner',
+      confidence: 1,
+      reason: 'FL.ru всегда требует осознанного ручного одобрения',
+      signals: input.mode === 'response'
+        ? ['platform_manual_review', 'initial_response']
+        : ['platform_manual_review'],
+    };
+  }
+
   if (runtimeSignals.length) {
     return {
       decision: 'ask_owner',
@@ -200,13 +226,22 @@ export function evaluateAutonomy(input: AutonomyEvaluationInput, policy: Autonom
   const riskSignals = RISK_RULES
     .filter((rule) => matches(combined, rule.patterns))
     .map((rule) => rule.signal);
-  if (input.mode === 'response') riskSignals.unshift('initial_response');
   if (riskSignals.length) {
     return {
       decision: 'ask_owner',
       confidence: 0.99,
       reason: 'Ответ затрагивает обязательства или чувствительные данные',
       signals: [...new Set(riskSignals)],
+    };
+  }
+
+  const commitmentIssues = outboundCommitmentIssues(input.outbound);
+  if (commitmentIssues.length) {
+    return {
+      decision: 'ask_owner',
+      confidence: 1,
+      reason: 'В ответе обнаружены цифры обязательств',
+      signals: ['outbound_commitment_filter'],
     };
   }
 
@@ -274,7 +309,29 @@ export class AutonomyService {
 
   async evaluate(input: AutonomyEvaluationInput): Promise<AutonomyEvaluation & { policyMode: AutonomyPolicyMode }> {
     const policy = await this.getPolicy();
-    return { ...evaluateAutonomy(input, policy), policyMode: policy.mode };
+    const rawEvaluation = evaluateAutonomy(input, policy);
+    const observedClass = input.automationClass || classifySafeAutonomyClass(input.inbound);
+    const evaluation = observedClass && !rawEvaluation.signals.some((signal) => signal.startsWith('class:'))
+      ? { ...rawEvaluation, signals: [...rawEvaluation.signals, `class:${observedClass}`] }
+      : rawEvaluation;
+    if (evaluation.decision !== 'auto_send' || evaluation.signals.includes('mission')) {
+      return { ...evaluation, policyMode: policy.mode };
+    }
+    const className = observedClass || autonomyClassFromSignals(evaluation.signals);
+    const stats = await this.db.query<{ auto_enabled: boolean }>(
+      'SELECT auto_enabled FROM autonomy_class_stats WHERE class=$1',
+      [className],
+    );
+    if (!stats.rows[0]?.auto_enabled) {
+      return {
+        decision: 'ask_owner',
+        confidence: evaluation.confidence,
+        reason: `Класс «${className}» ещё не доказал качество на ручных одобрениях`,
+        signals: [...evaluation.signals, 'class_gate_locked', `class:${className}`],
+        policyMode: policy.mode,
+      };
+    }
+    return { ...evaluation, signals: [...evaluation.signals, `class:${className}`], policyMode: policy.mode };
   }
 
   async runtimeSignals(channel: string): Promise<string[]> {
@@ -304,21 +361,108 @@ export class AutonomyService {
     policyMode: AutonomyPolicyMode;
     evaluation: AutonomyEvaluation;
   }): Promise<void> {
+    const className = input.evaluation.signals.find((signal) => signal.startsWith('class:'))?.slice(6)
+      || autonomyClassFromSignals(input.evaluation.signals);
+    await this.db.transaction(async (client) => {
+      await client.query(
+        `INSERT INTO autonomy_decisions(
+           lead_id,draft_id,source_message_id,policy_mode,decision,confidence,reason,signals
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT DO NOTHING`,
+        [
+          input.leadId,
+          input.draftId,
+          input.sourceMessageId || null,
+          input.policyMode,
+          input.evaluation.decision,
+          input.evaluation.confidence,
+          input.evaluation.reason,
+          JSON.stringify(input.evaluation.signals),
+        ],
+      );
+      await client.query(
+        `INSERT INTO autonomy_class_stats(class,shown,updated_at) VALUES($1,0,now())
+         ON CONFLICT(class) DO NOTHING`,
+        [className],
+      );
+      const feedback = await client.query(
+        `INSERT INTO autonomy_feedback(draft_id,class) VALUES($1,$2)
+         ON CONFLICT(draft_id) DO NOTHING RETURNING draft_id`,
+        [input.draftId, className],
+      );
+      if (feedback.rows[0]) {
+        await client.query(
+          'UPDATE autonomy_class_stats SET shown=shown+1,updated_at=now() WHERE class=$1',
+          [className],
+        );
+      }
+    });
+  }
+
+  async recordOwnerFeedback(draftId: string, action: 'edited' | 'approved' | 'rejected' | 'negative') {
+    const column = action === 'edited' ? 'edited_at'
+      : action === 'approved' ? 'approved_at'
+        : action === 'rejected' ? 'rejected_at'
+          : 'negative_at';
+    const counter = action === 'edited' ? 'edited'
+      : action === 'approved' ? 'approved_asis'
+        : action === 'rejected' ? 'rejected'
+          : 'negative_reactions';
+    const className = await this.db.transaction(async (client) => {
+      const selected = await client.query<{ class: string; edited_at: string | null }>(
+        `SELECT class,edited_at FROM autonomy_feedback WHERE draft_id=$1 FOR UPDATE`,
+        [draftId],
+      );
+      const feedback = selected.rows[0];
+      if (!feedback) return null;
+      if (action === 'approved' && feedback.edited_at) {
+        await client.query('UPDATE autonomy_feedback SET approved_at=COALESCE(approved_at,now()),updated_at=now() WHERE draft_id=$1', [draftId]);
+        return feedback.class;
+      }
+      const updated = await client.query(
+        `UPDATE autonomy_feedback SET ${column}=now(),updated_at=now()
+         WHERE draft_id=$1 AND ${column} IS NULL RETURNING class`,
+        [draftId],
+      );
+      if (updated.rows[0]) {
+        await client.query(
+          `UPDATE autonomy_class_stats SET ${counter}=${counter}+1,updated_at=now() WHERE class=$1`,
+          [feedback.class],
+        );
+      }
+      return feedback.class;
+    });
+    if (className) await this.refreshClassGate(className);
+  }
+
+  private async refreshClassGate(className: string) {
+    const threshold = AUTONOMY_THRESHOLDS[className];
+    if (!threshold) return;
+    const stats = (await this.db.query<{
+      approved_asis: number;
+      edited: number;
+      rejected: number;
+      negative_reactions: number;
+      auto_enabled: boolean;
+    }>(
+      `SELECT approved_asis,edited,rejected,negative_reactions,auto_enabled
+       FROM autonomy_class_stats WHERE class=$1`,
+      [className],
+    )).rows[0];
+    if (!stats) return;
+    const enabled = classCanUnlock({
+      approved_asis: Number(stats.approved_asis),
+      edited: Number(stats.edited),
+      rejected: Number(stats.rejected),
+      negative_reactions: Number(stats.negative_reactions),
+    }, className);
+    const reason = enabled ? null
+      : `Нужно ${threshold.approvals} одобрений; максимум ${(threshold.maxEditRate * 100).toFixed(0)}% правок; без негатива`;
     await this.db.query(
-      `INSERT INTO autonomy_decisions(
-         lead_id,draft_id,source_message_id,policy_mode,decision,confidence,reason,signals
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT DO NOTHING`,
-      [
-        input.leadId,
-        input.draftId,
-        input.sourceMessageId || null,
-        input.policyMode,
-        input.evaluation.decision,
-        input.evaluation.confidence,
-        input.evaluation.reason,
-        JSON.stringify(input.evaluation.signals),
-      ],
+      `UPDATE autonomy_class_stats SET auto_enabled=$2,
+       unlocked_at=CASE WHEN $2 AND unlocked_at IS NULL THEN now() ELSE unlocked_at END,
+       disabled_reason=$3,updated_at=now() WHERE class=$1`,
+      [className, enabled, reason],
     );
   }
 
