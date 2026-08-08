@@ -14,8 +14,9 @@ export function telegramOnDemandOnly(value = process.env.TELEGRAM_ON_DEMAND_ONLY
 export function shouldQueueAutomaticTelegramDraft(
   live: boolean,
   value = process.env.TELEGRAM_ON_DEMAND_ONLY,
+  activeMission = false,
 ): boolean {
-  return live && !telegramOnDemandOnly(value);
+  return live && (activeMission || !telegramOnDemandOnly(value));
 }
 
 export function isOwnerSendCommand(text: string): boolean {
@@ -503,7 +504,9 @@ export class TelegramService {
         );
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE lead_id=$1 AND status='pending'", [leadId]);
       });
-      if (shouldQueueAutomaticTelegramDraft(true)) {
+      const mission = await this.autonomy.missionRuntime(leadId);
+      const missionCanReply = Boolean(mission && !mission.expired && !mission.exhausted);
+      if (shouldQueueAutomaticTelegramDraft(true, undefined, missionCanReply)) {
         await this.queue.add(
           'draft-reply',
           { leadId, channel: 'telegram', targetExternalId: chatId },
@@ -591,7 +594,9 @@ export class TelegramService {
             [leadId],
           );
         });
-        if (shouldQueueAutomaticTelegramDraft(item.live === true)) {
+        const mission = await this.autonomy.missionRuntime(leadId);
+        const missionCanReply = Boolean(mission && !mission.expired && !mission.exhausted);
+        if (shouldQueueAutomaticTelegramDraft(item.live === true, undefined, missionCanReply)) {
           await this.queue.add(
             'draft-reply',
             { leadId, channel: 'telegram', targetExternalId: chatId },

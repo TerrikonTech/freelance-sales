@@ -533,6 +533,7 @@ export class AutonomyService {
 
   /** Runtime view used by evaluateAutonomy: null when there is no live mission. */
   async missionRuntime(leadId: string): Promise<MissionRuntime | null> {
+    if (!missionsEnabled()) return null;
     const mission = await this.getMission(leadId);
     if (!mission || !mission.active) return null;
     const expired = Boolean(mission.deadline && new Date(mission.deadline).getTime() <= Date.now());

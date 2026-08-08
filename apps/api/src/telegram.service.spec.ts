@@ -31,8 +31,53 @@ describe('Telegram on-demand policy', () => {
     expect(shouldQueueAutomaticTelegramDraft(false, 'true')).toBe(false);
   });
 
+  test('an active per-lead mission triggers only live inbound messages in on-demand mode', () => {
+    expect(shouldQueueAutomaticTelegramDraft(true, 'true', true)).toBe(true);
+    expect(shouldQueueAutomaticTelegramDraft(false, 'true', true)).toBe(false);
+  });
+
   test('legacy automatic drafts require an explicit opt-out', () => {
     expect(shouldQueueAutomaticTelegramDraft(true, 'false')).toBe(true);
+  });
+
+  test('a live Business message queues the next turn for the addressed mission', async () => {
+    const transactionQuery = jest.fn().mockResolvedValue({ rows: [] });
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ id: 'message-1' }] }),
+      transaction: jest.fn(async (callback: (client: { query: jest.Mock }) => Promise<void>) => (
+        callback({ query: transactionQuery })
+      )),
+    };
+    const settings = { getPublic: jest.fn().mockResolvedValue({ id: 42 }) };
+    const queue = { add: jest.fn().mockResolvedValue(undefined) };
+    const agent = {
+      resolveTelegramLead: jest.fn().mockResolvedValue('lead-1'),
+      registerLeadChannel: jest.fn().mockResolvedValue(undefined),
+    };
+    const autonomy = {
+      missionRuntime: jest.fn().mockResolvedValue({
+        instruction: 'отвечай на эльфийском', turnsLeft: 10, expired: false, exhausted: false,
+      }),
+    };
+    const service = new TelegramService(
+      db as never, settings as never, queue as never, agent as never, autonomy as never, {} as never,
+    );
+
+    await service.processUpdate({
+      business_message: {
+        chat: { id: 777, first_name: 'Groot' },
+        from: { id: 777, first_name: 'Groot' },
+        message_id: 5,
+        date: 123,
+        text: 'привет',
+      },
+    });
+
+    expect(queue.add).toHaveBeenCalledWith(
+      'draft-reply',
+      { leadId: 'lead-1', channel: 'telegram', targetExternalId: '777' },
+      'tg-draft-message-1',
+    );
   });
 });
 
