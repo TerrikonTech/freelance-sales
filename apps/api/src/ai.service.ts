@@ -86,7 +86,7 @@ type DraftReview = {
 
 const DEFAULT_STYLE_PROFILE = {
   response_greeting: 'Короткое обращение по имени, если имя подтверждено; иначе сразу содержательный хук без приветствия-филлера',
-  response_structure: 'Не более трёх коротких абзацев: вариативный хук; микро-план и измеримый критерий приёмки; один кейс, цена, срок, старт и один лёгкий вопрос',
+  response_structure: 'Не более трёх коротких абзацев: вариативный хук; микро-план и измеримый критерий приёмки; один кейс, цена, срок, подтверждённый старт и один лёгкий вопрос',
   response_length: 'FL.ru: обычно 100–200 слов; компактная точечная задача 60–120; дорогой сложный проект 170–260, жёсткий потолок 300 слов',
   punctuation: 'Естественная русская пунктуация. Короткий список из 2–3 шагов допустим, если он делает план сканируемым',
   tone: 'Спокойное личное сообщение сильного разработчика. Зеркалировать терминологию и регистр заказчика, не давить и не изображать рекламный текст',
@@ -95,7 +95,7 @@ const DEFAULT_STYLE_PROFILE = {
     'Использовать минимум две конкретные детали заказа, но не пересказывать список функций.',
     'Дать микро-план из 2–3 шагов и измеримый критерий приёмки. Формулировку критерия чередовать, а не копировать «Готово =» в каждый отклик.',
     'Использовать ровно одно самое релевантное доказательство. Если назван кейс, сразу дать точную ссылку.',
-    'В каждом отклике естественно назвать цену, срок и условие старта, даже если цифры также попадут в отдельные поля FL.ru.',
+    'В каждом отклике естественно назвать цену, срок и подтверждённое условие старта, даже если цифры также попадут в отдельные поля FL.ru. Если доступность не настроена, не выдумывать её.',
     'Закончить одним простым вопросом или бинарным выбором, на который легко ответить.',
     'Из психологии использовать только честные приёмы: зеркалирование, конкретное социальное доказательство, снижение риска, взаимность через полезное наблюдение. Никакой искусственной срочности.',
   ],
@@ -109,10 +109,120 @@ export type ProposalCommercialContext = {
   price?: number;
   days?: number;
   availability?: string;
+  availabilityConfigured?: boolean;
   clientName?: string;
   hookPattern?: ProposalHookPattern;
   acceptanceLabel?: ProposalAcceptanceLabel;
+  technologyFit?: ProposalTechnologyFit;
 };
+
+export type ProposalTechnologyFit = {
+  required: string[];
+  verifiedEvidence: Array<{
+    technology: string;
+    source: 'seller_profile' | 'portfolio';
+    detail: string;
+    url?: string;
+  }>;
+  unverified: string[];
+  risk: 'none' | 'elevated';
+};
+
+const PROPOSAL_TECHNOLOGIES: Array<{ label: string; pattern: RegExp }> = [
+  { label: '1С-Битрикс', pattern: /(?:1[сc]\s*[-–—]?\s*)?битрикс(?!\s*24)|bitrix(?!\s*24)/iu },
+  { label: 'Bitrix24', pattern: /битрикс\s*24|bitrix\s*24/iu },
+  { label: 'WordPress', pattern: /wordpress|вордпресс/iu },
+  { label: 'WooCommerce', pattern: /woocommerce|в[уо]коммерс/iu },
+  { label: 'Tilda', pattern: /(?:^|[^\p{L}])tilda(?:[^\p{L}]|$)|тильд[аеуы]?/iu },
+  { label: 'OpenCart', pattern: /opencart|опенкарт/iu },
+  { label: 'MODX', pattern: /(?:^|[^\p{L}])modx(?:[^\p{L}]|$)/iu },
+  { label: 'Shopify', pattern: /shopify|шопифай/iu },
+  { label: 'Webflow', pattern: /webflow|вебфлоу/iu },
+  { label: 'Flutter', pattern: /flutter|флаттер/iu },
+  { label: 'React Native', pattern: /react\s*native|реакт\s*нейтив/iu },
+];
+
+function technologyDefinition(label: string) {
+  return PROPOSAL_TECHNOLOGIES.find((item) => item.label === label);
+}
+
+export function proposalTechnologyFitContext(
+  lead: Record<string, unknown>,
+  seller: Record<string, unknown>,
+  portfolioValue: unknown,
+): ProposalTechnologyFit {
+  const leadText = `${lead.title || ''}\n${lead.description || ''}`;
+  const required = PROPOSAL_TECHNOLOGIES
+    .filter((technology) => technology.pattern.test(leadText))
+    .map((technology) => technology.label);
+  const sellerText = JSON.stringify(seller || {});
+  const portfolio = Array.isArray(portfolioValue) ? portfolioValue : [];
+  const verifiedEvidence: ProposalTechnologyFit['verifiedEvidence'] = [];
+
+  for (const label of required) {
+    const definition = technologyDefinition(label)!;
+    const matchedCase = portfolio.find((item) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+      return definition.pattern.test(`${row.title || ''}\n${row.description || ''}`);
+    });
+    if (matchedCase && typeof matchedCase === 'object') {
+      const row = matchedCase as Record<string, unknown>;
+      verifiedEvidence.push({
+        technology: label,
+        source: 'portfolio',
+        detail: String(row.title || label).slice(0, 180),
+        ...(String(row.url || '').trim() ? { url: String(row.url).trim().slice(0, 500) } : {}),
+      });
+      continue;
+    }
+    if (definition.pattern.test(sellerText)) {
+      verifiedEvidence.push({
+        technology: label,
+        source: 'seller_profile',
+        detail: `Подтверждено профилем продавца: ${label}`,
+      });
+    }
+  }
+
+  const verified = new Set(verifiedEvidence.map((item) => item.technology));
+  const unverified = required.filter((label) => !verified.has(label));
+  return {
+    required,
+    verifiedEvidence,
+    unverified,
+    risk: unverified.length ? 'elevated' : 'none',
+  };
+}
+
+export function proposalTechnologyIssues(content: string, fit?: ProposalTechnologyFit): string[] {
+  if (!fit?.required.length) return [];
+  const issues: string[] = [];
+  const sentences = content.split(/(?<=[.!?])\s+|\n+/u).map((item) => item.trim()).filter(Boolean);
+  const proofClaim = /(?:работал[аи]?|работаю|делал[аи]?|реализовал[аи]?|разрабатывал[аи]?|есть\s+опыт|владею|знаю)/iu;
+  const negativeProof = /(?:нет|не\s+заявляю|не\s+буду\s+выдумывать|без).{0,80}(?:опыт|кейс|проект|подтвержден)/iu;
+
+  for (const label of fit.unverified) {
+    const definition = technologyDefinition(label);
+    const unsupported = definition && sentences.some((sentence) => (
+      definition.pattern.test(sentence) && proofClaim.test(sentence) && !negativeProof.test(sentence)
+    ));
+    if (unsupported) {
+      issues.push(`Нельзя заявлять опыт с ${label}: в профиле и портфолио нет подтверждающего факта.`);
+    }
+  }
+
+  for (const evidence of fit.verifiedEvidence) {
+    const definition = technologyDefinition(evidence.technology);
+    const exactCaseUsed = Boolean(evidence.url && content.includes(evidence.url));
+    const verifiedClaimUsed = Boolean(definition && sentences.some((sentence) => (
+      definition.pattern.test(sentence) && proofClaim.test(sentence)
+    )));
+    if (!exactCaseUsed && !verifiedClaimUsed) {
+      issues.push(`Заказ явно требует ${evidence.technology}: добавь одно подтверждённое доказательство из technology_fit.`);
+    }
+  }
+  return issues;
+}
 
 const PROPOSAL_LIMITS: Record<ProposalProfile, { minWords: number; maxWords: number; minChars: number; maxChars: number }> = {
   compact: { minWords: 60, maxWords: 120, minChars: 350, maxChars: 850 },
@@ -231,8 +341,15 @@ export function proposalResearchIssues(
     const daysPattern = new RegExp(`${Math.round(Number(commercial.days))}\\s*(?:рабоч(?:их|ие)?\\s*)?д(?:ень|ня|ней|\\.)`, 'iu');
     if (!daysPattern.test(content)) issues.push(`Назови в тексте срок ${Math.round(Number(commercial.days))} дней.`);
   }
-  if (commercial.availability && !/(?:старт|начну|начать|приступлю|могу\s+приступить)/iu.test(content)) {
-    issues.push('Добавь честное условие или дату старта.');
+  if (commercial.availability) {
+    const availability = commercial.availability.replace(/^\s*старт\s*[:—-]?\s*/iu, '').trim().toLowerCase();
+    if (availability && !content.toLowerCase().includes(availability)) {
+      issues.push(`Укажи подтверждённую дату или условие старта дословно: «${commercial.availability}».`);
+    }
+  }
+  if (commercial.availabilityConfigured === false
+    && /старт\s*[—:-]\s*после\s+согласования\s+объ[её]ма.{0,100}(?:материал|доступ)/iu.test(content)) {
+    issues.push('Удали системную заглушку старта: дата не настроена, выдумывать доступность нельзя.');
   }
   const clientName = String(commercial.clientName || '').trim().split(/\s+/)[0];
   if (clientName) {
@@ -241,6 +358,7 @@ export function proposalResearchIssues(
       issues.push(`Имя заказчика подтверждено: начни с короткого обращения «${clientName},».`);
     }
   }
+  issues.push(...proposalTechnologyIssues(content, commercial.technologyFit));
   return issues;
 }
 
@@ -289,10 +407,11 @@ const RESPONSE_PRINCIPLES = [
   'Доверие строить одним сильным уместным сигналом: близкий реальный кейс с прямой ссылкой, подтверждённый опыт или конкретный способ снять главный риск. 6 лет и Яндекс не вставлять как заполнитель.',
   'Если называешь кейс из portfolio — сразу давай его ссылку из portfolio[].url. Не писать «могу показать» без ссылки: заказчик должен мочь открыть работу в один клик.',
   'Ссылку брать только из portfolio[].url дословно. Никогда не выдумывать адрес и не ссылаться на кейс, которого нет в portfolio.',
+  'Если заказ явно требует CMS или технологию, используй только доказательство из technology_fit. Словарь инфоблоков, компонентов и редакций не доказывает опыт сам по себе. При risk=elevated не заявляй, что работал с технологией: соседний кейс доказывает только механику проекта, а не стек.',
   'Завершать ровно одним лёгким вопросом или бинарным выбором, который двигает разговор на один шаг. Не превращать отклик в анкету.',
   'Не ругать постановку задачи, бюджет, конкурентов или выбранную технологию в первом сообщении.',
   'Не писать по обязательной формуле: структура и длина должны следовать брифу и выбранному углу.',
-  'Цена, срок и старт обязательны в самом тексте: люди сканируют ленту и не обязаны замечать отдельные поля FL.ru.',
+  'Цена и срок обязательны в самом тексте. Старт обязателен только когда подтверждён профилем продавца; при пустой настройке его нельзя выдумывать.',
   'Если подтверждёно имя из FL-профиля или чата, обратиться по имени. Не угадывать имя по логину.',
   'Не использовать манипуляции, искусственную срочность и давление. Рабочая психология отклика — персонализация, конкретное доказательство, снижение риска и простой следующий шаг.',
 ];
@@ -488,13 +607,37 @@ export class AiService {
     return match ? this.localRejection(match.reason) : null;
   }
 
+  async proposalReviewContext(lead: Record<string, unknown>) {
+    const [sellerValue, portfolioValue] = await Promise.all([
+      this.settings.getPublic('seller_profile'),
+      this.settings.getPublic('fl_portfolio_cases'),
+    ]);
+    const seller = sellerValue && typeof sellerValue === 'object'
+      ? sellerValue as Record<string, unknown>
+      : {};
+    const configuredAvailability = String(
+      seller.available_from || seller.availability || '',
+    ).trim().slice(0, 160);
+    return {
+      technologyFit: proposalTechnologyFitContext(lead, seller, portfolioValue),
+      availability: configuredAvailability,
+      availabilityConfigured: Boolean(configuredAvailability),
+    };
+  }
+
   async draftReply(context: Record<string, unknown>): Promise<string> {
     const seller = await this.settings.getPublic('seller_profile') || {};
     const style = await this.settings.getPublic('style_profile') || DEFAULT_STYLE_PROFILE;
     const sourceLead = (context.lead || {}) as Record<string, unknown>;
+    const allPortfolio = await this.settings.getPublic('fl_portfolio_cases') || [];
     const portfolio = selectRelevantPortfolio(
-      await this.settings.getPublic('fl_portfolio_cases') || [],
+      allPortfolio,
       `${sourceLead.title || ''} ${sourceLead.description || ''}`,
+    );
+    const technologyFit = proposalTechnologyFitContext(
+      sourceLead,
+      seller && typeof seller === 'object' ? seller as Record<string, unknown> : {},
+      allPortfolio,
     );
     const sourceMessages = Array.isArray(context.messages) ? context.messages : [];
     const mode = context.mode === 'chat' ? 'chat' : 'response';
@@ -535,9 +678,7 @@ export class AiService {
       || (seller as Record<string, unknown>).availability
       || '',
     ).trim().slice(0, 160);
-    const availability = configuredAvailability
-      ? `Старт: ${configuredAvailability}`
-      : 'Старт — после согласования объёма и получения необходимых материалов и доступов.';
+    const availability = configuredAvailability ? `Старт: ${configuredAvailability}` : '';
     const variationPlan = proposalVariationPlan(
       recentDrafts,
       String(sourceLead.external_id || sourceLead.id || sourceLead.title || ''),
@@ -545,10 +686,12 @@ export class AiService {
     const commercialTerms: ProposalCommercialContext = {
       price: Number(sourceLead.recommended_price) || undefined,
       days: Number(sourceLead.recommended_days) || undefined,
-      availability,
+      availability: availability || undefined,
+      availabilityConfigured: Boolean(configuredAvailability),
       clientName: clientName || undefined,
       hookPattern: variationPlan.hookPattern,
       acceptanceLabel: variationPlan.acceptanceLabel,
+      technologyFit,
     };
     const compactContext = {
       lead: {
@@ -595,10 +738,15 @@ export class AiService {
       commercial_terms: {
         price_rub: commercialTerms.price,
         duration_days: commercialTerms.days,
-        availability,
+        availability: availability || null,
+        availability_configured: Boolean(configuredAvailability),
+        availability_warning: configuredAvailability
+          ? null
+          : 'Дата старта не подтверждена владельцем. Не выдумывать и не вставлять системную заглушку; черновик требует ручной проверки доступности.',
         client_name: clientName || null,
         greeting_required: Boolean(clientName),
       },
+      technology_fit: technologyFit,
       submission_fields: {
         price: 'FL.ru получает recommended_price отдельным числовым полем',
         days: 'FL.ru получает recommended_days отдельным числовым полем',
