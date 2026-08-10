@@ -35,6 +35,27 @@ npm test -w apps/api -- --runInBand \
 python3 -m unittest ops/test_sales_hermes_broker.py
 ```
 
+Для изменения только правил откликов достаточно более короткого набора:
+
+```bash
+npm test -w apps/api -- --runInBand \
+  proposal-quality.spec.ts portfolio-link.spec.ts
+python3 -m unittest ops/test_sales_hermes_broker.py
+```
+
+Он отдельно проверяет CMS/stack fit, запрет неподтверждённого опыта, точную
+ссылку на кейс, коммерческие числа и отсутствие системной заглушки старта.
+
+Production image по умолчанию по-прежнему запускает весь Jest-набор. Для
+ограниченной правки правил отклика можно собрать тот же runtime image только с
+целевыми тестами:
+
+```bash
+docker compose build \
+  --build-arg API_TEST_TARGETS="proposal-quality.spec.ts portfolio-link.spec.ts" \
+  api
+```
+
 Он проверяет рабочие дни/джиттер follow-up, фильтр числовых обязательств,
 spotlighting, пороги классов, regex false positives, ротацию эскалаций,
 неотключаемое ручное одобрение FL.ru и схему Hermes.

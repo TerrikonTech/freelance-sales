@@ -2,6 +2,8 @@ import {
   portfolioEvidenceIssues,
   proposalProfileForLead,
   proposalResearchIssues,
+  proposalTechnologyFitContext,
+  proposalTechnologyIssues,
   proposalVariationPlan,
   selectRelevantPortfolio,
 } from './ai.service';
@@ -56,7 +58,8 @@ describe('proposal inputs', () => {
     expect(proposalResearchIssues(content, 'standard', {
       price: 110_000,
       days: 16,
-      availability: 'после доступов',
+      availability: 'после согласования объёма и получения доступов',
+      availabilityConfigured: true,
       acceptanceLabel: 'acceptance',
     })).toEqual([]);
   });
@@ -83,6 +86,39 @@ describe('proposal inputs', () => {
     ], 'lead-42');
     expect(plan.acceptanceLabel).not.toBe('ready_equals');
     expect(plan.acceptanceText).not.toContain('Готово =');
+  });
+
+  test('marks an explicit CMS as elevated risk when seller and portfolio do not prove it', () => {
+    const fit = proposalTechnologyFitContext(
+      { title: 'Сайт-витрина на 1С-Битрикс', description: 'Каталог и личный кабинет' },
+      { positioning: 'Fullstack-разработчик, 6 лет опыта' },
+      [{ title: 'МЕДСЕТЬ 24', description: 'Роли и личный кабинет на другом стеке', url: 'https://example.test/med' }],
+    );
+    expect(fit).toMatchObject({ required: ['1С-Битрикс'], unverified: ['1С-Битрикс'], risk: 'elevated' });
+    expect(proposalTechnologyIssues('С 1С-Битрикс работаю и архитектуру знаю.', fit).join(' ')).toContain('Нельзя заявлять опыт');
+    expect(proposalTechnologyIssues('На первом шаге согласую редакцию 1С-Битрикс и структуру каталога.', fit)).toEqual([]);
+  });
+
+  test('accepts exact technology evidence only from the seller profile or portfolio', () => {
+    const url = 'https://example.test/bitrix-case';
+    const fit = proposalTechnologyFitContext(
+      { title: 'Разработка на Битрикс', description: 'Сайт-витрина' },
+      {},
+      [{ title: 'Магазин на 1С-Битрикс', description: 'Каталог и инфоблоки', url }],
+    );
+    expect(fit.risk).toBe('none');
+    expect(fit.verifiedEvidence).toHaveLength(1);
+    expect(proposalTechnologyIssues(`Близкий кейс: ${url}`, fit)).toEqual([]);
+    expect(proposalTechnologyIssues('Есть общий кейс с каталогом.', fit).join(' ')).toContain('добавь одно подтверждённое доказательство');
+  });
+
+  test('blocks the old generic availability placeholder when no date is configured', () => {
+    const issues = proposalResearchIssues(
+      'План: 1) согласую объём. 2) соберу сайт. Приёмка: каталог открывается. Цена 250000 ₽, срок 45 дней. Старт — после согласования объёма и получения необходимых материалов и доступов. ЛК нужен?',
+      'standard',
+      { price: 250_000, days: 45, availabilityConfigured: false, acceptanceLabel: 'acceptance' },
+    ).join(' ');
+    expect(issues).toContain('системную заглушку старта');
   });
 
   test('requires one exact case link when relevant portfolio evidence exists', () => {

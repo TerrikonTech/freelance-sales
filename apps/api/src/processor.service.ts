@@ -381,6 +381,9 @@ export class ProcessorService implements OnModuleDestroy {
         mode,
         ownerInstructions: effectiveInstructions.slice(0, 4_000),
       });
+    const proposalReview = mode === 'response'
+      ? await this.ai.proposalReviewContext(lead)
+      : null;
     const hash = createHash('sha256').update(content).digest('hex');
     const dialogId = channel === 'fl' ? String(lead.client?.fl_dialog_id || targetExternalId || '') : '';
     const actualTarget = channel === 'fl' && mode === 'chat' ? dialogId : targetExternalId;
@@ -406,7 +409,26 @@ export class ProcessorService implements OnModuleDestroy {
             }
             : null,
         }
-        : { mode: 'response', strategy: 'proposal-research-v1', projectUrl: lead.url, price: lead.recommended_price, days: lead.recommended_days, priceDisplayedSeparately: true, regenerated: Boolean(ownerInstructions) }
+        : {
+          mode: 'response',
+          strategy: 'proposal-research-v1',
+          projectUrl: lead.url,
+          price: lead.recommended_price,
+          days: lead.recommended_days,
+          priceDisplayedSeparately: true,
+          regenerated: Boolean(ownerInstructions),
+          review: proposalReview
+            ? {
+              technology_fit: proposalReview.technologyFit,
+              availability_configured: proposalReview.availabilityConfigured,
+              availability: proposalReview.availability || null,
+              flags: [
+                ...(proposalReview.technologyFit.risk === 'elevated' ? ['technology_fit_unverified'] : []),
+                ...(!proposalReview.availabilityConfigured ? ['availability_missing'] : []),
+              ],
+            }
+            : null,
+        }
       : {
         mode: 'chat',
         agent: agentTurn

@@ -6,7 +6,12 @@ COPY apps/web/package.json apps/web/package.json
 RUN npm install
 COPY apps ./apps
 RUN npm run build
-RUN npm test -w apps/api
+ARG API_TEST_TARGETS=""
+RUN if [ -n "$API_TEST_TARGETS" ]; then \
+      npm test -w apps/api -- --runInBand $API_TEST_TARGETS; \
+    else \
+      npm test -w apps/api; \
+    fi
 RUN npm prune --omit=dev
 
 FROM node:22-alpine AS runtime
