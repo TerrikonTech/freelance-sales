@@ -668,14 +668,30 @@ export class FlService {
     const $ = cheerio.load(await response.text());
     const urls = $('.portfolio-item__description[href*="/portfolio/"]').map((_, element) => new URL($(element).attr('href') || '', 'https://www.fl.ru').toString()).get();
     const uniqueUrls = [...new Set(urls)].slice(0, 120); // was 40: the owner has 87 published works
-    const cases: Array<{ title: string; description: string; url: string }> = [];
+    const storedCases = await this.settings.getPublic<Array<Record<string, unknown>>>('fl_portfolio_cases') || [];
+    const storedByUrl = new Map(storedCases.map((item) => [String(item.url || ''), item]));
+    const cases: Array<Record<string, unknown>> = [];
     for (const caseUrl of uniqueUrls) {
       const caseResponse = await fetch(caseUrl, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' }, signal: AbortSignal.timeout(25_000) });
       if (!caseResponse.ok) continue;
       const casePage = cheerio.load(await caseResponse.text());
       const title = casePage('.fl-portfolio-content-header__text').first().text().replace(/\s+/g, ' ').trim();
       const description = casePage('.fl-portfolio-content-text').first().text().replace(/\s+/g, ' ').trim();
-      if (title && description) cases.push({ title, description: description.slice(0, 8_000), url: caseUrl });
+      if (title && description) {
+        const stored = storedByUrl.get(caseUrl) || {};
+        cases.push({
+          title,
+          description: description.slice(0, 8_000),
+          url: caseUrl,
+          client_context: String(stored.client_context || title).slice(0, 1_000),
+          task: String(stored.task || description).slice(0, 2_000),
+          solution_details: String(stored.solution_details || '').slice(0, 2_000),
+          challenge: String(stored.challenge || '').slice(0, 2_000),
+          result: String(stored.result || '').slice(0, 1_000),
+          stack: String(stored.stack || '').slice(0, 600),
+          stack_mismatch_note: String(stored.stack_mismatch_note || '').slice(0, 600),
+        });
+      }
     }
     await this.settings.setPublic('fl_portfolio_cases', cases);
     await this.db.query(

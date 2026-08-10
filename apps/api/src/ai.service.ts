@@ -86,14 +86,19 @@ type DraftReview = {
 
 const DEFAULT_STYLE_PROFILE = {
   response_greeting: 'Короткое обращение по имени, если имя подтверждено; иначе сразу содержательный хук без приветствия-филлера',
-  response_structure: 'Не более трёх коротких абзацев: вариативный хук; микро-план и измеримый критерий приёмки; один кейс, цена, срок, подтверждённый старт и один лёгкий вопрос',
+  response_structure: 'Обычно 2–5 асимметричных абзацев: вариативный хук; микро-план и измеримый критерий приёмки; один кейс; цена, срок, подтверждённый старт и один лёгкий вопрос',
   response_length: 'FL.ru: обычно 100–200 слов; компактная точечная задача 60–120; дорогой сложный проект 170–260, жёсткий потолок 300 слов',
   punctuation: 'Естественная русская пунктуация. Короткий список из 2–3 шагов допустим, если он делает план сканируемым',
   tone: 'Спокойное личное сообщение сильного разработчика. Зеркалировать терминологию и регистр заказчика, не давить и не изображать рекламный текст',
   rules: [
     'Первая содержательная фраза — о задаче или риске заказчика, а не об исполнителе. В ней должна быть уникальная деталь этого брифа.',
+    'Писать как конкретному человеку: естественно использовать «у вас», «вам» или «ваш» минимум дважды, но не повторять бриф.',
+    'Чередовать короткие, средние и длинные предложения. Нужен один смысловой акцент на 2–5 слов; телеграфные заглушки вроде «Всё прозрачно», «Границу закрепим» и «Откат предусмотрю» запрещены.',
+    'Абзацы должны следовать за мыслью и отличаться по длине. Не упаковывать хук, план и кейс в три одинаковых симметричных блока.',
+    'Говорить глаголами и от первого лица. Не начинать фразы с «важно», «нужно», «следует», «необходимо» и не прятать действие в канцелярские существительные.',
+    'Использовать 1–3 естественные разговорные связки по смыслу: «по деньгам», «на практике», «скажу честно». Не рассыпать их для вида.',
     'Использовать минимум две конкретные детали заказа, но не пересказывать список функций.',
-    'Дать микро-план из 2–3 шагов и измеримый критерий приёмки. Формулировку критерия чередовать, а не копировать «Готово =» в каждый отклик.',
+    'Дать микро-план из 2–3 шагов. Показать приёмку как сцену с живым человеком: ваш сотрудник сам добавляет товар, менеджер получает уведомление или пользователь проходит сценарий.',
     'Использовать ровно одно самое релевантное доказательство. Если назван кейс, сразу дать точную ссылку.',
     'В каждом отклике естественно назвать цену, срок и подтверждённое условие старта, даже если цифры также попадут в отдельные поля FL.ru. Если доступность не настроена, не выдумывать её.',
     'Закончить одним простым вопросом или бинарным выбором, на который легко ответить.',
@@ -114,6 +119,37 @@ export type ProposalCommercialContext = {
   hookPattern?: ProposalHookPattern;
   acceptanceLabel?: ProposalAcceptanceLabel;
   technologyFit?: ProposalTechnologyFit;
+};
+
+export type ProposalHumanityMetrics = {
+  wordCount: number;
+  sentenceLengths: number[];
+  averageSentenceWords: number;
+  burstiness: number;
+  burstinessTargetMet: boolean;
+  burstinessHardFail: boolean;
+  paragraphWordCounts: number[];
+  paragraphBurstiness: number;
+  clientAddressCount: number;
+  shortSentenceCount: number;
+  longSentenceFollowupMissCount: number;
+  emptyAccentCount: number;
+  impersonalStartCount: number;
+  nominalizationCount: number;
+  inlineNumberedPlan: boolean;
+  negativeParallelismCount: number;
+  repeatedSentenceStartCount: number;
+  parallelismPairCount: number;
+  symmetricParagraphPairCount: number;
+  ruleOfThreeCount: number;
+  capitalizedColonListCount: number;
+  conclusionPhraseCount: number;
+  bureaucraticPhraseCount: number;
+  protocolHonestyCount: number;
+  tablePricingCount: number;
+  firstPersonActionCount: number;
+  conversationalConnectorCount: number;
+  questionCount: number;
 };
 
 export type ProposalTechnologyFit = {
@@ -163,7 +199,7 @@ export function proposalTechnologyFitContext(
     const definition = technologyDefinition(label)!;
     const matchedCase = portfolio.find((item) => {
       const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
-      return definition.pattern.test(`${row.title || ''}\n${row.description || ''}`);
+      return definition.pattern.test(`${row.title || ''}\n${row.description || ''}\n${row.stack || ''}`);
     });
     if (matchedCase && typeof matchedCase === 'object') {
       const row = matchedCase as Record<string, unknown>;
@@ -209,6 +245,16 @@ export function proposalTechnologyIssues(content: string, fit?: ProposalTechnolo
     if (unsupported) {
       issues.push(`Нельзя заявлять опыт с ${label}: в профиле и портфолио нет подтверждающего факта.`);
     }
+    const linkedCase = /https?:\/\/[^\s)]+/iu.test(content);
+    const mismatchDisclosed = sentences.some((sentence) => (
+      Boolean(definition?.pattern.test(sentence))
+        && /(?:не\s+на|нет\s+подтвержд[её]нного|опыт\s+не\s+подтвержд[её]н)/iu.test(sentence)
+    )) || sentences.some((sentence) => /стек(?:\s+у\s+него|\s+там|\s+проекта)?\s+(?:был\s+)?друг/iu.test(sentence));
+    if (linkedCase && !mismatchDisclosed) {
+      issues.push(
+        `Связанный кейс не подтверждает ${label}: скажи это прямо человеческими словами, например «Скажу честно: тот проект был не на ${label}, стек другой».`,
+      );
+    }
   }
 
   for (const evidence of fit.verifiedEvidence) {
@@ -239,21 +285,21 @@ const PROPOSAL_ACCEPTANCE_LABELS: ProposalAcceptanceLabel[] = [
 ];
 
 const ACCEPTANCE_LABEL_TEXT: Record<ProposalAcceptanceLabel, string> = {
-  ready_equals: 'Готово =',
-  acceptance: 'Приёмка:',
-  stage_closed: 'Этап считается закрытым, когда',
-  result_accepted: 'Результат можно принимать, когда',
-  result_check: 'Проверка результата:',
+  ready_equals: 'Работа готова, когда',
+  acceptance: 'Проверим просто:',
+  stage_closed: 'Этап закрываем, когда',
+  result_accepted: 'На приёмке ваш сотрудник',
+  result_check: 'Финальная проверка простая:',
 };
 
 export function proposalVariationPlan(recentDrafts: string[], seed: string) {
   const joined = recentDrafts.join('\n').toLowerCase();
   const acceptanceCounts: Record<ProposalAcceptanceLabel, number> = {
-    ready_equals: (joined.match(/готово\s*=/gu) || []).length,
-    acceptance: (joined.match(/при[ёе]мка\s*:/gu) || []).length,
-    stage_closed: (joined.match(/этап\s+считается\s+закрыт/gu) || []).length,
-    result_accepted: (joined.match(/результат\s+можно\s+принимать/gu) || []).length,
-    result_check: (joined.match(/проверка\s+результата\s*:/gu) || []).length,
+    ready_equals: (joined.match(/(?:готово\s*=|работа\s+готова,?\s+когда)/gu) || []).length,
+    acceptance: (joined.match(/(?:при[ёе]мка\s*:|проверим\s+просто\s*:)/gu) || []).length,
+    stage_closed: (joined.match(/(?:этап\s+считается\s+закрыт|этап\s+закрываем,?\s+когда)/gu) || []).length,
+    result_accepted: (joined.match(/(?:результат\s+можно\s+принимать|на\s+при[ёе]мке\s+ваш\s+сотрудник)/gu) || []).length,
+    result_check: (joined.match(/(?:проверка\s+результата\s*:|финальная\s+проверка\s+простая\s*:)/gu) || []).length,
   };
   const seedNumber = Number.parseInt(createHash('sha256').update(seed).digest('hex').slice(0, 8), 16);
   const acceptanceLabel = [...PROPOSAL_ACCEPTANCE_LABELS]
@@ -268,12 +314,332 @@ export function proposalVariationPlan(recentDrafts: string[], seed: string) {
   };
 }
 
+export function proposalOpeningSeed(seed: string, clientName = ''): string {
+  const name = clientName.trim().split(/\s+/u)[0];
+  const openings = [
+    'У вас в задаче',
+    'Сразу зацепила деталь:',
+    'По вашему описанию видно:',
+    'Здесь я бы первым делом разобрался с',
+    'У вас хороший ориентир —',
+  ];
+  const seedNumber = Number.parseInt(createHash('sha256').update(seed).digest('hex').slice(0, 8), 16);
+  const substantive = openings[seedNumber % openings.length];
+  return name ? `Здравствуйте, ${name}!\n\n${substantive}` : substantive;
+}
+
 export function proposalProfileForLead(lead: Record<string, unknown>): ProposalProfile {
   const description = String(lead.description || '').trim();
   const price = Number(lead.recommended_price) || 0;
   if (description.length <= 220 || (price > 0 && price <= 40_000)) return 'compact';
   if (price >= 500_000) return 'premium';
   return 'standard';
+}
+
+const HUMANITY_WORD_PATTERN = /[\p{L}\p{N}]+(?:[-'][\p{L}\p{N}]+)*/gu;
+
+function proposalSentences(content: string): Array<{ text: string; words: string[] }> {
+  const withoutUrls = content.replace(/https?:\/\/[^\s)]+/giu, ' ссылка ');
+  return withoutUrls
+    .split(/(?<=[.!?])(?:\s+|$)|\n+/u)
+    .map((text) => text.replace(/^\s*(?:[-•]|\d+[.)])\s*/u, '').trim())
+    .filter(Boolean)
+    .map((text) => ({ text, words: text.match(HUMANITY_WORD_PATTERN) || [] }))
+    .filter((sentence) => sentence.words.length > 0);
+}
+
+function sentenceStructure(text: string): string {
+  const normalized = text.toLowerCase().replace(/^[^\p{L}\p{N}]+/u, '');
+  if (/^я(?:\s|$)/u.test(normalized)) return 'first_person';
+  if (/^(?:у\s+вас|вам|ваш[а-яё]*)(?:\s|$)/u.test(normalized)) return 'client';
+  if (/^(?:сначала|затем|потом|дальше|в\s+конце|наконец)(?:\s|$)/u.test(normalized)) return 'sequence';
+  if (/^(?:если|когда|после|перед|пока)(?:\s|$)/u.test(normalized)) return 'condition';
+  return (normalized.match(HUMANITY_WORD_PATTERN) || []).slice(0, 1).join(' ');
+}
+
+function priceWithSpaces(value: number): string {
+  return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+}
+
+/** Safe deterministic cleanup for formatting that should not consume an AI retry. */
+export function normalizeProposalFormatting(
+  content: string,
+  commercial: ProposalCommercialContext = {},
+): string {
+  const price = Math.round(Number(commercial.price) || 0);
+  if (price < 10_000) return content.trim();
+  const raw = String(price);
+  const grouped = priceWithSpaces(price);
+  return content.trim().replace(
+    new RegExp(`(^|[^\\d])${raw}(?=\\s*(?:₽|руб(?:\\.|лей|ля)?))`, 'gimu'),
+    (_match, prefix: string) => `${prefix}${grouped}`,
+  );
+}
+
+/** Deterministic style diagnostics: editorial signals, not an AI-detector verdict. */
+export function proposalHumanityMetrics(content: string): ProposalHumanityMetrics {
+  const sentences = proposalSentences(content);
+  const allWords = content.match(HUMANITY_WORD_PATTERN) || [];
+  const sentenceLengths = sentences.map((sentence) => sentence.words.length);
+  const average = sentenceLengths.length
+    ? sentenceLengths.reduce((sum, value) => sum + value, 0) / sentenceLengths.length
+    : 0;
+  const variance = sentenceLengths.length
+    ? sentenceLengths.reduce((sum, value) => sum + ((value - average) ** 2), 0) / sentenceLengths.length
+    : 0;
+  const burstiness = average > 0 ? Math.sqrt(variance) / average : 0;
+  const paragraphWordCounts = content.trim().split(/\n\s*\n/u)
+    .map((paragraph) => (paragraph.match(HUMANITY_WORD_PATTERN) || []).length)
+    .filter((length) => length > 0);
+  const paragraphAverage = paragraphWordCounts.length
+    ? paragraphWordCounts.reduce((sum, value) => sum + value, 0) / paragraphWordCounts.length
+    : 0;
+  const paragraphVariance = paragraphWordCounts.length
+    ? paragraphWordCounts.reduce((sum, value) => sum + ((value - paragraphAverage) ** 2), 0) / paragraphWordCounts.length
+    : 0;
+  const paragraphBurstiness = paragraphAverage > 0 ? Math.sqrt(paragraphVariance) / paragraphAverage : 0;
+  const paragraphSentenceCounts = content.trim().split(/\n\s*\n/u)
+    .map((paragraph) => proposalSentences(paragraph).length)
+    .filter((length) => length > 0);
+  const paragraphStructures = content.trim().split(/\n\s*\n/u)
+    .map((paragraph) => sentenceStructure(proposalSentences(paragraph)[0]?.text || ''))
+    .filter(Boolean);
+  const addressMatches = content.match(
+    /(?:^|[^\p{L}])(?:у\s+вас|вы|вам|вас|вами|ваш[а-яё]*)(?=$|[^\p{L}])/gimu,
+  ) || [];
+  const shortSentenceCount = sentences.filter((sentence) => (
+    sentence.words.length >= 2
+    && sentence.words.length <= 5
+    && !/^(?:добрый\s+день|здравствуйте|привет)[!,.]?$/iu.test(sentence.text)
+  )).length;
+  const emptyAccentCount = sentences.filter((sentence) => (
+    sentence.words.length <= 5
+    && /^(?:вс[её]\s+(?:понятно|прозрачно|просто|готово)|границы\s*(?:[—-]\s*сразу|закрепим)|откат\s+предусмотрю|риски?\s+(?:понятны|видны)|это\s+(?:главное|важно)|вот\s+и\s+вс[её])[.!]?$/iu.test(sentence.text.trim())
+  )).length;
+  const impersonalStartCount = sentences.filter((sentence) => (
+    /^(?:важно|нужно|следует|необходимо|требуется|стоит|можно)(?:\s|[,:—-]|$)/iu.test(sentence.text)
+  )).length;
+  const allowedTerms = /^(?:организац|регистрац|авторизац|стоимост|безопасност|доступност|производительност|возможност)/iu;
+  const nominalizationSuffix = /(?:ение|ения|ению|ением|ении|ание|ания|анию|анием|ании|ация|ации|ацию|ацией|ость|ости|остью)$/iu;
+  const nominalizationLead = /^(?:для|после|перед|через|при|с|по|пут[её]м|провести|проведу|проводить|выполнить|осуществить|обеспечить)$/iu;
+  const nominalizationCount = sentences.reduce((count, sentence) => {
+    const words = sentence.words.map((word) => word.toLowerCase());
+    return count + words.reduce((sentenceCount, word, index) => {
+      if (!nominalizationSuffix.test(word) || allowedTerms.test(word) || /ностью$/iu.test(word)) return sentenceCount;
+      const lead = words.slice(Math.max(0, index - 2), index);
+      return sentenceCount + (index === 0 || lead.some((item) => nominalizationLead.test(item)) ? 1 : 0);
+    }, 0);
+  }, 0);
+  const inlineNumberedPlan = content.split('\n').some((line) => (
+    /(?:^|\s)1[.)]\s+.+(?:^|\s)2[.)]\s+/u.test(line)
+  ));
+  const negativeParallelismCount = (
+    content.match(/(?:^|[^\p{L}])не\s+(?:(?:просто|только)(?:\s|[,:—-])[^.!?]{0,120}(?:а|но)|[^.!?]{1,80},\s*а)(?=$|[^\p{L}])/gimu) || []
+  ).length;
+  const sentenceStarts = sentences.map((sentence) => sentence.words.slice(0, 2).join(' ').toLowerCase());
+  const repeatedSentenceStartCount = sentenceStarts.reduce((count, start, index) => (
+    index > 0 && start.length > 0 && start === sentenceStarts[index - 1] ? count + 1 : count
+  ), 0);
+  const structures = sentences.map((sentence) => sentenceStructure(sentence.text));
+  const parallelismPairCount = structures.reduce((count, structure, index) => {
+    if (index === 0 || !structure || structure !== structures[index - 1]) return count;
+    const left = sentenceLengths[index - 1];
+    const right = sentenceLengths[index];
+    return count + (Math.abs(left - right) / Math.max(left, right) <= 0.3 ? 1 : 0);
+  }, 0);
+  const longSentenceFollowupMissCount = sentenceLengths.reduce((count, length, index) => (
+    length >= 25 && index < sentenceLengths.length - 1 && sentenceLengths[index + 1] > 8
+      ? count + 1
+      : count
+  ), 0);
+  const symmetricParagraphPairCount = paragraphWordCounts.reduce((count, words, index) => {
+    if (index === 0
+      || paragraphSentenceCounts[index] !== paragraphSentenceCounts[index - 1]
+      || paragraphStructures[index] !== paragraphStructures[index - 1]) return count;
+    const previous = paragraphWordCounts[index - 1];
+    return count + (Math.abs(previous - words) / Math.max(previous, words) <= 0.2 ? 1 : 0);
+  }, 0);
+  const ruleOfThreeCount = sentences.filter((sentence) => (
+    (sentence.text.match(/(?:^|[,;])\s*(?:я\s+)?[\p{L}-]+(?:ю|у|аю|яю|ем|им|ить|ать|ять)(?=\s|[,;]|$)/gimu) || []).length >= 3
+  )).length;
+  const capitalizedColonListCount = sentences.filter((sentence) => (
+    /:\s*[А-ЯЁ][^.!?;]{1,80}[;,]\s*[А-ЯЁ]/u.test(sentence.text)
+  )).length;
+  const conclusionPhraseCount = (content.match(
+    /(?:^|[^\p{L}])(?:таким\s+образом|подводя\s+итог)(?=$|[^\p{L}])/gimu,
+  ) || []).length;
+  const bureaucraticPhraseCount = (content.match(
+    /(?:^|[^\p{L}])(?:важно\s+отметить|ключевой\s+момент|это\s+особенно\s+важно|в\s+современных\s+реалиях|является|осуществляет)(?=$|[^\p{L}])/gimu,
+  ) || []).length;
+  const protocolHonestyCount = (content.match(
+    /(?:не\s+служит\s+подтверждением|не\s+является\s+гарантией)/gimu,
+  ) || []).length;
+  const tablePricingCount = (content.match(
+    /(?:стоимость|цена)\s*[—-]\s*\d[^.!?]{0,80}срок\s*[—-]/gimu,
+  ) || []).length;
+  const firstPersonActionCount = (content.match(
+    /(?:^|[^\p{L}])я\s+(?:делал|сделал|собрал|соберу|разработал|реализовал|спроектировал|настроил|подключил|внедрил|создал|проверю|покажу|сверю|опишу|зафиксирую|предусмотрю|продумаю|проведу|разведу|договорюсь)(?=$|[^\p{L}])/gimu,
+  ) || []).length;
+  const conversationalConnectorCount = (content.match(
+    /(?:^|[^\p{L}])(?:кстати|скажу\s+честно|по\s+деньгам|на\s+практике|проще\s+говоря|сразу\s+скажу|если\s+коротко|самое\s+хитрое\s+было)(?=$|[^\p{L}])/gimu,
+  ) || []).length;
+  return {
+    wordCount: allWords.length,
+    sentenceLengths,
+    averageSentenceWords: Number(average.toFixed(2)),
+    burstiness: Number(burstiness.toFixed(2)),
+    burstinessTargetMet: burstiness >= 0.6,
+    burstinessHardFail: sentences.length >= 5 && burstiness < 0.55,
+    paragraphWordCounts,
+    paragraphBurstiness: Number(paragraphBurstiness.toFixed(2)),
+    clientAddressCount: addressMatches.length,
+    shortSentenceCount,
+    longSentenceFollowupMissCount,
+    emptyAccentCount,
+    impersonalStartCount,
+    nominalizationCount,
+    inlineNumberedPlan,
+    negativeParallelismCount,
+    repeatedSentenceStartCount,
+    parallelismPairCount,
+    symmetricParagraphPairCount,
+    ruleOfThreeCount,
+    capitalizedColonListCount,
+    conclusionPhraseCount,
+    bureaucraticPhraseCount,
+    protocolHonestyCount,
+    tablePricingCount,
+    firstPersonActionCount,
+    conversationalConnectorCount,
+    questionCount: (content.match(/\?/g) || []).length,
+  };
+}
+
+function caseTokenStems(value: string): Set<string> {
+  const generic = new Set([
+    'проект', 'разработка', 'реализовать', 'сделал', 'делал', 'собрал', 'настроил', 'создал',
+    'спроектировал', 'система', 'платформа', 'сервис', 'кабинет', 'пользователь', 'клиент', 'задача',
+    'работа', 'логика', 'механика', 'интерфейс', 'frontend', 'backend', 'nextjs', 'nestjs', 'данные', 'сайт', 'приложение',
+  ].map((word) => word.slice(0, 6)));
+  return new Set((value.toLowerCase().match(/[а-яёa-z0-9]{5,}/gu) || [])
+    .map((word) => word.slice(0, 6))
+    .filter((stem) => !generic.has(stem)));
+}
+
+/** A linked case must contain one verifiable, non-generic detail from its stored card. */
+export function portfolioHumanityIssues(content: string, portfolio: Record<string, unknown>[]): string[] {
+  if (!content || !Array.isArray(portfolio) || !portfolio.length) return [];
+  const selected = portfolio.find((item) => {
+    const url = String(item.url || '').trim();
+    return url && content.includes(url);
+  });
+  if (!selected) return [];
+  const url = String(selected.url || '').trim();
+  const paragraph = content.split(/\n\s*\n/u).find((item) => item.includes(url)) || content;
+  const issues: string[] = [];
+  if (!/(?:^|[^\p{L}])я\s+(?:делал|сделал|собрал|разработал|реализовал|спроектировал|настроил|подключил|внедрил|создал|отвечал|проектировал)(?=$|[^\p{L}])/iu.test(paragraph)) {
+    issues.push('Опиши кейс от первого лица: «я делал/собрал/разработал», а не безличной справкой.');
+  }
+  const caseCard = selected.case_card && typeof selected.case_card === 'object'
+    ? selected.case_card as Record<string, unknown>
+    : selected;
+  const descriptionStems = caseTokenStems([
+    selected.description,
+    caseCard.client_context,
+    caseCard.task,
+    caseCard.solution_details,
+    caseCard.challenge,
+    caseCard.result,
+    caseCard.stack,
+  ].filter(Boolean).join(' '));
+  const paragraphStems = caseTokenStems(paragraph.replace(url, ''));
+  let overlap = 0;
+  for (const stem of descriptionStems) if (paragraphStems.has(stem)) overlap += 1;
+  if (descriptionStems.size > 0 && overlap < 2) {
+    issues.push('В кейсе нет живой проверяемой детали из его карточки: возьми 1–2 факта из portfolio.description и ничего не придумывай.');
+  }
+  return issues;
+}
+
+export function proposalHumanityWarnings(metrics: ProposalHumanityMetrics): string[] {
+  const warnings: string[] = [];
+  if (metrics.burstinessHardFail) {
+    warnings.push(`Бёрстинесс ${metrics.burstiness}: ниже жёсткого порога 0,55; нужна синтаксическая ревизия.`);
+  } else if (!metrics.burstinessTargetMet) {
+    warnings.push(`Бёрстинесс ${metrics.burstiness}: ниже цели 0,60, но выше жёсткого порога 0,55.`);
+  }
+  return warnings;
+}
+
+export function proposalHumanRulePass(metrics: ProposalHumanityMetrics): boolean {
+  const rhythmPass = !metrics.burstinessHardFail
+    // The supplied handwritten reference has sentence burstiness 0.49 despite
+    // claiming 0.77. Strong paragraph asymmetry plus real short beats is the
+    // calibrated escape hatch; the raw metric is still logged and revised.
+    || (metrics.paragraphBurstiness >= 0.5 && metrics.shortSentenceCount >= 2);
+  return rhythmPass
+    && metrics.clientAddressCount >= 2
+    && metrics.nominalizationCount <= 3
+    && metrics.impersonalStartCount === 0
+    && metrics.parallelismPairCount === 0
+    && metrics.negativeParallelismCount === 0
+    && metrics.ruleOfThreeCount === 0
+    && metrics.firstPersonActionCount >= 1
+    && metrics.conversationalConnectorCount >= 1
+    && metrics.conversationalConnectorCount <= 3;
+}
+
+export function proposalFinalBlockingIssues(content: string, issues: string[]): string[] {
+  if (!proposalHumanRulePass(proposalHumanityMetrics(content))) return issues;
+  return issues.filter((issue) => !/^Ритм провален/iu.test(issue));
+}
+
+function proposalRevisionGuidance(
+  content: string,
+  issues: string[],
+  portfolio: Record<string, unknown>[],
+) {
+  const consequenceFor = (issue: string) => {
+    if (/бёрстин|ритм|фраз|абзац|параллел|канцеляр|филлер/iu.test(issue)) {
+      return 'Текст звучит собранным по шаблону и выдаёт AI-происхождение.';
+    }
+    if (/кейс|ссылк|факт|опыт|технолог|стек/iu.test(issue)) {
+      return 'Заказчик не сможет проверить доказательство или увидит неподтверждённое обещание.';
+    }
+    if (/при[ёе]мк|план|вопрос|цен|срок|старт/iu.test(issue)) {
+      return 'Заказчику непонятен следующий шаг или коммерческая граница.';
+    }
+    return 'Отклик теряет конкретность и доверие.';
+  };
+  const preserve: string[] = [];
+  const first = proposalSentences(content)[0]?.text || '';
+  if (first && (first.match(HUMANITY_WORD_PATTERN) || []).length <= 24
+    && !/^(?:я|мы|внимательно|готов|задача\s+понятна)/iu.test(first)) {
+    preserve.push(first);
+  }
+  const caseParagraph = content.split(/\n\s*\n/u).find((paragraph) => /https?:\/\//iu.test(paragraph));
+  if (caseParagraph && portfolioHumanityIssues(content, portfolio).length === 0) {
+    preserve.push(caseParagraph.trim());
+  }
+  const commercialSentence = proposalSentences(content).find((sentence) => (
+    /(?:по\s+деньгам|стоимост|цена)[^.!?]*\d/iu.test(sentence.text)
+  ));
+  if (commercialSentence) preserve.push(commercialSentence.text);
+  if ((content.match(/\?/g) || []).length === 1) {
+    const question = content.split(/(?<=[?])\s+/u).find((part) => part.includes('?'));
+    if (question) preserve.push(question.trim());
+  }
+  return {
+    previous_content: content,
+    issues,
+    issue_plan: issues.map((error) => ({
+      error,
+      consequence: consequenceFor(error),
+      fix: error,
+    })),
+    preserve: [...new Set(preserve)].slice(0, 4),
+    instruction: 'Исправь только перечисленные причины. Фрагменты preserve оставь дословно, если они не противоречат issue_plan.',
+  };
 }
 
 export function proposalResearchIssues(
@@ -291,39 +657,120 @@ export function proposalResearchIssues(
     issues.push(`Объём для режима ${profile}: нужно ${limits.minChars}–${limits.maxChars} знаков, сейчас ${content.length}.`);
   }
   const paragraphs = content.trim().split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
-  if (paragraphs.length > 3) issues.push('Оставь не более трёх коротких абзацев.');
-  if (paragraphs.length === 1 && content.length > 650) issues.push('Разбей стену текста на 2–3 сканируемых абзаца.');
+  const substantiveParagraphs = paragraphs.filter((paragraph) => (
+    !/^(?:добрый\s+день|здравствуйте|привет)(?:,?\s+[\p{L} -]{2,40})?[!.]?$/iu.test(paragraph)
+  ));
+  if (substantiveParagraphs.length > 5) issues.push('Оставь не более пяти содержательных абзацев.');
+  if (substantiveParagraphs.length === 1 && content.length > 650) issues.push('Разбей стену текста на 2–3 сканируемых абзаца.');
+
+  const humanity = proposalHumanityMetrics(content);
+  // 0.60 is the editorial target. Only <0.55 is a hard generation failure;
+  // 0.55–0.59 stays visible in metadata for calibration instead of blocking work.
+  if (humanity.burstinessHardFail) {
+    const targetSentences = profile === 'premium' ? '12–16' : profile === 'standard' ? '9–14' : '7–10';
+    issues.push(
+      `Ритм провален (бёрстинесс ${humanity.burstiness}, жёсткий порог 0,55; длины: ${humanity.sentenceLengths.join('/')}). `
+      + `Сделай ${targetSentences} предложений: разбей две самые длинные фразы и добавь ещё один короткий смысловой акцент на 2–5 слов. Факты не меняй.`,
+    );
+  }
+  if (humanity.clientAddressCount < 2) {
+    issues.push(`Текст написан «в воздух»: естественно обратись к заказчику через «у вас», «вам» или «ваш» минимум дважды (сейчас ${humanity.clientAddressCount}).`);
+  }
+  if (humanity.sentenceLengths.length >= 5 && humanity.shortSentenceCount === 0) {
+    issues.push('Нет короткого смыслового акцента на 2–5 слов: текст звучит одинаково плотным.');
+  }
+  if (humanity.emptyAccentCount > 0) {
+    issues.push('Короткий акцент получился пустым филлером («Всё прозрачно»/«Это главное»): короткая фраза должна добавлять конкретный смысл.');
+  }
+  if (humanity.repeatedSentenceStartCount > 0) {
+    issues.push('Соседние предложения начинаются одинаково: разрушь синтаксический параллелизм, не меняя факты.');
+  }
+  if (humanity.parallelismPairCount > 0) {
+    issues.push(`Найдено ${humanity.parallelismPairCount} пар соседних фраз с одинаковой конструкцией и длиной: одну объедини, разбей или переставь.`);
+  }
+  if (humanity.longSentenceFollowupMissCount > 0) {
+    issues.push(`После ${humanity.longSentenceFollowupMissCount} длинных фраз нет короткого продолжения до 8 слов: разбей ритм смысловым ударом.`);
+  }
+  if (humanity.paragraphWordCounts.length >= 3
+    && humanity.paragraphWordCounts.reduce((sum, value) => sum + value, 0) >= 80
+    && humanity.paragraphBurstiness < 0.18) {
+    issues.push(`Абзацы слишком симметричны (${humanity.paragraphWordCounts.join('/')} слов): сделай их разной длины и подчинёнными ходу мысли.`);
+  }
+  if (humanity.symmetricParagraphPairCount > 0) {
+    issues.push('Соседние абзацы получились симметричными по длине и числу предложений: измени подачу одного из них.');
+  }
+  if (humanity.impersonalStartCount > 0) {
+    issues.push('Не начинай фразы безлично с «важно/нужно/следует/необходимо/можно»: назови, кто и что делает.');
+  }
+  const requiredFirstPersonActions = 1;
+  if (humanity.firstPersonActionCount < requiredFirstPersonActions) {
+    issues.push(`Назови свои действия от первого лица живыми глаголами минимум ${requiredFirstPersonActions} раза: «я соберу/покажу/проверю» (сейчас ${humanity.firstPersonActionCount}).`);
+  }
+  if (humanity.conversationalConnectorCount < 1) {
+    issues.push('Добавь одну уместную разговорную связку вроде «по деньгам», «на практике» или «скажу честно» — только ту, которая звучит естественно в этом месте.');
+  }
+  if (humanity.conversationalConnectorCount > 3) {
+    issues.push('Разговорных связок слишком много: оставь 1–3, иначе голос выглядит сыгранным.');
+  }
+  const nominalizationLimit = 3;
+  if (humanity.nominalizationCount > nominalizationLimit) {
+    issues.push(`Слишком много отглагольных существительных (${humanity.nominalizationCount}): замени канцелярские обороты прямыми глаголами.`);
+  }
+  if (humanity.inlineNumberedPlan) {
+    issues.push('Не пиши «1) 2) 3)» внутри одного предложения: изложи план прозой или отдельными строками.');
+  }
+  if (humanity.negativeParallelismCount > 0) {
+    issues.push('Убери машинную контрастивную конструкцию «не X, а Y» / «не просто» / «не только» и скажи мысль прямо.');
+  }
+  if (humanity.ruleOfThreeCount > 0) {
+    issues.push('Убери «правило трёх»: три одинаково построенных действия подряд звучат как рекламный шаблон.');
+  }
+  if (humanity.capitalizedColonListCount > 0) {
+    issues.push('После двоеточия получился формальный список с заглавных букв: скажи это нормальной фразой или одним коротким списком.');
+  }
+  if (humanity.conclusionPhraseCount > 0) {
+    issues.push('Удали выводную формулу «таким образом/подводя итог»: закончи предметным вопросом.');
+  }
+  if (humanity.bureaucraticPhraseCount > 0) {
+    issues.push('Убери канцелярские маркеры «важно отметить/ключевой момент/является/осуществляет» и назови действие прямо.');
+  }
+  if (humanity.protocolHonestyCount > 0) {
+    issues.push('Замени протокольную честность «не служит подтверждением/не является гарантией» на разговорное «скажу честно».');
+  }
 
   const withoutGreeting = content.trim().replace(/^(?:(?:[\p{L} -]{2,40},\s*)?(?:добрый день|здравствуйте|привет)[.!]?\s*)/iu, '');
   const firstSentence = withoutGreeting.split(/[.!?\n]/, 1)[0].trim().toLowerCase();
-  if (/^(?:я|мы|мне|мой|моя|мои|наш|наша)\b/u.test(firstSentence)) {
+  const firstSentenceWords = firstSentence.match(/[\p{L}\p{N}]+(?:[-'][\p{L}\p{N}]+)*/gu) || [];
+  if (firstSentenceWords.length > 24) {
+    issues.push(`Первая фраза перегружена: разбей её на две короткие, не более 24 слов в первой.`);
+  }
+  if (/^(?:я|мы|мне|мой|моя|мои|наш|наша)(?:\s|[,:—-]|$)/u.test(firstSentence)) {
     issues.push('Первая содержательная фраза должна быть о задаче или риске заказчика, а не об исполнителе.');
   }
   if (/^(?:внимательно (?:прочитал|изучил)|готов (?:выполнить|приступить)|задача понятна)/iu.test(firstSentence)) {
     issues.push('Первый экран занят шаблонным филлером: начни с конкретной детали этого заказа.');
   }
-  const acceptancePatterns: Record<ProposalAcceptanceLabel, RegExp> = {
-    ready_equals: /готово\s*=/iu,
-    acceptance: /при[ёе]мка\s*:/iu,
-    stage_closed: /этап\s+считается\s+закрыт/iu,
-    result_accepted: /результат\s+можно\s+принимать/iu,
-    result_check: /проверка\s+результата\s*:/iu,
-  };
-  const acceptancePattern = commercial.acceptanceLabel
-    ? acceptancePatterns[commercial.acceptanceLabel]
-    : new RegExp(Object.values(acceptancePatterns).map((pattern) => pattern.source).join('|'), 'iu');
+  // variation_plan suggests wording to avoid repetition; it is not a reason to
+  // reject an otherwise natural acceptance scene with a different phrase.
+  const acceptancePattern = /(?:при[ёе]мк|работа\s+готова|проверим\s+просто|этап\s+(?:закрываем|принят|считается)|финальная\s+проверка|если\s+(?:сможет|проходит|получится))/iu;
   if (!acceptancePattern.test(content)) {
-    const expected = commercial.acceptanceLabel ? ACCEPTANCE_LABEL_TEXT[commercial.acceptanceLabel] : 'одна из вариативных формул приёмки';
-    issues.push(`Добавь измеримый критерий приёмки через «${expected}».`);
+    issues.push('Добавь измеримый критерий приёмки как живую проверку результата.');
+  }
+  const acceptanceScene = /(?:ваш[а-яё]*\s+(?:сотрудник|менеджер|администратор)|администратор|менеджер|пользователь|партн[её]р)[^.!?]{0,140}(?:добав|созда|редакт|проход|регистр|вход|откры|получ|провер|меня|оформ)/iu.test(content);
+  if (!acceptanceScene) {
+    issues.push('Покажи приёмку как сцену: ваш сотрудник, менеджер или пользователь сам выполняет проверяемое действие.');
   }
   if (/(?:…|\.{3})/u.test(content)) {
     issues.push('В готовом отклике осталось многоточие-заглушка: замени его конкретным текстом.');
   }
   const numberedPlan = /(?:^|\s)1[.)]\s+[\s\S]{0,700}(?:^|\s)2[.)]\s+/mu.test(content);
   const bulletSteps = (content.match(/(?:^|\n)\s*[-•]\s+/gmu) || []).length;
+  const proseStepMarkers = content.match(
+    /(?:^|[^\p{L}])(?:сначала|первым\s+шагом|затем|потом|после\s+этого|дальше|в\s+конце|наконец|после\s+показа)(?=$|[^\p{L}])/gimu,
+  ) || [];
   const hasPlan = numberedPlan
     || bulletSteps >= 2
-    || /сначала[\s\S]{0,500}(?:затем|после этого|дальше)/iu.test(content);
+    || proseStepMarkers.length >= 2;
   if (!hasPlan) issues.push('Добавь микро-план из 2–3 последовательных шагов.');
   const questions = (content.match(/\?/g) || []).length;
   if (questions !== 1) issues.push(`В финале нужен ровно один лёгкий вопрос, сейчас вопросов: ${questions}.`);
@@ -336,6 +783,16 @@ export function proposalResearchIssues(
   );
   if (Number(commercial.price) > 0 && !exactNumberPattern(Number(commercial.price)).test(content)) {
     issues.push(`Назови в тексте цену ${Math.round(Number(commercial.price)).toLocaleString('ru-RU')} ₽.`);
+  }
+  if (humanity.tablePricingCount > 0) {
+    issues.push('Цена и срок звучат как строка таблицы. Скажи их фразой: «По деньгам: 250 000 ₽ и 45 дней».');
+  }
+  if (Number(commercial.price) >= 10_000) {
+    const rawPrice = String(Math.round(Number(commercial.price)));
+    const ungroupedPrice = new RegExp(`(^|\\D)${rawPrice}(?=\\D|$)`, 'u');
+    if (ungroupedPrice.test(content)) {
+      issues.push(`Раздели разряды в сумме: ${Math.round(Number(commercial.price)).toLocaleString('ru-RU')} ₽, а не ${rawPrice} ₽.`);
+    }
   }
   if (Number(commercial.days) > 0) {
     const daysPattern = new RegExp(`${Math.round(Number(commercial.days))}\\s*(?:рабоч(?:их|ие)?\\s*)?д(?:ень|ня|ней|\\.)`, 'iu');
@@ -401,20 +858,43 @@ export function portfolioEvidenceIssues(content: string, portfolio: Record<strin
 const RESPONSE_PRINCIPLES = [
   'Цель первого отклика — получить осмысленный ответ и снизить тревогу заказчика, а не пересказать бриф или показать весь стек.',
   'Первые 150–200 символов должны содержать конкретную проблему, наблюдение, результат или близкое доказательство именно по этому заказу. Не начинать с «я», стажа или приветствия-филлера.',
+  'Пиши конкретному человеку, а не в пустоту: минимум два естественных обращения «у вас/вам/ваш». Это не повод пересказывать заказ фразой «вам нужно».',
+  'Ритм должен быть неровным по смыслу: целевой бёрстинесс не ниже 0,60, жёсткий провал ниже 0,55. После фразы от 25 слов ставь короткую до 8 слов. Нужен один содержательный удар на 2–5 слов; соседние предложения одинаковой длины и конструкции запрещены.',
+  'Действия называй глаголами и от первого лица: «я соберу», «покажу», «проверю». Безличные старты и канцелярские цепочки из слов на «-ение/-ация/-ость» переписывай.',
+  'Добавь 1–3 разговорные связки только там, где они естественны: «по деньгам», «на практике», «скажу честно». Искусственная разговорность не нужна.',
   'Использовать минимум две уникальные детали задания и лексику клиента, но не перечислять уже написанные функции для вида.',
-  'Структура: один из пяти вариативных хуков → понимание цели → микро-план 2–3 шага → вариативный критерий приёмки → один кейс → цена, срок и старт → один простой вопрос.',
+  'Структура: один из пяти вариативных хуков → понимание цели → микро-план 2–3 шага → приёмка как живая сцена с сотрудником или пользователем → один кейс → цена, срок и подтверждённый старт при его наличии → один простой вопрос.',
   'Техническая мысль допустима только когда объясняет пользу, риск, деньги или скорость. На дорогом проекте показать управляемость: этапность, QA, прозрачность или обратимость.',
   'Доверие строить одним сильным уместным сигналом: близкий реальный кейс с прямой ссылкой, подтверждённый опыт или конкретный способ снять главный риск. 6 лет и Яндекс не вставлять как заполнитель.',
   'Если называешь кейс из portfolio — сразу давай его ссылку из portfolio[].url. Не писать «могу показать» без ссылки: заказчик должен мочь открыть работу в один клик.',
+  'Кейс упоминай по схеме «я делал → одна проверяемая деталь из portfolio.description → чем она совпадает с задачей клиента → точная ссылка». Нельзя дополнять карточку правдоподобными числами, ролями или результатами, которых в ней нет.',
+  'У case_card есть поля client_context, task, solution_details, challenge, result, stack и stack_mismatch_note. Используй только заполненные факты; пустое поле не разрешает домысливать деталь.',
   'Ссылку брать только из portfolio[].url дословно. Никогда не выдумывать адрес и не ссылаться на кейс, которого нет в portfolio.',
   'Если заказ явно требует CMS или технологию, используй только доказательство из technology_fit. Словарь инфоблоков, компонентов и редакций не доказывает опыт сам по себе. При risk=elevated не заявляй, что работал с технологией: соседний кейс доказывает только механику проекта, а не стек.',
   'Завершать ровно одним лёгким вопросом или бинарным выбором, который двигает разговор на один шаг. Не превращать отклик в анкету.',
   'Не ругать постановку задачи, бюджет, конкурентов или выбранную технологию в первом сообщении.',
   'Не писать по обязательной формуле: структура и длина должны следовать брифу и выбранному углу.',
   'Цена и срок обязательны в самом тексте. Старт обязателен только когда подтверждён профилем продавца; при пустой настройке его нельзя выдумывать.',
+  'Цену и срок писать живой фразой вроде «По деньгам: 250 000 ₽ и 45 дней», а не таблицей «Стоимость — …, срок — …». Суммы писать с разрядами.',
+  'Запрещены «важно отметить», «ключевой момент», «в современных реалиях», «является», «осуществляет», выводы «таким образом/подводя итог», правило трёх и формальная честность «не служит подтверждением».',
+  'Старт называть только когда он подтверждён профилем продавца; при пустой настройке не выдумывать дату и не вставлять системную заглушку.',
   'Если подтверждёно имя из FL-профиля или чата, обратиться по имени. Не угадывать имя по логину.',
   'Не использовать манипуляции, искусственную срочность и давление. Рабочая психология отклика — персонализация, конкретное доказательство, снижение риска и простой следующий шаг.',
 ];
+
+export function selectVoiceprintExamples(examples: string[], leadText: string, limit = 3): string[] {
+  const leadStems = caseTokenStems(leadText);
+  return examples
+    .map((content, index) => {
+      const exampleStems = caseTokenStems(content);
+      let overlap = 0;
+      for (const stem of leadStems) if (exampleStems.has(stem)) overlap += 1;
+      return { content, overlap, index };
+    })
+    .sort((left, right) => right.overlap - left.overlap || left.index - right.index)
+    .slice(0, Math.max(0, limit))
+    .map((item) => item.content);
+}
 
 const PORTFOLIO_CONCEPTS: Array<{ lead: RegExp; item: RegExp }> = [
   { lead: /(?:telegram|телеграм|max|макс|мессендж|бот)/iu, item: /(?:telegram|телеграм|max|макс|мессендж|бот|чат)/iu },
@@ -455,30 +935,34 @@ export function selectRelevantPortfolio(value: unknown, leadText: string): Recor
       title: String(row.title || '').slice(0, 180),
       description: String(row.description || '').slice(0, 900),
       url: String(row.url || '').slice(0, 500),
+      case_card: {
+        client_context: String(row.client_context || row.title || '').slice(0, 500),
+        task: String(row.task || row.description || '').slice(0, 900),
+        solution_details: String(row.solution_details || '').slice(0, 900),
+        challenge: String(row.challenge || '').slice(0, 700),
+        result: String(row.result || '').slice(0, 500),
+        stack: String(row.stack || '').slice(0, 300),
+        stack_mismatch_note: String(row.stack_mismatch_note || '').slice(0, 300),
+      },
       relevance_score: score,
     }));
 }
 
 const RESPONSE_CALIBRATION = [
   {
-    kind: 'Сложная интеграция с неясной существующей основой',
-    example: 'По связке hh.ru и GPT главный риск не в самом API, а в том, чтобы поиск, оценка кандидата и история решений не разъехались по разным процессам. Похожие кабинеты с ролями и внешними интеграциями делал: https://www.fl.ru/user/sporyshevsaveli/portfolio/8067026/\n\nПредлагаю начать с короткого этапа: 1) проверить доступные методы hh.ru и текущую основу; 2) собрать один сквозной сценарий поиска и AI-разбора; 3) зафиксировать границы следующего этапа. Готово = кандидат проходит путь от поиска до сохранённого заключения, а у вас есть проверенная схема и точная смета. Так риск закрытого API снимается до основной разработки.\n\nЕсли кабинет уже работает, начну с его аудита после получения тестового доступа. Интерфейс и база у вас уже есть или их тоже нужно делать с нуля?',
-    why: 'Исследовательская структура: риск в первом экране, один кейс, микро-план, критерий приёмки, логистика и один вопрос о границе.',
+    kind: 'Сайт-витрина и будущий магазин',
+    example: 'Здравствуйте!\n\nУ вас в задаче смешаны сайт-витрина клиники и будущий магазин с оплатой. Я бы развёл их по этапам. Витрину соберу сейчас, а под магазин заложу структуру каталога. Иначе смета расползётся ещё до старта.\n\nДизайн у вас готов — это сильно упрощает работу. Сначала я сверю редакцию CMS и границы кабинета. Потом соберу каталог на тестовом домене. В конце ваш сотрудник сам добавит товар и новость. Если сможет — этап принят.\n\nПохожую механику я делал для медицинской платформы: в кабинете были три роли, и самое хитрое было развести права доступа. У вас совпадает механика кабинета. Скажу честно: тот проект был на другом стеке. Ссылка на проект берётся только из карточки portfolio.\n\nПо деньгам: точная цена и срок из commercial_terms. Кабинет на первом этапе ограничиваем регистрацией и профилем или сразу нужна запись к врачу?',
+    why: 'Конкретная реакция, неровный ритм, живая приёмка, честный стек и один предметный вопрос.',
   },
   {
-    kind: 'Простая понятная задача по вёрстке',
-    example: 'Повторяющиеся SVG-элементы лучше вынести в общие компоненты сразу: тогда правка одного элемента не разъедется между экранами.\n\nПлан короткий: 1) сверю полную Figma и состояния; 2) соберу адаптив и общие компоненты; 3) проверю основные ширины. Готово = страницы совпадают с макетом на согласованных разрешениях, а повторяющаяся графика меняется в одном месте.\n\nНачну после получения полной Figma. В макете уже есть мобильные версии всех страниц или адаптив нужно определить по desktop?',
-    why: 'Компактный режим без воды: две детали, польза, короткий план, измеримое «Готово» и один вопрос.',
+    kind: 'Точечная адаптивная вёрстка',
+    example: 'У вас повторяются SVG-элементы на нескольких экранах, поэтому я вынесу их в общие компоненты. Одна правка тогда не разъедется по страницам. Это экономит время.\n\nСначала сверю Figma и состояния. Потом соберу адаптив. В конце ваш дизайнер откроет согласованные ширины и сам проверит расхождения — если их нет, этап закрываем.\n\nПо деньгам: точная цена и срок из commercial_terms. Мобильные версии у вас уже нарисованы или поведение нужно определить по desktop?',
+    why: 'Короткий живой отклик без искусственного риска и нумерованной строки.',
   },
   {
-    kind: 'Продукт, для которого есть близкий реальный кейс',
-    example: 'В мобильном магазине сложность обычно не в карточке товара, а в согласованности каталога, вариантов, остатков и оформления заказа между iOS и Android. Близкий по механике кейс — TERRA MARKET: каталог, фильтры, варианты товара и корзина уже собраны в одном пользовательском пути: https://www.fl.ru/user/sporyshevsaveli/portfolio/8057737/\n\nНачал бы с этапа-фундамента: 1) зафиксировать источник каталога и остатков; 2) собрать кликабельный путь «каталог → товар → корзина → заказ»; 3) проверить его на обеих платформах. Готово = тестовый заказ проходит без ручных обходов, а интеграционные границы подтверждены до основной разработки.\n\nПосле доступа к API смогу зафиксировать этапы и риски без сюрпризов по смете. Каталог и оформление заказа уже имеют готовый API или серверную часть тоже нужно проектировать?',
-    why: 'Кейс связан с конкретной механикой, ссылка одна, риск снят обратимым первым этапом и понятным критерием.',
-  },
-  {
-    kind: 'Лендинг услуги, где сначала нужно сформировать доверие',
-    example: 'Для ремонта рулевых реек сильнее обычного списка услуг сработают реальные случаи: с чем приехали, что нашли, что сделали и какую гарантию дали. Тогда фотографии показывают не просто мастерскую, а причину доверить вам дорогой узел автомобиля.\n\nПредлагаю: 1) собрать 3–5 таких историй и вопросы клиентов; 2) построить вокруг них первый экран и структуру; 3) проверить форму заявки и мобильную версию. Готово = посетитель за полминуты понимает, какие неисправности вы решаете, видит доказательство и может записаться без звонка.\n\nДизайн смогу начать после материалов; если он нужен с нуля, цену зафиксируем отдельно от вёрстки. Фото ремонтов и отзывы уже собраны или их ещё нужно подготовить?',
-    why: 'Полезное наблюдение даёт взаимность, истории создают доказательство, план снижает риск, финал легко продолжает диалог.',
+    kind: 'Интеграция с неизвестными ограничениями API',
+    example: 'У вас поиск и AI-разбор должны остаться одним процессом, хотя внешний API может урезать часть данных. Я сначала проверю доступные методы на реальном аккаунте. Закрытый метод быстро всё меняет.\n\nПотом соберу один сквозной путь: пользователь запускает поиск, получает разбор и сохраняет решение. На приёмке ваш менеджер сам проведёт кандидата по этому сценарию. Если история не теряется, первый этап готов.\n\nНа практике такой короткий аудит дешевле переделки всей интеграции. По деньгам: точная цена и срок из commercial_terms. Тестовый доступ к действующему кабинету у вас уже есть?',
+    why: 'Полезное наблюдение, действие от первого лица, сцена приёмки и простой следующий шаг.',
   },
 ];
 
@@ -607,10 +1091,21 @@ export class AiService {
     return match ? this.localRejection(match.reason) : null;
   }
 
-  async proposalReviewContext(lead: Record<string, unknown>) {
-    const [sellerValue, portfolioValue] = await Promise.all([
+  async proposalReviewContext(lead: Record<string, unknown>, content = '') {
+    const [sellerValue, portfolioValue, voiceprintResult, recentDraftResult] = await Promise.all([
       this.settings.getPublic('seller_profile'),
       this.settings.getPublic('fl_portfolio_cases'),
+      this.db.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM drafts
+         WHERE (kind='initial_response' OR metadata->>'mode'='response')
+           AND metadata->>'owner_edited'='true'`,
+      ),
+      this.db.query<{ content: string }>(
+        `SELECT content FROM drafts
+         WHERE (kind='initial_response' OR metadata->>'mode'='response')
+           AND status IN ('pending','approved','sent')
+         ORDER BY created_at DESC LIMIT 8`,
+      ),
     ]);
     const seller = sellerValue && typeof sellerValue === 'object'
       ? sellerValue as Record<string, unknown>
@@ -618,10 +1113,37 @@ export class AiService {
     const configuredAvailability = String(
       seller.available_from || seller.availability || '',
     ).trim().slice(0, 160);
+    const portfolio = selectRelevantPortfolio(
+      portfolioValue,
+      `${lead.title || ''} ${lead.description || ''}`,
+    );
+    const metrics = content ? proposalHumanityMetrics(content) : null;
+    const usedCase = content
+      ? portfolio.find((item) => String(item.url || '').trim() && content.includes(String(item.url).trim()))
+      : null;
+    const similarity = content
+      ? Math.max(0, ...recentDraftResult.rows.map((row) => this.textSimilarity(content, row.content)))
+      : 0;
     return {
       technologyFit: proposalTechnologyFitContext(lead, seller, portfolioValue),
       availability: configuredAvailability,
       availabilityConfigured: Boolean(configuredAvailability),
+      voiceprint: {
+        sampleCount: Number(voiceprintResult.rows[0]?.count || 0),
+        minimumSamples: 15,
+        ready: Number(voiceprintResult.rows[0]?.count || 0) >= 15,
+      },
+      deliveryMetrics: metrics ? {
+        ...metrics,
+        warnings: proposalHumanityWarnings(metrics),
+        recentSimilarity: Number(similarity.toFixed(3)),
+        similarityLimit: 0.35,
+        portfolioCaseUsed: Boolean(usedCase),
+        portfolioDetailPresent: usedCase
+          ? portfolioHumanityIssues(content, portfolio).length === 0
+          : null,
+        humanRulePass: proposalHumanRulePass(metrics),
+      } : null,
     };
   }
 
@@ -652,8 +1174,8 @@ export class AiService {
         : this.db.query<{ content: string }>(
           `SELECT content FROM drafts
            WHERE (kind='initial_response' OR metadata->>'mode'='response')
-             AND (status IN ('approved','sent') OR metadata->>'owner_edited'='true')
-           ORDER BY updated_at DESC LIMIT 12`,
+             AND metadata->>'owner_edited'='true'
+           ORDER BY updated_at DESC LIMIT 30`,
         ),
       this.db.query<{ content: string }>(
         `SELECT content FROM drafts
@@ -693,6 +1215,12 @@ export class AiService {
       acceptanceLabel: variationPlan.acceptanceLabel,
       technologyFit,
     };
+    const voiceprintExamples = selectVoiceprintExamples(
+      voiceResult.rows.map((row) => row.content),
+      `${sourceLead.title || ''} ${sourceLead.description || ''}`,
+      3,
+    );
+    const voiceprintReady = mode === 'chat' ? voiceprintExamples.length >= 2 : voiceResult.rows.length >= 15;
     const compactContext = {
       lead: {
         title: sourceLead.title,
@@ -735,6 +1263,10 @@ export class AiService {
         required_acceptance_label: variationPlan.acceptanceLabel,
         required_acceptance_text: variationPlan.acceptanceText,
       },
+      opening_seed: proposalOpeningSeed(
+        String(sourceLead.external_id || sourceLead.id || sourceLead.title || ''),
+        clientName,
+      ),
       commercial_terms: {
         price_rub: commercialTerms.price,
         duration_days: commercialTerms.days,
@@ -750,11 +1282,21 @@ export class AiService {
       submission_fields: {
         price: 'FL.ru получает recommended_price отдельным числовым полем',
         days: 'FL.ru получает recommended_days отдельным числовым полем',
-        cover_letter: 'content обязательно повторяет цену, срок и старт: эти три пункта должны быть видны при быстром чтении ленты',
+        cover_letter: 'Текст обязательно повторяет цену и срок. Старт добавляется только из подтверждённой настройки профиля',
       },
       owner_instructions: String(context.ownerInstructions || '').slice(0, 4_000),
-      voice_examples: voiceResult.rows.map((row) => row.content.slice(0, 300)),
-      approved_examples: approvedResult.rows.map((row) => row.content.slice(0, 560)),
+      voiceprint: {
+        source: mode === 'chat' ? 'Ручные исходящие сообщения владельца.' : 'Только отклики, которые владелец отредактировал вручную. Просто одобренные AI-черновики в voiceprint не попадают.',
+        ready: voiceprintReady,
+        sample_count: voiceResult.rows.length,
+        minimum_samples: mode === 'chat' ? 2 : 15,
+        rules: voiceprintReady
+          ? 'Использовать только ритм, обращения и привычные связки. Факты, имена, цены, сроки и кейсы из примеров переносить запрещено.'
+          : 'Корпус голоса ещё мал. Не выдавать approved_examples за голос владельца; писать по общим правилам живого делового сообщения.',
+        examples: voiceprintExamples.map((content) => content.slice(0, 560)),
+      },
+      voice_examples: voiceprintExamples.map((content) => content.slice(0, 300)),
+      approved_examples: approvedResult.rows.slice(0, 3).map((row) => row.content.slice(0, 560)),
       recent_drafts: recentDraftResult.rows.map((row) => row.content.slice(0, 560)),
       context: compactContext,
     };
@@ -766,7 +1308,7 @@ export class AiService {
       if (issues.length) {
         result = await this.tasks.run<{ content: string }>('draft_reply', {
           ...payload,
-          revision: { previous_content: content, issues },
+          revision: proposalRevisionGuidance(content, issues, portfolio),
         });
         content = String(result.content || '').trim();
       }
@@ -776,8 +1318,29 @@ export class AiService {
     const strategy = await this.tasks.run<DraftStrategy>('draft_strategy', payload);
     const generated = await this.tasks.run<{ candidates: DraftCandidate[] }>('draft_candidates', { ...payload, strategy });
     const candidates = Array.isArray(generated.candidates) ? generated.candidates.slice(0, 3) : [];
-    let reviewed = await this.tasks.run<DraftReview>('draft_review', { ...payload, strategy, candidates });
-    let content = String(reviewed.content || '').trim();
+    const candidateDiagnostics = candidates.map((candidate, index) => {
+      const candidateContent = normalizeProposalFormatting(String(candidate.content || ''), commercialTerms);
+      const candidateIssues = this.draftQualityIssues(
+        candidateContent,
+        mode,
+        recentDraftResult.rows.map((row) => row.content),
+        proposalProfile,
+        commercialTerms,
+      );
+      candidateIssues.push(...portfolioLinkIssues(candidateContent, portfolio));
+      candidateIssues.push(...portfolioEvidenceIssues(candidateContent, portfolio));
+      candidateIssues.push(...portfolioHumanityIssues(candidateContent, portfolio));
+      return {
+        index,
+        angle: String(candidate.angle || '').slice(0, 180),
+        humanity_metrics: proposalHumanityMetrics(candidateContent),
+        issues: candidateIssues,
+      };
+    });
+    let reviewed = await this.tasks.run<DraftReview>('draft_review', {
+      ...payload, strategy, candidates, candidate_diagnostics: candidateDiagnostics,
+    });
+    let content = normalizeProposalFormatting(String(reviewed.content || ''), commercialTerms);
     const issues = this.draftQualityIssues(
       content,
       mode,
@@ -787,6 +1350,7 @@ export class AiService {
     );
     issues.push(...portfolioLinkIssues(content, portfolio));
     issues.push(...portfolioEvidenceIssues(content, portfolio));
+    issues.push(...portfolioHumanityIssues(content, portfolio));
     if (Number(reviewed.human_score) < 85) issues.push('Редактор оценил естественность ниже 85/100: перепиши как личное сообщение человека.');
     if (Number(reviewed.sales_score) < 85) issues.push('Редактор оценил причину ответить ниже 85/100: усили конкретную ценность следующего шага.');
     if (Number(reviewed.specificity_score) < 90) issues.push('Текст можно отправить другому заказчику почти без изменений: добавь один уникальный якорь именно этого проекта.');
@@ -796,9 +1360,10 @@ export class AiService {
         ...payload,
         strategy,
         candidates,
-        revision: { previous_content: content, issues },
+        candidate_diagnostics: candidateDiagnostics,
+        revision: proposalRevisionGuidance(content, issues, portfolio),
       });
-      content = String(reviewed.content || '').trim();
+      content = normalizeProposalFormatting(String(reviewed.content || ''), commercialTerms);
     }
     const finalIssues = this.draftQualityIssues(
       content,
@@ -809,12 +1374,39 @@ export class AiService {
     );
     finalIssues.push(...portfolioLinkIssues(content, portfolio));
     finalIssues.push(...portfolioEvidenceIssues(content, portfolio));
+    finalIssues.push(...portfolioHumanityIssues(content, portfolio));
     if (Number(reviewed.human_score) < 85) finalIssues.push('Итоговый текст звучит как AI-шаблон.');
     if (Number(reviewed.sales_score) < 85) finalIssues.push('Итоговый текст не даёт достаточной причины ответить.');
     if (Number(reviewed.specificity_score) < 90) finalIssues.push('Итоговому тексту не хватает деталей конкретного заказа.');
     if (Number(reviewed.factual_score) < 100) finalIssues.push('Итоговый текст содержит неподтверждённый факт.');
     if (finalIssues.length) {
-      throw new Error(`Отклик не прошёл финальную проверку качества: ${finalIssues.join(' ')}`);
+      reviewed = await this.tasks.run<DraftReview>('draft_review', {
+        ...payload,
+        strategy,
+        candidates,
+        candidate_diagnostics: candidateDiagnostics,
+        revision: proposalRevisionGuidance(content, finalIssues, portfolio),
+      });
+      content = normalizeProposalFormatting(String(reviewed.content || ''), commercialTerms);
+      finalIssues.length = 0;
+      finalIssues.push(...this.draftQualityIssues(
+        content,
+        mode,
+        recentDraftResult.rows.map((row) => row.content),
+        proposalProfile,
+        commercialTerms,
+      ));
+      finalIssues.push(...portfolioLinkIssues(content, portfolio));
+      finalIssues.push(...portfolioEvidenceIssues(content, portfolio));
+      finalIssues.push(...portfolioHumanityIssues(content, portfolio));
+      if (Number(reviewed.human_score) < 85) finalIssues.push('Итоговый текст звучит как AI-шаблон.');
+      if (Number(reviewed.sales_score) < 85) finalIssues.push('Итоговый текст не даёт достаточной причины ответить.');
+      if (Number(reviewed.specificity_score) < 90) finalIssues.push('Итоговому тексту не хватает деталей конкретного заказа.');
+      if (Number(reviewed.factual_score) < 100) finalIssues.push('Итоговый текст содержит неподтверждённый факт.');
+    }
+    const blockingFinalIssues = proposalFinalBlockingIssues(content, finalIssues);
+    if (blockingFinalIssues.length) {
+      throw new Error(`Отклик не прошёл финальную проверку качества: ${blockingFinalIssues.join(' ')}`);
     }
     return content.charAt(0).toUpperCase() + content.slice(1);
   }
@@ -842,10 +1434,13 @@ export class AiService {
       'готов собрать', 'рабочий контур', 'первый контур',
       'в портфолио есть fullstack', 'сложная бизнес-логика',
       'обращайтесь, обсудим детали', 'fullstack',
+      'важно отметить', 'ключевой момент', 'это особенно важно',
+      'в современных реалиях', 'таким образом', 'подводя итог',
+      'не служит подтверждением', 'не является гарантией',
     ];
     const found = banned.filter((phrase) => lower.includes(phrase));
     if (found.length) issues.push(`Шаблонные или AI-фразы: ${found.join(', ')}`);
-    if (/\b(?:лучше|стоит)\b[^.!?]{0,160}\bиначе\b/i.test(content)) {
+    if (/(?:^|[^\p{L}])(?:лучше|стоит)(?=$|[^\p{L}])[^.!?]{0,160}(?:^|[^\p{L}])иначе(?=$|[^\p{L}])/imu.test(content)) {
       issues.push('Получилась заезженная формула «лучше сделать X, иначе Y»: перепиши как нормальное личное сообщение, без мини-лекции.');
     }
     if (/^(?:[^.!?\n]{0,80})(?:лучше|стоит|нужно)[^.!?\n]{0,100}(?:провер|фиксац|уточн)/iu.test(content.trim())) {
@@ -861,8 +1456,8 @@ export class AiService {
     if (/могу показать/i.test(content) && recentCaseCtaCount >= 3) {
       issues.push('Фраза «могу показать» уже повторяется: оставь её только при очень близком кейсе и сформулируй следующий шаг иначе.');
     }
-    const recentMaterialCtaCount = recentDrafts.filter((draft) => /(?:пришлите|отправьте|покажите)\b/i.test(draft)).length;
-    if (/(?:пришлите|отправьте|покажите)\b/i.test(content) && recentMaterialCtaCount >= 3) {
+    const recentMaterialCtaCount = recentDrafts.filter((draft) => /(?:пришлите|отправьте|покажите)(?=$|[^\p{L}])/iu.test(draft)).length;
+    if (/(?:пришлите|отправьте|покажите)(?=$|[^\p{L}])/iu.test(content) && recentMaterialCtaCount >= 3) {
       issues.push('Просьба прислать материалы уже повторяется в недавних откликах: выбери другой естественный следующий шаг или один важный вопрос.');
     }
     return issues;

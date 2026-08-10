@@ -262,10 +262,15 @@ function ResearchDashboard({ data }: { data: any }) {
   const replyRate = proposals > 0 ? Math.round((replied / proposals) * 100) : 0;
   const evalTotal = numberOf(evals.total);
   const evalRate = evalTotal > 0 ? Math.round((numberOf(evals.passed) / evalTotal) * 100) : 100;
+  const humanity = data.proposalHumanity || {};
+  const measuredHumanity = numberOf(humanity.measured);
+  const humanityRate = measuredHumanity > 0
+    ? Math.round((numberOf(humanity.human_pass) / measuredHumanity) * 100)
+    : 0;
   return <section className="researchDashboard">
     <div className="researchHead"><div><span className="eyebrow">Контур доказуемой автономности</span><h2>Воронка, follow-up и качество агента</h2><p>Автоматические классы открываются только после нужного числа одобрений без правок. FL.ru всегда остаётся ручным.</p></div><span className="researchSafety">L1–L2 · сбор доказательств для L3</span></div>
     <div className="researchMetrics">
-      <article><small>Отклики отправлены</small><b>{proposals}</b><span>Reply rate: {replyRate}%</span></article>
+      <article><small>Отклики отправлены</small><b>{proposals}</b><span>Reply rate: {replyRate}% · живые: {humanityRate}%</span></article>
       <article><small>Ответили / диалог</small><b>{replied} / {funnel.engaged || 0}</b><span>Discovery: {funnel.discovery_complete || 0}</span></article>
       <article><small>Follow-up готовы</small><b>{followups.drafted || 0}</b><span>Запланировано: {followups.pending || 0}</span></article>
       <article><small>Бинарные evals</small><b>{evalRate}%</b><span>{evals.failed || 0} провалов за 30 дней</span></article>
@@ -279,7 +284,7 @@ function ResearchDashboard({ data }: { data: any }) {
       <article className="researchClasses"><b>Классы Telegram</b>{(data.autonomyClasses || []).length
         ? data.autonomyClasses.map((item: any) => <div key={item.class}><span><i className={item.auto_enabled ? 'on' : ''} />{item.class}</span><strong>{item.approved_asis}/{item.shown}</strong><small>{item.auto_enabled ? 'авто открыт' : 'ручной сбор доказательств'}</small></div>)
         : <p>Статистика начнёт заполняться с новых черновиков. До порогов всё остаётся ручным.</p>}</article>
-      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются в безопасных автоответах</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
+      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются в безопасных автоответах</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Естественность: бёрстинесс {humanity.avg_burstiness || '—'}, обращений {humanity.avg_addresses || '—'} (цель ≥90%)</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
     </div>
   </section>;
 }
@@ -770,6 +775,8 @@ function DraftCard({ draft, reload, action, notify }: any) {
   const unverifiedTechnologies: string[] = Array.isArray(review?.technology_fit?.unverified)
     ? review.technology_fit.unverified
     : [];
+  const voiceprintSamples = Number(review?.voiceprint?.sampleCount || 0);
+  const voiceprintMinimum = Number(review?.voiceprint?.minimumSamples || 10);
   const save = async () => { await api(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }); notify('Изменения сохранены — требуется новое одобрение'); reload(); };
   const regenerate = async () => {
     setRegenerating(true);
@@ -790,6 +797,7 @@ function DraftCard({ draft, reload, action, notify }: any) {
     {reviewFlags.length > 0 && <div className="proposalWarning"><b>Нужна ручная проверка перед отправкой</b>
       {reviewFlags.includes('technology_fit_unverified') && <span>Нет подтверждённого кейса или записи в профиле по технологии: {unverifiedTechnologies.join(', ')}. Черновик не должен заявлять такой опыт.</span>}
       {reviewFlags.includes('availability_missing') && <span>Дата старта не заполнена в настройках. Система её не выдумывает — укажите доступность или добавьте её вручную.</span>}
+      {reviewFlags.includes('voiceprint_insufficient') && <span>Голос владельца ещё не откалиброван: ручных правок {voiceprintSamples} из минимальных {voiceprintMinimum}. Сохранённые вами правки будут пополнять корпус.</span>}
     </div>}
     <textarea rows={8} value={content} disabled={!editable} onChange={(event) => setContent(event.target.value)} />
     {draft.error && <div className="error">{draft.error}</div>}

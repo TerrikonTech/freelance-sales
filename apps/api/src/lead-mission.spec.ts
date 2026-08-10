@@ -9,6 +9,7 @@ import {
   stripLeadIn,
   ownerDeliveryResultMessage,
   parseOwnerChoice,
+  missionShouldStartNow,
 } from './telegram.service';
 
 const STRICT: AutonomyPolicyConfig = { mode: 'manual', globalPaused: false, minAutoConfidence: 0.99 };
@@ -102,6 +103,11 @@ describe('guardrails still win over a mission', () => {
 });
 
 describe('owner commands', () => {
+  it('distinguishes a reactive mission from an explicit opening message', () => {
+    expect(missionShouldStartNow('общайся с Олегом на эльфийском')).toBe(false);
+    expect(missionShouldStartNow('общайся с Олегом и напиши ему сейчас как дела')).toBe(true);
+  });
+
   it('understands «общайся с Олегом на эльфийском»', () => {
     const parsed = parseOwnerMissionStart('общайся с Олегом на эльфийском');
     expect(parsed).toMatchObject({ recipient: 'Олег', instruction: 'на эльфийском' });
