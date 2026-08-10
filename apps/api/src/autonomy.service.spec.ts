@@ -1,4 +1,5 @@
 import {
+  AutonomyService,
   AutonomyPolicyConfig,
   classifySafeAutonomyClass,
   evaluateAutonomy,
@@ -162,5 +163,26 @@ describe('smart autonomy fail-closed policy', () => {
       { ...smart, minAutoConfidence: 0.98 },
     );
     expect(result.decision).toBe('ask_owner');
+  });
+});
+
+describe('mission and progressive class gate', () => {
+  test('an explicit mission bypasses only the statistical class gate', async () => {
+    const db = { query: jest.fn() };
+    const settings = { getPublic: jest.fn().mockResolvedValue(null) };
+    const service = new AutonomyService(db as never, settings as never);
+
+    const result = await service.evaluate({
+      inbound: 'Как продвигается работа?',
+      outbound: 'Aiya! Проверяю текущий статус.',
+      mode: 'chat',
+      channel: 'telegram',
+      mission: { instruction: 'отвечай на эльфийском', turnsLeft: 3, expired: false, exhausted: false },
+      runtimeSignals: [],
+    });
+
+    expect(result.decision).toBe('auto_send');
+    expect(result.signals).toEqual(expect.arrayContaining(['mission', 'class:safe_status']));
+    expect(db.query).not.toHaveBeenCalled();
   });
 });

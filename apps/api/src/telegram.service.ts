@@ -222,9 +222,14 @@ export type OwnerMissionStart = {
   instruction: string;
   deadline: Date | null;
   maxTurns: number | null;
+  startNow: boolean;
   /** "Олег Зотов" before "Олег": longest name first, so a surname wins over a bare first name. */
   candidates: Array<{ recipient: string; instruction: string }>;
 };
+
+export function missionShouldStartNow(text: string): boolean {
+  return /(?:^|[\s,.;!?])(?:напиши|пиши|скажи|отправь|скинь)(?:те)?\s+(?:ему|ей|этому(?:\s+человеку)?|клиенту|заказчику)(?:\s|$|[,:;.!?])/iu.test(text);
+}
 
 /** Words that can never be part of a name — they start the instruction. */
 const NAME_STOP = /^(?:только|на|по|до|и|или|чтобы|сам|сама|самостоятельно|сегодня|завтра|пока|как|про|за|в|с|о|об|же|ему|ей|максимум|напиши)$/iu;
@@ -294,6 +299,7 @@ export function parseOwnerMissionStart(text: string): OwnerMissionStart | null {
       instruction: best.instruction.slice(0, 2_000),
       deadline: parseMissionDeadline(best.instruction),
       maxTurns: parseMissionTurns(best.instruction),
+      startNow: missionShouldStartNow(normalized),
       candidates: list.map((item) => ({ recipient: item.recipient, instruction: item.instruction.slice(0, 2_000) })),
     };
   }
@@ -613,7 +619,7 @@ export class TelegramService {
   private async startMission(
     leadId: string,
     leadTitle: string,
-    input: { instruction: string; deadline: Date | null; maxTurns: number | null },
+    input: { instruction: string; deadline: Date | null; maxTurns: number | null; startNow?: boolean },
   ): Promise<string> {
     const mission = await this.autonomy.setMission({
       leadId,
@@ -624,7 +630,37 @@ export class TelegramService {
     const until = mission.deadline
       ? new Date(mission.deadline).toLocaleString('ru-RU', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
       : 'без срока';
-    return `Принял. «${leadTitle}» — веду сам.\nЗадача: ${mission.instruction}\nПотолок: ${mission.max_turns} ответов · срок: ${until}\nЦена, договор, сроки и любые обещания всё равно принесу вам.\nОстановить: «стоп по ${leadTitle.split(' ')[0]}».`;
+    let opening = 'Отвечу на следующее новое сообщение клиента.';
+    if (input.startNow) {
+      try {
+        const target = await this.db.query<{ external_id: string }>(
+          `SELECT external_id FROM lead_channels
+           WHERE lead_id=$1 AND channel='telegram'
+           ORDER BY last_seen_at DESC LIMIT 1`,
+          [leadId],
+        );
+        const externalId = String(target.rows[0]?.external_id || '');
+        if (externalId) {
+          await this.queue.add(
+            'draft-reply',
+            {
+              leadId,
+              channel: 'telegram',
+              targetExternalId: externalId,
+              ownerRequested: true,
+              sendImmediately: true,
+            },
+            `mission-opening-${leadId}-${Date.now()}`,
+          );
+          opening = 'Первое сообщение поставил на отправку; результат сообщу отдельно.';
+        } else {
+          opening = 'Telegram-чат не привязан: миссия сохранена, первое сообщение не отправлено.';
+        }
+      } catch {
+        opening = 'Миссия сохранена, но первое сообщение не удалось поставить в очередь.';
+      }
+    }
+    return `Принял. «${leadTitle}» — веду сам.\nЗадача: ${mission.instruction}\nПотолок: ${mission.max_turns} ответов · срок: ${until}\n${opening}\nЦена, договор, сроки и любые обещания всё равно принесу вам.\nОстановить: «стоп по ${leadTitle.split(' ')[0]}».`;
   }
 
   /**
@@ -750,6 +786,7 @@ export class TelegramService {
               maxTurns: Number.isFinite(Number(intent.max_turns)) && Number(intent.max_turns) > 0
                 ? Number(intent.max_turns)
                 : parseMissionTurns(instruction),
+              startNow: missionShouldStartNow(text),
             }));
             return;
           }
@@ -758,7 +795,7 @@ export class TelegramService {
             await this.agent.setPendingChoice(ownerId, {
               kind: 'mission',
               options,
-              mission: { instruction, deadline: null, maxTurns: intent.max_turns ?? null },
+              mission: { instruction, deadline: null, maxTurns: intent.max_turns ?? null, startNow: missionShouldStartNow(text) },
             });
             await say(`Кого именно вести?\n${options.map((o, i) => `${i + 1}. ${o.title}`).join('\n')}\n\nОтветьте номером — например «1».`);
             return;
@@ -912,7 +949,7 @@ export class TelegramService {
       const pending = await this.agent.takePendingChoice<{
         kind: string;
         options: Array<{ id: string; title: string }>;
-        mission?: { instruction: string; deadline: string | null; maxTurns: number | null };
+        mission?: { instruction: string; deadline: string | null; maxTurns: number | null; startNow?: boolean };
       }>(ownerId);
       if (pending?.kind === 'mission' && pending.options?.length) {
         const picked = pending.options[choice - 1];
@@ -924,6 +961,7 @@ export class TelegramService {
           instruction: pending.mission?.instruction || '',
           deadline: pending.mission?.deadline ? new Date(pending.mission.deadline) : null,
           maxTurns: pending.mission?.maxTurns ?? null,
+          startNow: pending.mission?.startNow === true,
         }));
         return;
       }
@@ -938,6 +976,7 @@ export class TelegramService {
           instruction: used.instruction || missionStart.instruction,
           deadline: parseMissionDeadline(used.instruction || missionStart.instruction),
           maxTurns: parseMissionTurns(used.instruction || missionStart.instruction),
+          startNow: missionStart.startNow,
         }));
         return;
       }
@@ -950,6 +989,7 @@ export class TelegramService {
             instruction: missionStart.instruction,
             deadline: missionStart.deadline ? missionStart.deadline.toISOString() : null,
             maxTurns: missionStart.maxTurns,
+            startNow: missionStart.startNow,
           },
         });
         const list = options.map((option, index) => `${index + 1}. ${option.title}`).join('\n');

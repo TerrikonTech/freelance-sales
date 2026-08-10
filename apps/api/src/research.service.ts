@@ -166,7 +166,7 @@ export class ResearchService {
   }
 
   async overview() {
-    const [funnel, followups, evals, autonomy, costs, episodes] = await Promise.all([
+    const [funnel, followups, evals, autonomy, costs, episodes, humanity] = await Promise.all([
       this.db.query(`WITH proposals AS (
           SELECT DISTINCT d.lead_id,min(d.sent_at) AS sent_at
           FROM drafts d JOIN leads l ON l.id=d.lead_id
@@ -201,6 +201,30 @@ export class ResearchService {
           count(*) FILTER (WHERE estimated_cost_usd IS NULL)::text AS cost_unknown
         FROM ai_tasks WHERE created_at>=now()-interval '30 days'`),
       this.db.query(`SELECT count(*)::text AS total,count(DISTINCT lead_id)::text AS leads FROM lead_episodes`),
+      this.db.query(`WITH measured AS (
+          SELECT d.lead_id,d.sent_at,
+            NULLIF(d.metadata->'review'->'humanity_metrics'->>'burstiness','')::numeric AS burstiness,
+            NULLIF(d.metadata->'review'->'humanity_metrics'->>'clientAddressCount','')::numeric AS addresses,
+            COALESCE((d.metadata->'review'->'humanity_metrics'->>'humanRulePass')::boolean,false) AS human_pass
+          FROM drafts d JOIN leads l ON l.id=d.lead_id
+          WHERE d.status='sent' AND d.metadata->>'mode'='response' AND l.source<>'sandbox'
+            AND d.metadata->'review'->'humanity_metrics' IS NOT NULL
+        ) SELECT count(*)::text AS measured,
+          round(COALESCE(avg(burstiness),0),2)::text AS avg_burstiness,
+          round(COALESCE(avg(addresses),0),2)::text AS avg_addresses,
+          count(*) FILTER (WHERE human_pass)::text AS human_pass,
+          count(*) FILTER (WHERE burstiness>=0.60)::text AS target_burstiness,
+          count(*) FILTER (WHERE burstiness>=0.60 AND EXISTS (
+            SELECT 1 FROM messages m WHERE m.lead_id=measured.lead_id
+              AND m.direction='inbound' AND m.created_at>measured.sent_at
+          ))::text AS high_burst_replied,
+          count(*) FILTER (WHERE burstiness>=0.60)::text AS high_burst_total,
+          count(*) FILTER (WHERE burstiness<0.60 AND EXISTS (
+            SELECT 1 FROM messages m WHERE m.lead_id=measured.lead_id
+              AND m.direction='inbound' AND m.created_at>measured.sent_at
+          ))::text AS low_burst_replied,
+          count(*) FILTER (WHERE burstiness<0.60)::text AS low_burst_total
+        FROM measured`),
     ]);
     return {
       funnel: funnel.rows[0],
@@ -209,6 +233,7 @@ export class ResearchService {
       autonomyClasses: autonomy.rows,
       aiEconomics: costs.rows[0],
       memory: episodes.rows[0],
+      proposalHumanity: humanity.rows[0],
       presence: await this.presenceProfile(),
       safety: {
         flManualApprovalPermanent: true,

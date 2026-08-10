@@ -318,7 +318,10 @@ export class AutonomyService {
     const evaluation = observedClass && !rawEvaluation.signals.some((signal) => signal.startsWith('class:'))
       ? { ...rawEvaluation, signals: [...rawEvaluation.signals, `class:${observedClass}`] }
       : rawEvaluation;
-    if (evaluation.decision !== 'auto_send' || (evaluation.signals.includes('mission') && !observedClass)) {
+    // A per-lead mission is already the owner's explicit approval. It still passed
+    // every hard guardrail in evaluateAutonomy above, so the statistical class gate
+    // must not silently turn a valid mission reply back into manual review.
+    if (evaluation.decision !== 'auto_send' || evaluation.signals.includes('mission')) {
       return { ...evaluation, policyMode: policy.mode };
     }
     const className = observedClass || autonomyClassFromSignals(evaluation.signals);

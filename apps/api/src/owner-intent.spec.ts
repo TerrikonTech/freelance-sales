@@ -8,6 +8,8 @@ import { TelegramService } from './telegram.service';
 describe('AI intent routing with clarification memory', () => {
   const build = (intent: Record<string, unknown>, agentPatch: Record<string, jest.Mock> = {}) => {
     const settings = { getPublic: jest.fn().mockResolvedValue({ id: 42 }) };
+    const db = { query: jest.fn().mockResolvedValue({ rows: [{ external_id: '777' }] }) };
+    const queue = { add: jest.fn().mockResolvedValue(undefined) };
     const tasks = { run: jest.fn().mockResolvedValue(intent) };
     const agent = {
       ownerLead: jest.fn().mockResolvedValue({ id: 'lead-1', title: 'Олег Зотов' }),
@@ -37,12 +39,12 @@ describe('AI intent routing with clarification memory', () => {
       getMission: jest.fn().mockResolvedValue(null),
     };
     const service = new TelegramService(
-      {} as never, settings as never, {} as never,
+      db as never, settings as never, queue as never,
       agent as never, autonomy as never, tasks as never,
     );
     const sendControlMessage = jest.fn().mockResolvedValue(undefined);
     (service as unknown as { sendControlMessage: jest.Mock }).sendControlMessage = sendControlMessage;
-    return { service, agent, autonomy, tasks, sendControlMessage };
+    return { service, agent, autonomy, tasks, queue, sendControlMessage };
   };
 
   const send = (service: TelegramService, text: string) =>
@@ -120,6 +122,29 @@ describe('AI intent routing with clarification memory', () => {
       leadId: 'lead-1', instruction: 'на эльфийском', maxTurns: 3,
     }));
     expect(sendControlMessage).toHaveBeenCalledWith('42', expect.stringContaining('веду сам'));
+  });
+
+  test('the exact screenshot command queues the opening message and the mission', async () => {
+    const { service, autonomy, queue, sendControlMessage } = build({
+      intent: 'start_mission', recipient: 'Groot',
+      instruction: 'на эльфийском, спросить, как дела',
+      question: null, confidence: 0.95, restated: 'вести Groot на эльфийском', max_turns: 10,
+    });
+    await send(service, 'Пообщайся с этим человеком на эльфийском, пиши ему мол, как дела и так далее. @Grootq');
+
+    expect(autonomy.setMission).toHaveBeenCalled();
+    expect(queue.add).toHaveBeenCalledWith(
+      'draft-reply',
+      {
+        leadId: 'lead-1',
+        channel: 'telegram',
+        targetExternalId: '777',
+        ownerRequested: true,
+        sendImmediately: true,
+      },
+      expect.stringMatching(/^mission-opening-lead-1-/),
+    );
+    expect(sendControlMessage).toHaveBeenCalledWith('42', expect.stringContaining('Первое сообщение поставил на отправку'));
   });
 
   test('a conditional send never reaches the model', async () => {

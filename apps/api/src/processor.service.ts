@@ -17,6 +17,16 @@ import { PushService } from './push.service';
 import { TelegramService } from './telegram.service';
 import { isDeliveryUnknown, OutboundPreflightError } from './outbound-errors';
 
+export function resolveDraftMode(
+  channel: string,
+  requestedMode: string,
+  hasFlDialog: boolean,
+): 'chat' | 'response' {
+  if (requestedMode === 'chat' || requestedMode === 'response') return requestedMode;
+  if (channel === 'telegram') return 'chat';
+  return hasFlDialog ? 'chat' : 'response';
+}
+
 @Injectable()
 export class ProcessorService implements OnModuleDestroy {
   private readonly logger = new Logger(ProcessorService.name);
@@ -187,6 +197,7 @@ export class ProcessorService implements OnModuleDestroy {
         String(job.data.automationClass || ''),
         String(job.data.followupId || ''),
         Number(job.data.followupTouch || 0),
+        Boolean(job.data.sendImmediately),
       );
       case 'generate-documents': return this.generateDocuments(String(job.data.leadId));
       case 'generate-design': return this.generateDesign(job);
@@ -348,6 +359,7 @@ export class ProcessorService implements OnModuleDestroy {
     automationClass = '',
     followupId = '',
     followupTouch = 0,
+    sendImmediately = false,
   ) {
     const leadResult = await this.db.query('SELECT * FROM leads WHERE id=$1', [leadId]);
     const lead = leadResult.rows[0];
@@ -357,7 +369,7 @@ export class ProcessorService implements OnModuleDestroy {
       this.logger.log(`Skipping initial FL draft for non-qualified lead ${leadId}`);
       return;
     }
-    const mode = requestedMode || (lead.client?.fl_dialog_id ? 'chat' : 'response');
+    const mode = resolveDraftMode(channel, requestedMode, Boolean(lead.client?.fl_dialog_id));
     // A live mission both steers the wording ("reply in Elvish") and unlocks autonomy
     // for this one lead.  Owner instructions typed right now still win over it.
     const mission = await this.autonomy.missionRuntime(leadId);
@@ -382,7 +394,7 @@ export class ProcessorService implements OnModuleDestroy {
         ownerInstructions: effectiveInstructions.slice(0, 4_000),
       });
     const proposalReview = mode === 'response'
-      ? await this.ai.proposalReviewContext(lead)
+      ? await this.ai.proposalReviewContext(lead, content)
       : null;
     const hash = createHash('sha256').update(content).digest('hex');
     const dialogId = channel === 'fl' ? String(lead.client?.fl_dialog_id || targetExternalId || '') : '';
@@ -411,7 +423,7 @@ export class ProcessorService implements OnModuleDestroy {
         }
         : {
           mode: 'response',
-          strategy: 'proposal-research-v1',
+          strategy: 'proposal-research-v3-human-voice',
           projectUrl: lead.url,
           price: lead.recommended_price,
           days: lead.recommended_days,
@@ -422,9 +434,12 @@ export class ProcessorService implements OnModuleDestroy {
               technology_fit: proposalReview.technologyFit,
               availability_configured: proposalReview.availabilityConfigured,
               availability: proposalReview.availability || null,
+              voiceprint: proposalReview.voiceprint,
+              humanity_metrics: proposalReview.deliveryMetrics,
               flags: [
                 ...(proposalReview.technologyFit.risk === 'elevated' ? ['technology_fit_unverified'] : []),
                 ...(!proposalReview.availabilityConfigured ? ['availability_missing'] : []),
+                ...(!proposalReview.voiceprint.ready ? ['voiceprint_insufficient'] : []),
               ],
             }
             : null,
@@ -543,7 +558,12 @@ export class ProcessorService implements OnModuleDestroy {
           "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'autonomy','draft_auto_approved',$2)",
           [leadId, JSON.stringify({ draftId, confidence: decision.confidence, reason: decision.reason, mission: decision.signals.includes('mission') })],
         );
-        const delayMs = await this.research.autoReplyDelayMs(content.length, `${leadId}:${sourceMessageId || draftId}`);
+        // A direct owner command such as "пиши ему сейчас" is already a timing
+        // decision. Presence hours still apply to autonomous reactions, but must
+        // not silently postpone this explicit opening until the next workday.
+        const delayMs = sendImmediately
+          ? 0
+          : await this.research.autoReplyDelayMs(content.length, `${leadId}:${sourceMessageId || draftId}`);
         await this.queue.add(
           'send-draft',
           { draftId },
