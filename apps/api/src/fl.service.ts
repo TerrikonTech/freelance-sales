@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as cheerio from 'cheerio';
 import puppeteer, { Browser, CookieData } from 'puppeteer-core';
 import { DatabaseService } from './database.service';
+import { JobProgressService } from './job-progress.service';
 import { OutboundDeliveryUnknownError, OutboundPreflightError } from './outbound-errors';
 import { ProjectAttachmentsService } from './project-attachments.service';
 import { QueueService } from './queue.service';
@@ -38,6 +39,41 @@ export function flProfileIdentity(
   return { name, username };
 }
 
+const normalizeFlOfferText = (value: string) => String(value || '').replace(/\s+/g, ' ').trim();
+
+export function flCookieHeader(cookies: Array<Pick<CookieData, 'name' | 'value'>>) {
+  return cookies
+    .filter((cookie) => cookie?.name && cookie?.value)
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
+    .join('; ');
+}
+
+export function matchesExistingFlOffer(existingOffer: string, draftContent: string) {
+  const existing = normalizeFlOfferText(existingOffer);
+  const draft = normalizeFlOfferText(draftContent);
+  if (!draft) return false;
+  if (existing.includes(draft)) return true;
+  if (draft.length < 160) return false;
+  const boundaryLength = Math.min(100, Math.max(60, Math.floor(draft.length / 8)));
+  if (!existing.includes(draft.slice(0, boundaryLength))
+    || !existing.includes(draft.slice(-boundaryLength))) return false;
+  const tokens = (value: string) => value.toLocaleLowerCase('ru')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((token) => token.length >= 3);
+  const draftTokens = tokens(draft);
+  const available = new Map<string, number>();
+  for (const token of tokens(existing)) available.set(token, (available.get(token) || 0) + 1);
+  let matched = 0;
+  for (const token of draftTokens) {
+    const count = available.get(token) || 0;
+    if (count > 0) {
+      matched += 1;
+      available.set(token, count - 1);
+    }
+  }
+  return draftTokens.length > 0 && matched / draftTokens.length >= 0.85;
+}
+
 @Injectable()
 export class FlService {
   private readonly logger = new Logger(FlService.name);
@@ -47,16 +83,23 @@ export class FlService {
     private readonly queue: QueueService,
     private readonly push: PushService,
     private readonly settings: SettingsService,
+    private readonly progress: JobProgressService,
   ) {}
 
   async scan(options: { force?: boolean } = {}) {
     const state = await this.flState();
     if (!state.enabled && !options.force) return { found: 0, created: 0, analyzed: 0, skippedKnown: 0, disabled: true };
     const startedAt = Date.now();
-    let browser: Browser | undefined;
     try {
+      await this.progress.advance('fetch', 'Открываю ленту заказов');
+      const cookiesRaw = await this.settings.getSecret('fl_cookies').catch(() => null);
+      const cookies = cookiesRaw ? JSON.parse(cookiesRaw) as CookieData[] : [];
+      const cookie = flCookieHeader(cookies);
       const response = await fetch('https://www.fl.ru/projects/', {
-        headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' },
+        headers: {
+          'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)',
+          ...(cookie ? { cookie } : {}),
+        },
         signal: AbortSignal.timeout(25_000),
       });
       if (!response.ok) throw new Error(`FL scan HTTP ${response.status}`);
@@ -80,6 +123,7 @@ export class FlService {
         });
       });
 
+      await this.progress.advance('dedupe', 'Отбрасываю уже известные заказы', `в ленте ${items.length}`);
       const externalIds = items.map((item) => item.externalId);
       const known = externalIds.length
         ? await this.db.query<{ external_id: string }>(
@@ -94,41 +138,18 @@ export class FlService {
           : [],
       );
       const freshItems = items.filter((item) => !knownIds.has(item.externalId) && !rememberedIds.has(item.externalId));
-      const portfolioLastSync = state.cursor?.portfolio_last_sync_at ? Date.parse(state.cursor.portfolio_last_sync_at) : 0;
-      const portfolioDue = !portfolioLastSync || Date.now() - portfolioLastSync >= 6 * 60 * 60 * 1_000;
-      const cookiesRaw = await this.settings.getSecret('fl_cookies');
-      const cookies = cookiesRaw ? JSON.parse(cookiesRaw) as CookieData[] : [];
-      if (freshItems.length || (portfolioDue && cookies.length)) {
-        browser = await this.browser();
-      }
-      if (browser && portfolioDue && cookies.length) {
-        await this.syncPortfolio(browser, cookies).catch((error) => this.logger.warn(`Portfolio sync skipped: ${error instanceof Error ? error.message : 'unknown'}`));
-      }
+      await this.progress.advance(
+        'read',
+        'Сразу добавляю новые заказы на Dashboard',
+        freshItems.length ? `новых ${freshItems.length}` : 'новых заказов нет',
+      );
       let created = 0;
       for (const item of freshItems) {
-        let detail: Awaited<ReturnType<FlService['readProject']>> | null = null;
-        let projectAttachments: Awaited<ReturnType<ProjectAttachmentsService['download']>> = [];
-        try {
-          detail = browser ? await this.readProject(browser, item.url, cookies) : null;
-          if (detail?.attachment_links.length) {
-            projectAttachments = await this.attachments.download(item.externalId, detail.attachment_links);
-          }
-        } catch (error) {
-          this.logger.warn(`Detailed FL parse failed for ${item.externalId}: ${error instanceof Error ? error.message : 'unknown'}`);
-        }
         const requirements = {
           project: {
-            detail_parsed_at: new Date().toISOString(),
-            published_at: detail?.published_at || null,
-            published_text: detail?.published_text || null,
-            client_registered: detail?.client_registered || null,
-            response_count: detail?.response_count ?? null,
-            response_price_min: detail?.response_price_min ?? null,
-            response_price_max: detail?.response_price_max ?? null,
-            response_days_min: detail?.response_days_min ?? null,
-            response_days_max: detail?.response_days_max ?? null,
-            age_minutes_at_parse: detail?.age_minutes_at_parse ?? null,
-            attachments: projectAttachments,
+            listing_detected_at: new Date().toISOString(),
+            detail_parsed_at: null,
+            attachments: [],
           },
         };
         const result = await this.db.query<{ id: string }>(
@@ -137,25 +158,46 @@ export class FlService {
            ON CONFLICT(source,external_id) DO NOTHING RETURNING id`,
           [
             item.externalId,
-            detail?.title || item.title,
-            detail?.description || item.description,
+            item.title,
+            item.description,
             item.url,
-            detail?.budget || item.budget,
+            item.budget,
             JSON.stringify(requirements),
-            JSON.stringify(detail?.client || {}),
+            JSON.stringify({}),
           ],
         );
-        const lead = result.rows[0];
-        if (!lead) continue;
-        created += 1;
-        await this.queue.add('analyze-lead', { leadId: lead.id }, `analyze-${lead.id}`);
+        if (result.rows[0]) created += 1;
       }
+
+      // Database insertion and queue publication are not atomic. Reconcile all
+      // recent idle leads on every scan so a short Redis outage cannot leave an
+      // order invisible and unanalyzed forever.
+      const pending = await this.db.query<{ id: string }>(
+        `SELECT id FROM leads
+         WHERE source='fl' AND analysis_state='idle'
+           AND external_id NOT LIKE 'dialog:%'
+           AND created_at >= now()-interval '24 hours'
+         ORDER BY created_at LIMIT 50`,
+      );
+      const analysisBucket = Math.floor(Date.now() / 60_000);
+      for (const lead of pending.rows) {
+        await this.queue.add(
+          'analyze-lead',
+          { leadId: lead.id },
+          'analyze-' + lead.id + '-' + analysisBucket,
+        );
+      }
+      await this.progress.advance(
+        'save',
+        'Ставлю новые заказы на оценку',
+        'добавлено ' + created + ' · в очереди ' + pending.rows.length,
+      );
       const durationMs = Date.now() - startedAt;
       const skippedKnown = items.length - created;
       await Promise.all([
         this.db.query(
           `INSERT INTO scan_runs(connector,found_count,new_count,analyzed_count,skipped_known_count,duration_ms)
-           VALUES('fl',$1,$2,$2,$3,$4)`,
+           VALUES('fl',$1,$2,0,$3,$4)`,
           [items.length, created, skippedKnown, durationMs],
         ),
         this.db.query(
@@ -180,13 +222,32 @@ export class FlService {
           })],
         ),
       ]);
-      return { found: items.length, created, analyzed: created, skippedKnown, durationMs };
+      return { found: items.length, created, analyzed: 0, queued: pending.rows.length, skippedKnown, durationMs };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка FL';
       await this.settings.setConnectorState('fl', { healthy: false, statusText: message.slice(0, 180) });
       throw error;
+    }
+  }
+
+  async syncPortfolioIfDue() {
+    const state = await this.flState();
+    if (!state.enabled) return { skipped: true, reason: 'disabled' };
+    const lastSync = state.cursor?.portfolio_last_sync_at
+      ? Date.parse(state.cursor.portfolio_last_sync_at)
+      : 0;
+    if (lastSync && Date.now() - lastSync < 6 * 60 * 60 * 1_000) {
+      return { skipped: true, reason: 'not_due' };
+    }
+    const cookiesRaw = await this.settings.getSecret('fl_cookies');
+    if (!cookiesRaw) return { skipped: true, reason: 'cookies_missing' };
+    const cookies = JSON.parse(cookiesRaw) as CookieData[];
+    await this.checkCookieExpiry(cookies);
+    const browser = await this.browser();
+    try {
+      return await this.syncPortfolio(browser, cookies);
     } finally {
-      await browser?.close();
+      await browser.close();
     }
   }
 
@@ -197,10 +258,8 @@ export class FlService {
     if (!lead || lead.source !== 'fl' || !lead.url || !lead.external_id || lead.external_id.startsWith('dialog:')) return { enriched: false };
     const cookiesRaw = await this.settings.getSecret('fl_cookies');
     const cookies = cookiesRaw ? JSON.parse(cookiesRaw) as CookieData[] : [];
-    const browser = await this.browser();
-    try {
-      const detail = await this.readProject(browser, lead.url, cookies);
-      const files = await this.attachments.download(lead.external_id, detail.attachment_links);
+    const detail = await this.readProject(lead.url, cookies);
+    const files = await this.attachments.download(lead.external_id, detail.attachment_links);
       const project = {
         detail_parsed_at: new Date().toISOString(),
         published_at: detail.published_at,
@@ -216,14 +275,13 @@ export class FlService {
       };
       await this.db.query(
         `UPDATE leads SET title=$2,description=$3,budget_text=$4,
-         requirements=requirements || jsonb_build_object('project',$5::jsonb),
+         requirements=jsonb_set(requirements,'{project}',
+           coalesce(requirements->'project','{}'::jsonb) || $5::jsonb,
+           true),
          client=client || $6::jsonb,updated_at=now() WHERE id=$1`,
         [leadId, detail.title, detail.description, detail.budget, JSON.stringify(project), JSON.stringify(detail.client)],
       );
-      return { enriched: true, attachments: files.length, responses: detail.response_count };
-    } finally {
-      await browser.close();
-    }
+    return { enriched: true, attachments: files.length, responses: detail.response_count };
   }
 
   async syncChats() {
@@ -372,16 +430,44 @@ export class FlService {
     const cookies = await this.cookies();
     const browser = await this.browser();
     try {
+      let projectUrl: URL;
+      try {
+        projectUrl = new URL(input.projectUrl);
+      } catch {
+        throw new OutboundPreflightError('layout_change', 'У заказа нет корректной ссылки FL.ru');
+      }
+      if (!['fl.ru', 'www.fl.ru'].includes(projectUrl.hostname)) {
+        throw new OutboundPreflightError('layout_change', 'Ссылка заказа ведёт не на FL.ru');
+      }
       const page = await browser.newPage();
       await page.setCookie(...cookies);
-      await page.goto(input.projectUrl, { waitUntil: 'networkidle2', timeout: 40_000 });
+      await page.goto(projectUrl.toString(), { waitUntil: 'networkidle2', timeout: 40_000 });
       await this.assertSession(page);
-      const responseLink = await page.$('a[href*="respond"]');
-      if (responseLink) {
-        await Promise.all([
-          responseLink.click(),
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20_000 }).catch(() => null),
-        ]);
+      const existingOffer = await page.$eval('#my-offer', (element) => element.textContent || '')
+        .catch(() => '');
+      if (existingOffer) {
+        if (!matchesExistingFlOffer(existingOffer, input.content)) {
+          throw new OutboundPreflightError(
+            'layout_change',
+            'На FL.ru уже есть другой отклик на этот проект. Проверьте его вручную',
+          );
+        }
+        await this.settings.setConnectorState('fl', {
+          healthy: true,
+          statusText: 'Отклик уже подтверждён на FL.ru',
+          success: true,
+        });
+        return { ok: true, alreadySent: true };
+      }
+      const responseUrl = await page.$eval('a[href*="respond"]', (element) => (element as HTMLAnchorElement).href)
+        .catch(() => '');
+      if (responseUrl) {
+        const target = new URL(responseUrl, projectUrl);
+        if (!['fl.ru', 'www.fl.ru'].includes(target.hostname)) {
+          throw new OutboundPreflightError('layout_change', 'Кнопка отклика ведёт за пределы FL.ru');
+        }
+        await page.goto(target.toString(), { waitUntil: 'networkidle2', timeout: 20_000 });
+        await this.assertSession(page);
       }
       await page.waitForSelector('textarea[name="descr"]', { timeout: 15_000 }).catch((error) => {
         throw new OutboundPreflightError('layout_change', 'Форма отклика FL.ru не найдена: интерфейс изменился', { cause: error });
@@ -550,94 +636,81 @@ export class FlService {
     return { leadId, inserted, lastInboundId, lastDirection, lastInboundContent, lastInboundAuthor };
   }
 
-  private async readProject(browser: Browser, url: string, cookies: CookieData[]) {
-    const page = await browser.newPage();
-    try {
-      if (cookies.length) await page.setCookie(...cookies);
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 45_000 });
-      await page.evaluate(() => {
-        const trigger = Array.from(document.querySelectorAll('a,button')).find((element) =>
-          (element.textContent || '').includes('Информация о заказчике'),
-        ) as HTMLElement | undefined;
-        trigger?.click();
-      });
-      await new Promise((resolve) => setTimeout(resolve, 700));
-      const raw = await page.evaluate(() => {
-        const clean = (value: string | null | undefined) => String(value || '').replace(/\s+/g, ' ').trim();
-        const bodyLines = (document.body.innerText || '').split('\n').map(clean).filter(Boolean);
-        const body = bodyLines.join('\n');
-        const budget = bodyLines.find((line) => line.startsWith('Бюджет:'))?.replace(/^Бюджет:\s*/, '') || '';
-        const published = body.match(/Опубликован\s+(\d{2}\.\d{2}\.\d{4}\s+в\s+\d{2}:\d{2})/i)?.[1] || '';
-        const registeredIndex = bodyLines.findIndex((line) => line === 'Заказчик');
-        const registered = bodyLines.slice(Math.max(0, registeredIndex), registeredIndex + 5)
-          .find((line) => line.startsWith('Зарегистрирован:'))?.replace(/^Зарегистрирован:\s*/, '') || '';
-        const statsText = bodyLines.slice(0, Math.max(30, registeredIndex + 15)).join(' ');
-        const responseMatch = statsText.match(/Откликнулись:\s*([\d\s]+)\s+фрилансер/i);
-        const pricesMatch = statsText.match(/Цены:\s*от\s*([\d\s]+)\s*₽\s*до\s*([\d\s]+)\s*₽/i);
-        const daysMatch = statsText.match(/Сроки:\s*от\s*([\d\s]+)\s*до\s*([\d\s]+)\s*д/i);
-        const roots = Array.from(document.querySelectorAll('.fl-project-content__description-text, [class*="attachment"], [class*="project-file"]'));
-        const candidates = roots.flatMap((root) => [
-          ...Array.from(root.querySelectorAll('a[href]')).map((element) => ({ url: (element as HTMLAnchorElement).href, name: clean(element.textContent) })),
-          ...Array.from(root.querySelectorAll('img[src]')).map((element) => ({ url: (element as HTMLImageElement).src, name: clean((element as HTMLImageElement).alt) })),
-        ]);
-        const profileLink = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
-          .find((anchor) => /\/users\/[^/?#]+\/?(?:[?#].*)?$/iu.test(anchor.getAttribute('href') || anchor.href || ''));
-        const profileImage = profileLink?.querySelector('img');
-        return {
-          title: clean(document.querySelector('h1')?.textContent),
-          description: clean(document.querySelector('.fl-project-content__description-text')?.textContent),
-          budget,
-          published,
-          registered,
-          responseCount: responseMatch?.[1] || '',
-          priceMin: pricesMatch?.[1] || '',
-          priceMax: pricesMatch?.[2] || '',
-          daysMin: daysMatch?.[1] || '',
-          daysMax: daysMatch?.[2] || '',
-          profileHref: profileLink?.getAttribute('href') || profileLink?.href || null,
-          profileLabel: profileLink?.getAttribute('aria-label')
-            || profileLink?.getAttribute('title')
-            || profileImage?.getAttribute('alt')
-            || profileLink?.textContent?.trim()
-            || null,
-          candidates,
-        };
-      });
-      const number = (value: string) => value ? Number(value.replace(/\s+/g, '')) : null;
-      const publishedAt = this.parseFlDate(raw.published);
-      const identity = flProfileIdentity(raw.profileHref, raw.profileLabel);
-      const attachmentLinks = raw.candidates.filter((item) => {
-        try {
-          const candidate = new URL(item.url);
-          return (candidate.hostname === 'st.fl.ru' || candidate.hostname.endsWith('.fl.ru'))
-            && /\/upload\/|download|attachment|\/file/i.test(candidate.pathname)
-            && !candidate.pathname.includes('/about/documents/');
-        } catch {
-          return false;
-        }
-      }).filter((item, index, items) => items.findIndex((other) => other.url === item.url) === index);
-      return {
-        title: raw.title,
-        description: raw.description,
-        budget: raw.budget,
-        published_at: publishedAt?.toISOString() || null,
-        published_text: raw.published || null,
-        client_registered: raw.registered || null,
-        response_count: number(raw.responseCount),
-        response_price_min: number(raw.priceMin),
-        response_price_max: number(raw.priceMax),
-        response_days_min: number(raw.daysMin),
-        response_days_max: number(raw.daysMax),
-        age_minutes_at_parse: publishedAt ? Math.max(0, Math.round((Date.now() - publishedAt.getTime()) / 60_000)) : null,
-        client: {
-          ...(identity.name ? { fl_name: identity.name } : {}),
-          ...(identity.username ? { fl_username: identity.username } : {}),
-        },
-        attachment_links: attachmentLinks,
-      };
-    } finally {
-      await page.close();
-    }
+  private async readProject(url: string, cookies: CookieData[]) {
+    const cookie = flCookieHeader(cookies);
+    const response = await fetch(url, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)',
+        ...(cookie ? { cookie } : {}),
+      },
+      signal: AbortSignal.timeout(12_000),
+    });
+    if (!response.ok) throw new Error(`FL project HTTP ${response.status}`);
+    const $ = cheerio.load(await response.text());
+    const clean = (value: string | null | undefined) => String(value || '').replace(/\s+/g, ' ').trim();
+    const bodyLines = $('body').text().split(/\n+/).map(clean).filter(Boolean);
+    const body = bodyLines.join(' ');
+    const title = clean($('h1').first().text());
+    const description = clean($('.fl-project-content__description-text').first().text());
+    if (!title || !description) throw new Error('FL project page is missing title or description');
+    const budget = bodyLines.find((line) => line.startsWith('Бюджет:'))?.replace(/^Бюджет:\s*/, '') || '';
+    const published = body.match(/Опубликован\s+(\d{2}\.\d{2}\.\d{4}\s+в\s+\d{2}:\d{2})/i)?.[1] || '';
+    const registered = body.match(/Зарегистрирован:\s*([^|]{1,120}?)(?=\s+(?:Откликнулись|Бюджет|Опубликован|$))/i)?.[1]?.trim() || '';
+    const responseMatch = body.match(/Откликнулись:\s*([\d\s]+)\s+фрилансер/i);
+    const pricesMatch = body.match(/Цены:\s*от\s*([\d\s]+)\s*₽\s*до\s*([\d\s]+)\s*₽/i);
+    const daysMatch = body.match(/Сроки:\s*от\s*([\d\s]+)\s*до\s*([\d\s]+)\s*д/i);
+
+    const candidates: Array<{ url: string; name: string }> = [];
+    const roots = $('.fl-project-content__description-text, [class*="attachment"], [class*="project-file"]');
+    roots.find('a[href]').each((_, element) => {
+      candidates.push({ url: $(element).attr('href') || '', name: clean($(element).text()) });
+    });
+    roots.find('img[src]').each((_, element) => {
+      candidates.push({ url: $(element).attr('src') || '', name: clean($(element).attr('alt')) });
+    });
+    const profileLink = $('a[href]').filter((_, element) =>
+      /\/users\/[^/?#]+\/?(?:[?#].*)?$/iu.test($(element).attr('href') || ''),
+    ).first();
+    const profileHref = profileLink.attr('href') || null;
+    const profileLabel = profileLink.attr('aria-label')
+      || profileLink.attr('title')
+      || profileLink.find('img').attr('alt')
+      || clean(profileLink.text())
+      || null;
+    const publishedAt = this.parseFlDate(published);
+    const identity = flProfileIdentity(profileHref, profileLabel);
+    const number = (value: string | undefined) => value ? Number(value.replace(/\s+/g, '')) : null;
+    const attachmentLinks = candidates.filter((item) => {
+      try {
+        const candidate = new URL(item.url, url);
+        return (candidate.hostname === 'st.fl.ru' || candidate.hostname.endsWith('.fl.ru'))
+          && /\/upload\/|download|attachment|\/file/i.test(candidate.pathname)
+          && !candidate.pathname.includes('/about/documents/');
+      } catch {
+        return false;
+      }
+    }).map((item) => ({ ...item, url: new URL(item.url, url).toString() }))
+      .filter((item, index, items) => items.findIndex((other) => other.url === item.url) === index);
+
+    return {
+      title,
+      description,
+      budget,
+      published_at: publishedAt?.toISOString() || null,
+      published_text: published || null,
+      client_registered: registered || null,
+      response_count: number(responseMatch?.[1]),
+      response_price_min: number(pricesMatch?.[1]),
+      response_price_max: number(pricesMatch?.[2]),
+      response_days_min: number(daysMatch?.[1]),
+      response_days_max: number(daysMatch?.[2]),
+      age_minutes_at_parse: publishedAt ? Math.max(0, Math.round((Date.now() - publishedAt.getTime()) / 60_000)) : null,
+      client: {
+        ...(identity.name ? { fl_name: identity.name } : {}),
+        ...(identity.username ? { fl_username: identity.username } : {}),
+      },
+      attachment_links: attachmentLinks,
+    };
   }
 
   private async syncPortfolio(browser: Browser, cookies: CookieData[]) {
@@ -808,7 +881,11 @@ export class FlService {
   private async setInput(page: import('puppeteer-core').Page, selector: string, value: string) {
     const field = await page.$(selector);
     if (!field) return;
-    await field.click({ clickCount: 3 });
-    await field.type(value);
+    await page.$eval(selector, (element, nextValue) => {
+      const input = element as HTMLInputElement;
+      input.value = String(nextValue);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, value);
   }
 }

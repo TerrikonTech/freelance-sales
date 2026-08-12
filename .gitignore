@@ -14,8 +14,6 @@ runtime/codex-jobs/
 ops/backups/
 runtime/
 .pytest-cache/
-__pycache__/
-*.py[cod]
 *.dump
 *.tgz
 *.zip

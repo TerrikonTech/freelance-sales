@@ -290,8 +290,11 @@ def load_config() -> Config:
     model = os.getenv("SALES_HERMES_MODEL", "").strip()
     if model and re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", model) is None:
         raise BrokerError("SALES_HERMES_MODEL contains unsupported characters")
+    worker_instance = os.getenv("SALES_HERMES_WORKER_INSTANCE", "primary").strip()
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,40}", worker_instance) is None:
+        raise BrokerError("SALES_HERMES_WORKER_INSTANCE contains unsupported characters")
     worker_suffix = hashlib.sha256(
-        f"{socket.gethostname()}\0{ROOT}".encode()
+        f"{socket.gethostname()}\0{ROOT}\0{worker_instance}".encode()
     ).hexdigest()[:12]
     telegram_token, telegram_chat_id = _optional_telegram_credentials()
     return Config(

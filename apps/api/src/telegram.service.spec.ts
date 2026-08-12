@@ -79,6 +79,41 @@ describe('Telegram on-demand policy', () => {
       'tg-draft-message-1',
     );
   });
+
+  test('paused monitoring drops Bot API and MTProto input before database or AI work', async () => {
+    const db = { query: jest.fn(), transaction: jest.fn() };
+    const settings = { getPublic: jest.fn().mockResolvedValue({ enabled: false }) };
+    const queue = { add: jest.fn() };
+    const service = new TelegramService(
+      db as never,
+      settings as never,
+      queue as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    await service.processUpdate({
+      business_message: {
+        chat: { id: 777 },
+        from: { id: 777 },
+        message_id: 5,
+        text: 'Это сообщение не нужно разбирать',
+      },
+    });
+    const result = await service.ingestMtprotoMessages([{
+      chatId: 777,
+      messageId: 6,
+      direction: 'inbound',
+      text: 'И это тоже',
+      live: true,
+    }]);
+
+    expect(result).toEqual({ inserted: 0, queued: 0, disabled: true });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
+  });
 });
 
 describe('Telegram owner command parsing', () => {

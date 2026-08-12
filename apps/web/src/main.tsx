@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
@@ -39,6 +39,41 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
 type Page = 'dashboard' | 'sandbox' | 'chat-lab' | 'leads' | 'chats' | 'approvals' | 'settings';
 const validPage = (value: string | null): Page => ['dashboard', 'sandbox', 'chat-lab', 'leads', 'chats', 'approvals', 'settings'].includes(value || '') ? value as Page : 'dashboard';
 
+
+type LiveEventItem = { id: string; lead_id?: string; title: string; content?: string; created_at: string };
+type LiveEventFeed = { serverTime: string; lead: LiveEventItem | null; draft: LiveEventItem | null; message: LiveEventItem | null };
+type LivePageAlert = { kind: 'lead' | 'draft' | 'message'; leadId: string; title: string; text: string; createdAt: string };
+
+let alarmAudio: AudioContext | null = null;
+
+async function ensureAlarmAudio() {
+  const AudioCtor = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioCtor) return null;
+  alarmAudio ||= new AudioCtor();
+  if (alarmAudio.state === 'suspended') await alarmAudio.resume();
+  return alarmAudio;
+}
+
+async function playPageAlarm(test = false) {
+  const audio = await ensureAlarmAudio();
+  if (!audio) return;
+  const start = audio.currentTime + 0.03;
+  const pulses = test ? 2 : 6;
+  for (let index = 0; index < pulses; index += 1) {
+    const oscillator = audio.createOscillator();
+    const gain = audio.createGain();
+    oscillator.type = 'square';
+    oscillator.frequency.value = index % 2 === 0 ? 880 : 660;
+    gain.gain.setValueAtTime(0.0001, start + index * 0.22);
+    gain.gain.exponentialRampToValueAtTime(0.22, start + index * 0.22 + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + index * 0.22 + 0.18);
+    oscillator.connect(gain);
+    gain.connect(audio.destination);
+    oscillator.start(start + index * 0.22);
+    oscillator.stop(start + index * 0.22 + 0.19);
+  }
+}
+
 function App() {
   const params = new URLSearchParams(location.search);
   const [auth, setAuth] = useState<'loading' | 'setup' | 'login' | 'ok'>('loading');
@@ -46,6 +81,9 @@ function App() {
   const [selectedLead, setSelectedLead] = useState<string | null>(params.get('lead') || params.get('chat'));
   const [selectedView, setSelectedView] = useState<'lead' | 'chat'>(params.get('chat') ? 'chat' : 'lead');
   const [toast, setToast] = useState('');
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('sales.pageSound') !== '0');
+  const [liveAlert, setLiveAlert] = useState<LivePageAlert | null>(null);
+  const seenEvents = useRef<Record<'lead' | 'draft' | 'message', LiveEventItem | null> | null>(null);
 
   const refreshAuth = async () => {
     try { await api('/auth/me'); setAuth('ok'); }
@@ -65,15 +103,115 @@ function App() {
   const openChat = (id: string) => { setSelectedView('chat'); setSelectedLead(id); history.replaceState({}, '', `${BASE}/?chat=${id}`); window.scrollTo({ top: 0 }); };
   const closeLead = () => { setSelectedLead(null); history.replaceState({}, '', `${BASE}/?page=${page}`); window.scrollTo({ top: 0 }); };
 
+  useEffect(() => {
+    if (!soundEnabled) return;
+    const unlock = () => { void ensureAlarmAudio(); };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    return () => window.removeEventListener('pointerdown', unlock);
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    if (auth !== 'ok') return;
+    let cancelled = false;
+    const loadEvents = async () => {
+      try {
+        const next = await api<LiveEventFeed>('/live-events');
+        if (cancelled) return;
+        const current = { lead: next.lead, draft: next.draft, message: next.message };
+        if (!seenEvents.current) {
+          seenEvents.current = current;
+          return;
+        }
+        const previous = seenEvents.current;
+        const isNewer = (kind: keyof typeof current) => Boolean(
+          current[kind] && Date.parse(current[kind]!.created_at) > Date.parse(previous[kind]?.created_at || '1970-01-01'),
+        );
+        const candidates: LivePageAlert[] = [];
+        if (next.lead && isNewer('lead')) candidates.push({
+          kind: 'lead', leadId: next.lead.id, title: 'Новый заказ на FL.ru',
+          text: next.lead.title, createdAt: next.lead.created_at,
+        });
+        if (next.draft && isNewer('draft')) candidates.push({
+          kind: 'draft', leadId: next.draft.lead_id || '', title: 'Отклик готов',
+          text: next.draft.title, createdAt: next.draft.created_at,
+        });
+        if (next.message && isNewer('message')) candidates.push({
+          kind: 'message', leadId: next.message.lead_id || '', title: 'Клиент написал в чат',
+          text: `${next.message.title}. ${String(next.message.content || '').slice(0, 140)}`, createdAt: next.message.created_at,
+        });
+        seenEvents.current = {
+          lead: isNewer('lead') ? next.lead : previous.lead,
+          draft: isNewer('draft') ? next.draft : previous.draft,
+          message: isNewer('message') ? next.message : previous.message,
+        };
+        const newest = candidates.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+        if (!newest) return;
+        setLiveAlert(newest);
+        setToast(`${newest.title}: ${newest.text}`);
+        window.setTimeout(() => setToast(''), 6_000);
+        document.title = `🔔 ${newest.title}`;
+        if (soundEnabled) await playPageAlarm();
+      } catch {
+        // The normal page keeps working if this lightweight poll misses one cycle.
+      }
+    };
+    void loadEvents();
+    const timer = window.setInterval(() => { void loadEvents(); }, 5_000);
+    const onFocus = () => { void loadEvents(); };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [auth, soundEnabled]);
+
+  const toggleSound = async () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    localStorage.setItem('sales.pageSound', next ? '1' : '0');
+    if (next) {
+      await playPageAlarm(true);
+      notify('Звук включён. Так прозвучит новое событие.');
+    } else {
+      notify('Звуковой сигнал выключен');
+    }
+  };
+  const openLiveAlert = () => {
+    if (!liveAlert) return;
+    if (liveAlert.kind === 'lead') openLead(liveAlert.leadId);
+    else if (liveAlert.kind === 'draft') navigate('approvals');
+    else openChat(liveAlert.leadId);
+    setLiveAlert(null);
+    document.title = 'Sales Control';
+  };
+  const dismissLiveAlert = () => {
+    setLiveAlert(null);
+    document.title = 'Sales Control';
+  };
+
   if (auth === 'loading') return <div className="center"><div className="spinner" /></div>;
   if (auth !== 'ok') return <Auth mode={auth} onDone={() => setAuth('ok')} />;
 
   return <div className={`shell ${selectedLead ? 'focus' : ''} ${page === 'chat-lab' ? 'chatLabShell' : ''}`}>
     <header>
       <div className="brand"><span className="logo">S</span><div><strong>Sales Control</strong><small>Заказы под контролем</small></div></div>
-      <span className="approvalLock"><i /> Отправка только после одобрения</span>
+      <div className="headerActions">
+        <button className={`soundToggle ${soundEnabled ? 'on' : ''}`} onClick={() => { void toggleSound(); }}>
+          {soundEnabled ? '🔊 Звук включён' : '🔇 Включить звук'}
+        </button>
+        <span className="approvalLock"><i /> Отправка только после одобрения</span>
+      </div>
     </header>
     <main>
+      {liveAlert && <div className="liveAlarm" role="alert">
+        <button className="liveAlarmOpen" onClick={openLiveAlert}>
+          <span className="liveAlarmIcon">🔔</span>
+          <span><b>{liveAlert.title}</b><small>{liveAlert.text}</small></span>
+          <strong>Открыть →</strong>
+        </button>
+        <button className="liveAlarmClose" aria-label="Закрыть уведомление" onClick={dismissLiveAlert}>×</button>
+      </div>}
       {selectedLead ? selectedView === 'chat' ? <ChatDetail id={selectedLead} back={closeLead} notify={notify} /> : <LeadDetail id={selectedLead} back={closeLead} notify={notify} /> : <>
         {page === 'dashboard' && <Dashboard openLead={openLead} notify={notify} openApprovals={() => navigate('approvals')} openChats={() => navigate('chats')} />}
         {page === 'sandbox' && <Sandbox openLead={openLead} notify={notify} />}
@@ -117,6 +255,150 @@ function Auth({ mode, onDone }: { mode: 'setup' | 'login'; onDone: () => void })
 
 function Nav({ active, onClick, icon, text }: { active: boolean; onClick: () => void; icon: string; text: string }) {
   return <button className={active ? 'active' : ''} onClick={onClick}><span>{icon}</span>{text}</button>;
+}
+
+type ActivityStep = { key: string; label: string; status: 'pending' | 'active' | 'done' | 'skipped' | 'failed'; note?: string; attempts?: number; started_at?: string; ended_at?: string };
+type ActivityJob = {
+  id: string; kind: string; title: string; status: 'running' | 'completed' | 'failed';
+  lead_id: string | null; lead_title: string | null; steps: ActivityStep[];
+  result_text: string | null; error: string | null;
+  started_at: string; updated_at: string; finished_at: string | null;
+};
+type ActivityFeed = { active: ActivityJob[]; recent: ActivityJob[]; aiQueue: number };
+
+/**
+ * Pressing a button starts work that finishes minutes later inside the worker.
+ * Polling has to be fast while something runs and cheap when nothing does.
+ */
+function useActivity(leadId?: string, signal = 0) {
+  const [feed, setFeed] = useState<ActivityFeed>();
+  const load = useCallback(
+    () => api<ActivityFeed>(`/activity${leadId ? `?leadId=${encodeURIComponent(leadId)}` : ''}`).then(setFeed).catch(() => undefined),
+    [leadId],
+  );
+  const running = (feed?.active?.length || 0) > 0;
+  useEffect(() => { void load(); }, [load, signal]);
+  useEffect(() => {
+    const timer = window.setInterval(() => { void load(); }, running ? 2_000 : 12_000);
+    return () => clearInterval(timer);
+  }, [load, running]);
+  return { feed, running, reload: load };
+}
+
+/** Second-by-second clock, but only while there is a running job to time. */
+function useTicker(enabled: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [enabled]);
+  return now;
+}
+
+const duration = (ms: number) => {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds} с`;
+  return `${Math.floor(seconds / 60)} мин ${String(seconds % 60).padStart(2, '0')} с`;
+};
+
+/** Broker and queue failures arrive as English internals; the owner needs the meaning. */
+const humanError = (text: string) => {
+  const table: Array<[RegExp, string]> = [
+    [/exceeds the Hermes input limit|instruction limit/i, 'Заказ оказался слишком большим для одной задачи ИИ. Система ужимает контекст сама; если повторяется — сократите описание заказа.'],
+    [/Время ожидания Codex истекло/i, 'ИИ не ответил за отведённое время. Запустите ещё раз — обычно проходит со второй попытки.'],
+    [/не прошёл финальную проверку качества/i, 'Текст не прошёл проверку на живость и достоверность, поэтому черновик не сохранён. Запустите заново или задайте свои правки.'],
+    [/Hermes did not return a JSON object|invalid task id/i, 'ИИ вернул испорченный ответ. Запустите ещё раз.'],
+    [/Hermes run failed|run was cancelled/i, 'Задача ИИ оборвалась на стороне брокера. Запустите ещё раз.'],
+    [/fetch failed|ECONNREFUSED|ETIMEDOUT/i, 'Не достучались до внешнего сервиса. Проверьте связь и подключения в разделе «Система».'],
+    [/Работа прервана: сервис перезапустился/i, 'Работа прервалась из-за перезапуска сервиса. Запустите заново.'],
+    [/cookie|Unauthorized|401/i, 'FL.ru не принял вход. Обновите cookies в разделе «Система».'],
+  ];
+  for (const [pattern, message] of table) if (pattern.test(text)) return message;
+  return text;
+};
+
+/** Honest expectation beats a spinner with no end in sight. */
+const jobEta = (kind: string) => ({
+  'draft-reply': 'обычно 3–6 минут',
+  'analyze-lead': 'обычно 30–90 секунд',
+  'generate-documents': 'обычно 2–5 минут',
+  'generate-design': 'обычно 5–10 минут',
+  'send-draft': 'обычно несколько секунд',
+  'scan-fl': 'обычно 10–30 секунд',
+} as Record<string, string>)[kind] || '';
+
+const jobIcon = ({ kind }: ActivityJob) => ({
+  'draft-reply': '✎', 'analyze-lead': '⚖', 'generate-documents': '▤', 'generate-design': '◨',
+  'send-draft': '➤', 'scan-fl': '⟳', 'owner-command': '☰',
+} as Record<string, string>)[kind] || '•';
+
+function ActivityJobCard({ job, now }: { job: ActivityJob; now: number }) {
+  const finished = job.finished_at ? new Date(job.finished_at).getTime() : now;
+  const total = finished - new Date(job.started_at).getTime();
+  const steps = Array.isArray(job.steps) ? job.steps : [];
+  const doneCount = steps.filter((step) => step.status === 'done').length;
+  const countable = steps.filter((step) => step.status !== 'skipped').length || 1;
+  return <article className={`liveJob ${job.status}`}>
+    <div className="liveJobHead">
+      <span className="liveJobIcon">{jobIcon(job)}</span>
+      <div>
+        <b>{job.title}</b>
+        <small>{job.lead_title ? job.lead_title : 'Общая задача системы'}{job.status === 'running' && jobEta(job.kind) ? ` · ${jobEta(job.kind)}` : ''}</small>
+      </div>
+      <div className="liveJobTime">
+        <b>{duration(total)}</b>
+        <small>{job.status === 'running' ? `шаг ${Math.min(doneCount + 1, countable)} из ${countable}` : job.status === 'failed' ? 'с ошибкой' : 'готово'}</small>
+      </div>
+    </div>
+    <div className="liveJobBar"><i style={{ width: `${Math.round(Math.min(1, doneCount / countable) * 100)}%` }} /></div>
+    <ol className="liveSteps">{steps.map((step) => {
+      const started = step.started_at ? new Date(step.started_at).getTime() : 0;
+      const ended = step.ended_at ? new Date(step.ended_at).getTime() : now;
+      const spent = started ? ended - started : 0;
+      return <li className={step.status} key={step.key}>
+        <i>{step.status === 'done' ? '✓' : step.status === 'failed' ? '!' : step.status === 'skipped' ? '–' : step.status === 'active' ? '' : '○'}</i>
+        <span>{step.label}{step.note ? <em> — {step.note}</em> : null}</span>
+        <time>{step.status === 'pending' ? '' : step.status === 'skipped' ? 'не потребовалось' : duration(spent)}</time>
+      </li>;
+    })}</ol>
+    {job.error && <p className="liveJobError">Не получилось: {humanError(job.error)}</p>}
+    {job.result_text && !job.error && <p className="liveJobResult">{job.result_text}</p>}
+  </article>;
+}
+
+/**
+ * The one place that answers "я нажал кнопку — что сейчас происходит?".
+ * Shown on the dashboard globally and inside a deal filtered to that deal.
+ */
+function LiveActivity({ leadId, signal = 0, onIdle, title = 'Прямо сейчас' }: { leadId?: string; signal?: number; onIdle?: () => void; title?: string }) {
+  const { feed, running } = useActivity(leadId, signal);
+  const now = useTicker(running);
+  const [wasRunning, setWasRunning] = useState(false);
+  useEffect(() => {
+    if (running) setWasRunning(true);
+    else if (wasRunning) { setWasRunning(false); onIdle?.(); }
+  }, [running, wasRunning, onIdle]);
+  if (!feed) return null;
+  const recent = feed.recent.slice(0, running ? 2 : 4);
+  return <section className={`liveActivity ${running ? 'busy' : ''}`}>
+    <div className="liveHead">
+      <div><span className="eyebrow">{running ? 'Идёт работа' : 'Система свободна'}</span><h2>{title}</h2></div>
+      <span className="liveBadgeCount">{running ? <><i className="livePulse" />{feed.active.length} в работе</> : <>Ожидает команды</>}</span>
+    </div>
+    {running && feed.aiQueue > 1 && <p className="liveQueue">ИИ выполняет задачи по очереди: сейчас в очереди {feed.aiQueue}. Пока они не пройдут, текущий шаг будет ждать.</p>}
+    {running
+      ? <div className="liveJobs">{feed.active.map((job) => <ActivityJobCard job={job} now={now} key={job.id} />)}</div>
+      : <p className="liveIdle">Ничего не считается и никуда не отправляется. Нажмите любую кнопку выше — здесь появятся все шаги с таймером.</p>}
+    {recent.length > 0 && <div className="liveRecent">
+      <b>Последние завершённые</b>
+      {recent.map((job) => <div className={job.status} key={job.id}>
+        <i>{job.status === 'failed' ? '!' : '✓'}</i>
+        <span>{job.title}{job.lead_title ? ` · ${job.lead_title}` : ''}</span>
+        <time>{job.finished_at ? relativeTime(job.finished_at) : ''} · {duration(new Date(job.finished_at || job.updated_at).getTime() - new Date(job.started_at).getTime())}</time>
+      </div>)}
+    </div>}
+  </section>;
 }
 
 const chatLabStages = [
@@ -198,18 +480,23 @@ function ChatLab({ back }: { back: () => void }) {
 function Dashboard({ openLead, notify, openApprovals, openChats }: { openLead: (id: string) => void; notify: (text: string) => void; openApprovals: () => void; openChats: () => void }) {
   const [data, setData] = useState<any>();
   const [busy, setBusy] = useState(false);
+  const [signal, setSignal] = useState(0);
+  const [tech, setTech] = useState(() => localStorage.getItem('sales.tech') === '1');
   const load = () => api('/dashboard').then(setData);
+  const reload = useCallback(() => { void load(); }, []);
   useEffect(() => { void load(); const timer = window.setInterval(load, 20_000); return () => clearInterval(timer); }, []);
+  useEffect(() => { localStorage.setItem('sales.tech', tech ? '1' : '0'); }, [tech]);
   if (!data) return <Loading />;
   const fl = data.connectors.find((item: any) => item.connector === 'fl') || {};
   const scan = data.scan || {};
   const manualScan = async () => {
     setBusy(true);
+    setSignal((value) => value + 1);
     try {
       const result = await api<any>('/connectors/fl/scan', { method: 'POST' });
       notify(`FL проверен: новых ${result.projects?.created || 0}, повторов ${result.projects?.skippedKnown || 0}`);
       await load();
-    } catch (error) { notify((error as Error).message); } finally { setBusy(false); }
+    } catch (error) { notify((error as Error).message); } finally { setBusy(false); setSignal((value) => value + 1); }
   };
   const toggle = async () => {
     setBusy(true);
@@ -223,8 +510,18 @@ function Dashboard({ openLead, notify, openApprovals, openChats }: { openLead: (
   const analyzed24 = Number(data.metrics.analyzed24 || 0);
   const qualified = Number(data.metrics.qualified || 0);
   const qualified24 = Number(data.metrics.qualified24 || 0);
+  const broken = data.connectors.filter((item: any) => ['fl', 'codex', 'telegram'].includes(item.connector)
+    && !(item.connector === 'codex' ? item.healthy : item.enabled && item.healthy));
+
   return <section>
-    <div className="pageTitle"><div><span className="eyebrow">Сегодня</span><h1>Что сделать сейчас</h1><p>Сначала ваши решения. Остальное система делает сама.</p></div><PushControl notify={notify} compact /></div>
+    <div className="pageTitle"><div><span className="eyebrow">Сегодня</span><h1>Что сделать сейчас</h1><p>Сверху — то, где нужны вы. Ниже видно, чем система занята прямо сейчас.</p></div><PushControl notify={notify} compact /></div>
+
+    {broken.length > 0 && <div className="alertBar">
+      <i>!</i>
+      <div><b>Не работает: {broken.map((item: any) => labelConnector(item.connector)).join(', ')}</b><small>Пока это не починить, новые заказы и отправка могут не проходить. Подробности — в разделе «Система».</small></div>
+    </div>}
+
+    <div className="stepHint"><b>1</b><span>Проверьте готовые ответы</span><b>2</b><span>Одобрите или поправьте текст</span><b>3</b><span>Система отправит и покажет результат</span></div>
 
     <div className="metrics actionMetrics">
       <button className="metric amber actionable primaryAction" onClick={openApprovals}><b>{data.metrics.pending || 0}</b><span>Ответов ждут проверки</span><small>Проверить и отправить →</small></button>
@@ -232,23 +529,30 @@ function Dashboard({ openLead, notify, openApprovals, openChats }: { openLead: (
       <Metric label="Подходящих заказов" value={qualified} tone="violet" hint="Система уже отобрала их для вас" />
     </div>
 
-    <div className={`systemBar ${fl.enabled ? 'online' : 'paused'}`}><span className={fl.enabled ? 'dot ok' : 'dot'} /><div><b>{fl.enabled ? 'Автопоиск работает' : 'Автопоиск на паузе'}</b><small>{fl.status_text || 'Нет данных'}{fl.last_success_at ? ` · ${relativeTime(fl.last_success_at)}` : ''}</small></div><button onClick={manualScan} disabled={busy}>{busy ? 'Проверяю…' : 'Проверить'}</button><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={toggle} disabled={busy}>{fl.enabled ? 'Пауза' : 'Включить'}</button></div>
+    <LiveActivity signal={signal} onIdle={reload} />
 
-    <div className="grid two dashboardGrid dashboardTech">
-      <Card title="Воронка за 24 часа" subtitle="Показывает, куда ушли новые проекты">
-        <FunnelRow label="Найдено новых" value={new24} max={Math.max(1, new24)} />
-        <FunnelRow label="Оценено Codex" value={analyzed24} max={Math.max(1, new24)} />
-        <FunnelRow label="Прошли отбор" value={qualified24} max={Math.max(1, new24)} accent />
-        <div className="saving"><span>⚡</span><div><b>{scan.skipped24 || 0} повторов не отправлено в ИИ</b><small>Заказы сверяются по ID до запуска Codex</small></div></div>
-      </Card>
+    <div className={`systemBar ${fl.enabled ? 'online' : 'paused'}`}><span className={fl.enabled ? 'dot ok' : 'dot'} /><div><b>{fl.enabled ? 'Автопоиск работает' : 'Автопоиск на паузе'}</b><small>{fl.status_text || 'Нет данных'}{fl.last_success_at ? ` · ${relativeTime(fl.last_success_at)}` : ''}</small></div><button onClick={manualScan} disabled={busy}>{busy ? 'Проверяю…' : 'Проверить сейчас'}</button><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={toggle} disabled={busy}>{fl.enabled ? 'Пауза' : 'Включить'}</button></div>
+
+    <Card title="Заказы, на которые стоит посмотреть" subtitle={`${new24} новых за сутки · ${analyzed24} уже оценены · нажмите на строку, чтобы открыть заказ`}><LeadRows leads={data.recent.slice(0, 5)} openLead={openLead} /></Card>
+
+    <Card title="Воронка за 24 часа" subtitle="Куда ушли новые проекты">
+      <FunnelRow label="Найдено новых" value={new24} max={Math.max(1, new24)} />
+      <FunnelRow label="Оценено Codex" value={analyzed24} max={Math.max(1, new24)} />
+      <FunnelRow label="Прошли отбор" value={qualified24} max={Math.max(1, new24)} accent />
+      <div className="saving"><span>⚡</span><div><b>{scan.skipped24 || 0} повторов не отправлено в ИИ</b><small>Заказы сверяются по ID до запуска Codex</small></div></div>
+    </Card>
+
+    <div className="techToggle">
+      <button className={tech ? 'active' : ''} onClick={() => setTech(!tech)}>{tech ? '▾' : '▸'} Технические подробности<small>Состояние сервисов, схема архитектуры и метрики исследования</small></button>
+    </div>
+    {tech && <div className="techPanel">
       <Card title="Состояние системы" subtitle="Живые данные сервисов">
         {data.connectors.filter((item: any) => item.connector !== 'openai').map((connector: any) => <Connector key={connector.connector} connector={connector} />)}
         <div className="scanFacts"><span>Средний скан <b>{scan.avg_duration_ms ? `${scan.avg_duration_ms} мс` : '—'}</b></span><span>Последний <b>{scan.last_scan_at ? relativeTime(scan.last_scan_at) : '—'}</b></span></div>
       </Card>
-    </div>
-    <Card title="Заказы, на которые стоит посмотреть" subtitle={`${new24} новых за сутки · ${analyzed24} уже оценены`}><LeadRows leads={data.recent.slice(0, 5)} openLead={openLead} /></Card>
-    <ResearchDashboard data={data.research} />
-    <ArchitectureDashboard data={data} />
+      <ResearchDashboard data={data.research} />
+      <ArchitectureDashboard data={data} />
+    </div>}
   </section>;
 }
 
@@ -479,6 +783,7 @@ function Sandbox({ openLead, notify }: { openLead: (id: string) => void; notify:
   const [clientMessage, setClientMessage] = useState('Спасибо. Нужны роли администратора и менеджера, интеграция с нашей PostgreSQL, уведомления в Telegram и запуск первой версии за 6 недель. Что ещё нужно уточнить?');
   const [telegramMessage, setTelegramMessage] = useState('Продолжим здесь. В первой версии используем существующего Telegram-бота: он принимает заявки и уведомляет менеджера о новой заявке и просроченном ответе. Администратор видит все сделки, менеджер — только назначенные ему.');
   const [busy, setBusy] = useState('');
+  const [signal, setSignal] = useState(0);
 
   const loadRuns = async () => {
     const result = await api<any[]>('/sandbox');
@@ -498,12 +803,13 @@ function Sandbox({ openLead, notify }: { openLead: (id: string) => void; notify:
 
   const run = async (key: string, action: () => Promise<unknown>, success: string) => {
     setBusy(key);
+    setSignal((value) => value + 1);
     try {
       await action();
       notify(success);
       window.setTimeout(() => { void loadState(); void loadRuns(); }, 700);
     } catch (error) { notify((error as Error).message); }
-    finally { setBusy(''); }
+    finally { setBusy(''); setSignal((value) => value + 1); }
   };
   const create = () => run('create', async () => {
     const created = await api<{ id: string }>('/sandbox', { method: 'POST', body: JSON.stringify({ scenario }) });
@@ -532,6 +838,8 @@ function Sandbox({ openLead, notify }: { openLead: (id: string) => void; notify:
 
     {!activeId ? <Card><Empty text="Создайте первый тестовый заказ — реальные отклики FL.ru не расходуются." /></Card> : !state ? <Loading /> : <>
       <div className="sandboxProgress"><div><span>Пройдено этапов</span><b>{done} из {total}</b></div><i><em style={{ width: `${Math.round(done / total * 100)}%` }} /></i><small>{done === total ? 'Полный сценарий пройден' : 'Двигайтесь сверху вниз; долгие операции обновятся автоматически.'}</small></div>
+
+      <LiveActivity leadId={activeId} signal={signal} onIdle={() => { void loadState(); void loadRuns(); }} title="Что сейчас делает система в этом прогоне" />
 
       <div className="sandboxWorkspace">
         <div className="sandboxSteps"><strong>Покрытие прогона</strong>{state.steps.map((step: any, index: number) => <a className={`${step.done ? 'done' : ''} ${step.failed ? 'failed' : ''}`} href={`#sandbox-step-${step.key}`} key={step.key}><i>{step.done ? '✓' : step.failed ? '!' : index + 1}</i><span>{step.label}</span></a>)}</div>
@@ -708,14 +1016,34 @@ function Leads({ openLead, notify }: { openLead: (id: string) => void; notify: (
   const [leads, setLeads] = useState<any[]>([]);
   const [show, setShow] = useState(false);
   const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState('qualified');
-  const load = () => api<any[]>('/leads').then(setLeads);
-  useEffect(() => { void load(); }, []);
-  const filtered = useMemo(() => leads.filter((lead) => (filter === 'all' || lead.status === filter) && lead.title.toLowerCase().includes(query.toLowerCase())), [leads, filter, query]);
-  return <section><div className="pageTitle"><div><span className="eyebrow">База заказов</span><h1>Заказы</h1><p>{leads.length} всего · {leads.filter((lead) => lead.status === 'qualified').length} подходят</p></div><button className="primary small" onClick={() => setShow(true)}>+ Добавить</button></div>
-    <div className="toolbar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по названию" /><div className="chips">{[['qualified','Подходят'],['contacted','В работе'],['new','Оцениваются'],['all','Все'],['rejected','Отсеяны']].map(([value,label]) => <button className={filter === value ? 'active' : ''} key={value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
+  const [filter, setFilter] = useState('fresh');
+  const [lastLoaded, setLastLoaded] = useState<Date | null>(null);
+  const load = useCallback(() => api<any[]>('/leads').then((next) => {
+    setLeads(next);
+    setLastLoaded(new Date());
+  }), []);
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 5_000);
+    const refresh = () => { if (!document.hidden) void load(); };
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [load]);
+  const isFresh = (lead: any) => lead.status !== 'rejected'
+    && Date.now() - Date.parse(lead.published_at || lead.created_at) <= 24 * 60 * 60 * 1_000;
+  const filtered = useMemo(() => leads.filter((lead) => {
+    const matchesFilter = filter === 'all' || (filter === 'fresh' ? isFresh(lead) : lead.status === filter);
+    return matchesFilter && lead.title.toLowerCase().includes(query.toLowerCase());
+  }), [leads, filter, query]);
+  return <section><div className="pageTitle"><div><span className="eyebrow">База заказов</span><h1>Заказы</h1><p>Обновляются каждые 5 секунд. По умолчанию показаны свежие за последние сутки.</p></div><div className="leadPageActions"><span className="liveBadge"><i /> {lastLoaded ? `Обновлено ${lastLoaded.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : 'Подключаюсь'}</span><button className="primary small" onClick={() => setShow(true)}>+ Добавить</button></div></div>
+    <div className="toolbar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по названию" /><div className="chips">{[['fresh','Актуальные 24 ч'],['qualified','Подходят'],['contacted','В работе'],['new','Оцениваются'],['all','Все'],['rejected','Отсеяны']].map(([value,label]) => <button className={filter === value ? 'active' : ''} key={value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
     <Card><LeadRows leads={filtered} openLead={openLead} /></Card>
-    {show && <Modal close={() => setShow(false)}><NewLead done={() => { setShow(false); load(); notify('Лид добавлен и отправлен на анализ'); }} /></Modal>}
+    {show && <Modal close={() => setShow(false)}><NewLead done={() => { setShow(false); void load(); notify('Лид добавлен и отправлен на анализ'); }} /></Modal>}
   </section>;
 }
 
@@ -752,12 +1080,13 @@ function Approvals({ notify }: { notify: (text: string) => void }) {
   const [kind, setKind] = useState<'response' | 'message'>('response');
   const load = () => api<any[]>('/drafts').then(setDrafts);
   useEffect(() => { void load(); const timer = window.setInterval(load, 15_000); return () => clearInterval(timer); }, []);
-  const activeDrafts = drafts.filter((draft) => history || ['pending', 'approved', 'sending'].includes(draft.status));
+  const activeDrafts = drafts.filter((draft) => history || ['pending', 'approved', 'sending', 'failed', 'stale', 'send_unknown'].includes(draft.status));
   const visible = activeDrafts.filter((draft) => draft.draft_type === kind);
   const responseCount = activeDrafts.filter((draft) => draft.draft_type === 'response').length;
   const messageCount = activeDrafts.filter((draft) => draft.draft_type === 'message').length;
   const action = async (id: string, name: string) => { try { await api(`/drafts/${id}/${name}`, { method: 'POST' }); notify(name === 'approve' ? 'Одобрено и поставлено в отправку' : 'Черновик отклонён'); load(); } catch (error) { notify((error as Error).message); load(); } };
   return <section><div className="pageTitle"><div><span className="eyebrow">Ваше решение</span><h1>На проверку</h1><p>Отклики на проекты и ответы в чатах больше не смешиваются.</p></div><button className="ghost" onClick={() => setHistory(!history)}>{history ? 'Скрыть историю' : 'Показать историю'}</button></div>
+    <LiveActivity title="Что сейчас готовится" />
     <div className="approvalTabs"><button className={kind === 'response' ? 'active' : ''} onClick={() => setKind('response')}>Отклики на проекты <b>{responseCount}</b></button><button className={kind === 'message' ? 'active' : ''} onClick={() => setKind('message')}>Сообщения клиентам <b>{messageCount}</b></button></div>
     <div className="drafts">{visible.length === 0 ? <Card><Empty text="Новых черновиков нет" /></Card> : visible.map((draft) => <DraftCard key={draft.id} draft={draft} reload={load} action={action} notify={notify} />)}</div>
   </section>;
@@ -769,12 +1098,14 @@ function DraftCard({ draft, reload, action, notify }: any) {
   const [price, setPrice] = useState(String(draft.recommended_price || ''));
   const [days, setDays] = useState(String(draft.recommended_days || ''));
   const [regenerating, setRegenerating] = useState(false);
+  const [acting, setActing] = useState(false);
   const editable = ['pending','failed','stale'].includes(draft.status);
   const review = draft.metadata?.review;
   const reviewFlags: string[] = Array.isArray(review?.flags) ? review.flags : [];
   const unverifiedTechnologies: string[] = Array.isArray(review?.technology_fit?.unverified)
     ? review.technology_fit.unverified
     : [];
+  const qualityIssues: string[] = Array.isArray(review?.quality_issues) ? review.quality_issues : [];
   const voiceprintSamples = Number(review?.voiceprint?.sampleCount || 0);
   const voiceprintMinimum = Number(review?.voiceprint?.minimumSamples || 10);
   const save = async () => { await api(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }); notify('Изменения сохранены — требуется новое одобрение'); reload(); };
@@ -792,19 +1123,25 @@ function DraftCard({ draft, reload, action, notify }: any) {
       reload();
     } catch (error) { notify((error as Error).message); } finally { setRegenerating(false); }
   };
+  const runAction = async (name: 'approve' | 'reject') => {
+    setActing(true);
+    try { await action(draft.id, name); }
+    finally { setActing(false); }
+  };
   return <article className="draft"><div className="draftHead"><div><span className={`badge ${draft.channel}`}>{draft.draft_type === 'message' ? 'Сообщение' : 'Отклик'}</span><b>{draft.lead_title}</b></div><Status value={draft.status} /></div>
     <div className="facts"><span>Релевантность <b>{draft.score ?? '—'}/100</b></span><span>Цена <b>{money(draft.recommended_price)}</b></span><span>Срок <b>{draft.recommended_days || '—'} дн.</b></span></div>
     {reviewFlags.length > 0 && <div className="proposalWarning"><b>Нужна ручная проверка перед отправкой</b>
       {reviewFlags.includes('technology_fit_unverified') && <span>Нет подтверждённого кейса или записи в профиле по технологии: {unverifiedTechnologies.join(', ')}. Черновик не должен заявлять такой опыт.</span>}
       {reviewFlags.includes('availability_missing') && <span>Дата старта не заполнена в настройках. Система её не выдумывает — укажите доступность или добавьте её вручную.</span>}
       {reviewFlags.includes('voiceprint_insufficient') && <span>Голос владельца ещё не откалиброван: ручных правок {voiceprintSamples} из минимальных {voiceprintMinimum}. Сохранённые вами правки будут пополнять корпус.</span>}
+      {reviewFlags.includes('style_check_failed') && <span><b>Автопроверка стиля не пройдена.</b> Текст сохранён, чтобы вы не ждали заново — прочитайте, поправьте вручную или перегенерируйте с указаниями. Замечания: {qualityIssues.join(' ')}</span>}
     </div>}
     <textarea rows={8} value={content} disabled={!editable} onChange={(event) => setContent(event.target.value)} />
-    {draft.error && <div className="error">{draft.error}</div>}
+    {draft.error && <div className="error">{humanError(draft.error)}</div>}
     {editable && <div className="regenerateBox"><div><b>Не нравится? Напишите, что исправить</b><small>Например: короче, больше уверенности, упомянуть кейс, убрать технические детали.</small></div><textarea rows={3} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Ваши корректировки для нового варианта" />
       {draft.draft_type === 'response' && <div className="regenerateNumbers"><label>Цена, ₽<input type="number" min="1" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label>Срок, дней<input type="number" min="1" value={days} onChange={(event) => setDays(event.target.value)} /></label></div>}
       <button className="regenButton" disabled={regenerating || (draft.draft_type === 'message' && !instructions.trim())} onClick={regenerate}>{regenerating ? 'Перегенерирую…' : '↻ Перегенерировать с правками'}</button><small>Текущий вариант останется до готовности нового. Ничего не отправится автоматически.</small></div>}
-    {editable && <div className="actions"><button onClick={save}>Сохранить</button>{draft.status === 'pending' && <button className="primary" onClick={() => action(draft.id, 'approve')}>✓ Одобрить и отправить</button>}<button className="danger" onClick={() => action(draft.id, 'reject')}>Отклонить</button></div>}
+    {editable && <div className="actions"><button onClick={save} disabled={acting}>Сохранить</button>{['pending','failed'].includes(draft.status) && <button className="primary" disabled={acting} onClick={() => runAction('approve')}>{acting ? 'Отправляю…' : draft.status === 'failed' ? '↻ Повторить отправку' : '✓ Одобрить и отправить'}</button>}<button className="danger" disabled={acting} onClick={() => runAction('reject')}>Отклонить</button></div>}
   </article>;
 }
 
@@ -816,6 +1153,7 @@ function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify
   const [agentAnswer, setAgentAnswer] = useState('');
   const [agentBusy, setAgentBusy] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [signal, setSignal] = useState(0);
   const load = () => Promise.all([
     api(`/leads/${id}`),
     api(`/leads/${id}/agent`),
@@ -830,9 +1168,10 @@ function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify
   const lead = data.lead;
   const run = async (action: () => Promise<unknown>, message: string) => {
     setBusy(true);
-    try { await action(); notify(message); window.setTimeout(load, 1200); } catch (error) { notify((error as Error).message); } finally { setBusy(false); }
+    setSignal((value) => value + 1);
+    try { await action(); notify(message); window.setTimeout(load, 1200); } catch (error) { notify((error as Error).message); } finally { setBusy(false); setSignal((value) => value + 1); }
   };
-  const makeDraft = () => run(() => api(`/leads/${id}/draft`, { method: 'POST', body: '{}' }), 'Готовлю ответ — push придёт, когда он будет готов');
+  const makeDraft = () => run(() => api(`/leads/${id}/draft`, { method: 'POST', body: '{}' }), 'Запустил. Каждый шаг виден в блоке «Что сейчас делает система»');
   const saveDraft = () => run(() => api(`/drafts/${pending.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }), 'Правки сохранены');
   const approve = () => run(() => api(`/drafts/${pending.id}/approve`, { method: 'POST' }), 'Ответ одобрен и отправляется');
   const reject = () => run(() => api(`/drafts/${pending.id}/reject`, { method: 'POST' }), 'Ответ отклонён');
@@ -853,6 +1192,7 @@ function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify
   };
   return <section className="chatScreen"><button className="back" onClick={back}>← Все чаты</button><div className="pageTitle chatTitle"><div><span className="eyebrow">{lead.source === 'telegram' ? 'Диалог Telegram' : 'Диалог FL.ru'}</span><h1>{lead.title}</h1><p>{data.messages.length} сообщений · обновлён {relativeTime(lead.updated_at)}</p></div>{lead.url && <a className="button ghost" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
     <div className="chatWorkspace"><div className="conversationColumn">
+      <LiveActivity leadId={id} signal={signal} onIdle={load} title="Что сейчас делает система" />
       {pending ? <article className="replyReady"><div className="replyReadyHead"><div><span>Готово к отправке</span><h2>Ответ клиенту</h2></div><Status value={pending.status} /></div><textarea rows={7} value={content} onChange={(event) => setContent(event.target.value)} /><div className="actions"><button onClick={saveDraft} disabled={busy}>Сохранить правки</button><button className="primary" onClick={approve} disabled={busy}>✓ Одобрить и отправить</button><button className="danger" onClick={reject} disabled={busy}>Отклонить</button></div></article> : <div className="replyEmpty"><div><b>Нужно ответить клиенту?</b><small>Система подготовит ответ в вашем стиле. Без одобрения он не уйдёт.</small></div><button className="primary" onClick={makeDraft} disabled={busy}>{busy ? 'Готовлю…' : 'Подготовить ответ'}</button></div>}
       <Card title="Переписка" subtitle="Последние сообщения снизу"><div className="messageThread">{data.messages.length === 0 ? <Empty text="Сообщений пока нет" /> : data.messages.slice(-50).map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.direction === 'outbound' ? 'Вы' : 'Клиент'} · {new Date(message.created_at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</small><p>{message.content}</p></div>)}</div></Card>
     </div><aside className="chatContext"><Card title="Агент сделки" subtitle="Можно спрашивать обычными словами"><div className="contextFacts"><span>Стадия<b>{agent?.stage || '—'}</b></span><span>Интервью<b>{agent?.discoveryReadiness ?? 0}%</b></span><span>Готовность к разработке<b>{agent?.buildReadiness ?? 0}%</b></span></div>{agent?.nextAction && <p className="hint"><b>Следующий шаг:</b> {agent.nextAction}</p>}<textarea rows={3} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Например: что клиент хочет и какие вопросы ещё не закрыты?" /><button className="primary" disabled={agentBusy || !question.trim()} onClick={askAgent}>{agentBusy ? 'Анализирую…' : 'Спросить агента'}</button>{agentAnswer && <p className="pre">{agentAnswer}</p>}</Card><Card title="Заказ и условия"><div className="contextFacts"><span>Этап<b>{labelStatus(lead.status)}</b></span><span>Релевантность<b>{lead.score ?? '—'}/100</b></span><span>Цена<b>{money(lead.recommended_price)}</b></span><span>Срок<b>{lead.recommended_days ? `${lead.recommended_days} дней` : '—'}</b></span></div>{lead.description && lead.description !== 'Диалог FL.ru' && <details><summary>Описание заказа</summary><p className="pre">{lead.description}</p></details>}<div className="actions"><button onClick={() => run(() => api(`/leads/${id}/documents`, { method: 'POST', body: '{}' }), 'ТЗ, договор и пакет для Codex готовятся')}>Сформировать пакет проекта</button></div></Card><Card title="Правило отправки"><p className="hint">Рискованные ответы, цены, сроки и договорённости всегда требуют вашего подтверждения.</p></Card></aside></div>
@@ -861,15 +1201,24 @@ function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify
 
 function LeadDetail({ id, back, notify }: { id: string; back: () => void; notify: (text: string) => void }) {
   const [data, setData] = useState<any>();
+  const [signal, setSignal] = useState(0);
   const load = () => api(`/leads/${id}`).then(setData);
+  const reload = useCallback(() => { void load(); }, [id]);
   useEffect(() => { void load(); }, [id]);
   if (!data) return <Loading />;
   const lead = data.lead;
   const project = lead.requirements?.project || {};
-  const job = async (path: string, message: string) => { await api(`/leads/${id}/${path}`, { method: 'POST', body: '{}' }); notify(message); window.setTimeout(load, 1500); };
+  const job = async (path: string, message: string) => {
+    setSignal((value) => value + 1);
+    try { await api(`/leads/${id}/${path}`, { method: 'POST', body: '{}' }); notify(message); }
+    catch (error) { notify((error as Error).message); }
+    finally { setSignal((value) => value + 1); window.setTimeout(load, 1500); }
+  };
   return <section><button className="back" onClick={back}>← Назад</button><div className="pageTitle leadTitle"><div><span className="eyebrow">{labelStatus(lead.status)}</span><h1>{lead.title}</h1><p>{lead.source.toUpperCase()} · обновлён {relativeTime(lead.updated_at)}</p></div><Score value={lead.score} /></div>
     <div className="facts bigfacts"><span>Цена <b>{money(lead.recommended_price)}</b></span><span>Срок <b>{lead.recommended_days || '—'} дней</b></span><span>Уверенность <b>{lead.confidence ?? '—'}%</b></span></div>
-    <div className="actions wrap"><button onClick={() => job('analyze','Повторный анализ запущен')}>Обновить анализ</button><button onClick={() => job('draft','Черновик создаётся')}>Создать ответ</button><button className="primary" onClick={() => job('documents','ТЗ и данные договора создаются')}>Сформировать ТЗ</button>{lead.url && <a className="button" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
+    <div className="actions wrap"><button onClick={() => job('analyze','Запустил переоценку — шаги видно ниже')}>Обновить анализ</button><button onClick={() => job('draft','Запустил подготовку текста — шаги видно ниже')}>Создать ответ</button><button className="primary" onClick={() => job('documents','Запустил сборку ТЗ и договора — шаги видно ниже')}>Сформировать ТЗ</button>{lead.url && <a className="button" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
+    <p className="actionsHint">Работа идёт в фоне и занимает от нескольких секунд до нескольких минут. Ничего не отправляется клиенту без вашего одобрения.</p>
+    <LiveActivity leadId={id} signal={signal} onIdle={reload} title="Что сейчас делает система по этому заказу" />
     {project.detail_parsed_at && <div className="projectSignals"><span>Карточка проекта<b>прочитана полностью</b></span><span>Откликов<b>{project.response_count ?? '—'}</b></span><span>Вилка исполнителей<b>{project.response_price_min ? `${money(project.response_price_min)} — ${money(project.response_price_max)}` : '—'}</b></span><span>Вложений<b>{project.attachments?.length || 0}</b></span></div>}
     <div className="grid two"><Card title="Полное описание проекта"><p className="pre">{lead.description || '—'}</p>{project.attachments?.length > 0 && <div className="attachmentList"><h4>Вложения</h4>{project.attachments.map((file: any) => <div key={file.sha256}><b>{file.name}</b><small>{Math.ceil(file.size / 1024)} КБ · {file.extraction === 'image' ? 'изображение передано Codex' : file.extracted_text ? 'текст извлечён' : 'файл сохранён'}</small></div>)}</div>}</Card><Card title="Оценка Codex"><p>{lead.analysis?.fit_reason || 'Ещё не выполнена'}</p>{lead.analysis?.risks?.length > 0 && <><h4>Риски</h4><ul>{lead.analysis.risks.map((item: string) => <li key={item}>{item}</li>)}</ul></>}</Card></div>
     <Card title="Переписка">{data.messages.length === 0 ? <Empty text="Сообщений пока нет" /> : data.messages.map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.channel} · {new Date(message.created_at).toLocaleString('ru')}</small><p>{message.content}</p></div>)}</Card>
@@ -888,6 +1237,7 @@ function Settings({ notify }: { notify: (text: string) => void }) {
   useEffect(() => { void load(); }, []);
   if (!data) return <Loading />;
   const fl = data.connectors.find((item: any) => item.connector === 'fl') || {};
+  const telegramMonitoring = data.telegramMonitoring !== false;
   const saveProfile = async () => { await api('/settings/profile', { method: 'PATCH', body: JSON.stringify({ seller, style }) }); notify('Профиль сохранён'); };
   const connect = async (kind: string, body: unknown) => { try { await api(`/settings/${kind}`, { method: 'POST', body: JSON.stringify(body) }); notify(`${kind} подключён`); await load(); } catch (error) { notify((error as Error).message); } };
   const uploadContract = async () => { if (!contractTemplate) return; const form = new FormData(); form.append('template', contractTemplate); try { await api('/settings/contract-template', { method: 'POST', body: form }); notify('Шаблон договора сохранён'); await load(); } catch (error) { notify((error as Error).message); } };
@@ -895,6 +1245,7 @@ function Settings({ notify }: { notify: (text: string) => void }) {
     <div className="settingsGrid">
       <Card title="Push-уведомления" subtitle="О подходящем заказе и готовом черновике"><PushControl notify={notify} /></Card>
       <Card title="Автопоиск FL.ru" subtitle="Только новые проекты, один раз в 5 минут"><div className="settingStatus"><span className={fl.enabled ? 'dot ok' : 'dot'} /><b>{fl.enabled ? 'Включён' : 'На паузе'}</b></div><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={() => connect('fl', { enabled: !fl.enabled })}>{fl.enabled ? 'Остановить' : 'Включить мониторинг'}</button></Card>
+      <Card title="Мониторинг Telegram" subtitle="Входящие сообщения и подготовка ответов"><div className="settingStatus"><span className={telegramMonitoring ? 'dot ok' : 'dot'} /><b>{telegramMonitoring ? 'Включён' : 'На паузе'}</b></div><p className="hint">{telegramMonitoring ? 'Новые сообщения Telegram разбираются системой.' : 'Сообщения Telegram не читаются и задачи ИИ по ним не запускаются.'}</p><button className={telegramMonitoring ? 'danger soft' : 'primary'} onClick={() => connect('telegram', { enabled: !telegramMonitoring })}>{telegramMonitoring ? 'Остановить' : 'Включить мониторинг'}</button></Card>
     </div>
     <Card title="Ваше предложение" subtitle="Чем точнее заполнено, тем меньше лишних заказов"><div className="formgrid"><label>Имя<input value={seller.name || ''} onChange={(event) => setSeller({ ...seller, name: event.target.value })} /></label><label>Минимальная цена<input type="number" value={seller.minimum_price || ''} onChange={(event) => setSeller({ ...seller, minimum_price: Number(event.target.value) })} /></label><label>Telegram для клиентов<input placeholder="@username" value={seller.telegram_username || ''} onChange={(event) => setSeller({ ...seller, telegram_username: event.target.value })} /></label><label>Когда могу начать<input placeholder="например: с 10 августа" value={seller.available_from || ''} onChange={(event) => setSeller({ ...seller, available_from: event.target.value })} /></label><label className="wide">Услуги<textarea rows={4} value={seller.services || ''} onChange={(event) => setSeller({ ...seller, services: event.target.value })} /></label><label className="wide">Подтверждённые кейсы<textarea rows={4} value={seller.cases || ''} onChange={(event) => setSeller({ ...seller, cases: event.target.value })} /></label><label className="wide">Стиль общения<textarea rows={4} value={style.rules || ''} onChange={(event) => setStyle({ ...style, rules: event.target.value })} /></label></div><p className="hint">Если дату не указать, система не будет её выдумывать и покажет предупреждение перед отправкой отклика.</p><button className="primary" onClick={saveProfile}>Сохранить профиль</button></Card>
     <div className="settingsGrid">
@@ -962,13 +1313,13 @@ function PushControl({ notify, compact = false }: { notify: (text: string) => vo
 }
 
 function LeadRows({ leads, openLead }: { leads: any[]; openLead: (id: string) => void }) {
-  return <div className="leadrows">{leads.length === 0 ? <Empty text="Ничего не найдено" /> : leads.map((lead) => <button key={lead.id} onClick={() => openLead(lead.id)}><Score value={lead.score} /><div><b>{lead.title}</b><small><StatusDot status={lead.status} /> {labelStatus(lead.status)} · {relativeTime(lead.updated_at)}</small></div><span className="price">{money(lead.recommended_price)}</span><span className="chevron">›</span></button>)}</div>;
+  return <div className="leadrows">{leads.length === 0 ? <Empty text="Ничего не найдено" /> : leads.map((lead) => <button key={lead.id} onClick={() => openLead(lead.id)}><Score value={lead.score} /><div><b>{lead.title}</b><small><StatusDot status={lead.status} /> {labelStatus(lead.status)} · опубликован {relativeTime(lead.published_at || lead.created_at)}</small></div><span className="price">{money(lead.recommended_price)}</span><span className="chevron">›</span></button>)}</div>;
 }
 
 function StatusDot({ status }: { status: string }) { return <i className={`statusDot ${status}`} />; }
 function Metric({ label, value, tone = '', hint = '' }: any) { return <div className={`metric ${tone}`}><b>{value ?? 0}</b><span>{label}</span>{hint && <small>{hint}</small>}</div>; }
 function Score({ value }: { value: number | null }) { return <span className={`score ${(value || 0) >= 65 ? 'high' : (value || 0) >= 45 ? 'mid' : ''}`}>{value ?? '—'}</span>; }
-function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{({ pending:'Ждёт решения',approved:'Одобрено',sending:'Отправляется',failed:'Ошибка',stale:'Устарело' } as Record<string,string>)[value] || value}</span>; }
+function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{({ pending:'Ждёт решения',approved:'Одобрено',sending:'Отправляется',failed:'Ошибка отправки',stale:'Устарело',send_unknown:'Проверьте отправку' } as Record<string,string>)[value] || value}</span>; }
 function Card({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) { return <div className="card">{title && <div className="cardTitle"><h3>{title}</h3>{subtitle && <p>{subtitle}</p>}</div>}{children}</div>; }
 function Modal({ close, children }: { close: () => void; children: React.ReactNode }) { return <div className="modal" onMouseDown={close}><div onMouseDown={(event) => event.stopPropagation()}>{children}</div></div>; }
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }

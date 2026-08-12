@@ -544,3 +544,23 @@ ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS input_tokens integer;
 ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS output_tokens integer;
 ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS estimated_cost_usd numeric(12,6);
 ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS duration_ms integer;
+
+-- Every long operation the owner can start from the dashboard writes its own
+-- progress here.  Without this the interface can only say "готовлю…" and then
+-- stay silent for minutes while Codex works.
+CREATE TABLE IF NOT EXISTS job_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind text NOT NULL,
+  lead_id uuid REFERENCES leads(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'running' CHECK (status IN ('running','completed','failed')),
+  steps jsonb NOT NULL DEFAULT '[]'::jsonb,
+  result_text text,
+  error text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS job_runs_active_idx ON job_runs(status, started_at DESC);
+CREATE INDEX IF NOT EXISTS job_runs_lead_idx ON job_runs(lead_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS job_runs_recent_idx ON job_runs(started_at DESC);
