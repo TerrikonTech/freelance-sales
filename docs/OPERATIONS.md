@@ -50,6 +50,25 @@ sudo SALES_AI_BROKER=codex ./deploy.sh
 Не удаляйте volumes и не запускайте `docker system prune` как часть обычного
 обновления.
 
+### Единый источник кода
+
+Git commit, из которого собран production image, является источником истины для
+исходников и документации. Не поддерживайте параллельно отдельные live/publish
+копии вручную: сначала зафиксируйте проверенный код в Git, затем разворачивайте
+тот же commit. `.env`, `data`, `runtime`, volumes, cookies и внешняя Telegram
+state остаются вне Git и подключаются к checkout при развёртывании.
+
+После сборки зафиксируйте commit и путь Compose-проекта:
+
+```bash
+git rev-parse HEAD
+docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' freelance-sales-api-1
+```
+
+Имя контейнера зависит от Compose project name. Функциональный diff между
+развёрнутым checkout и опубликованным commit перед релизом должен быть пустым;
+build artifacts и эксплуатационные данные в это сравнение не входят.
+
 ## Команды состояния
 
 ```bash
