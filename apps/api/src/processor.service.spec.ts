@@ -1,4 +1,13 @@
 import { resolveDraftMode } from './processor.service';
+import { queueAttemptsFor, queuePriorityFor } from './queue.service';
+
+describe('latency-sensitive queue policy', () => {
+  test('puts discovery ahead of background and avoids pointless scan retries', () => {
+    expect(queuePriorityFor('scan-fl')).toBeLessThan(queuePriorityFor('analyze-lead'));
+    expect(queuePriorityFor('analyze-lead')).toBeLessThan(queuePriorityFor('health-watchdog'));
+    expect(queueAttemptsFor('scan-fl')).toBe(1);
+  });
+});
 
 describe('draft mode routing', () => {
   test('treats Telegram inbound messages as chat even without an FL dialog id', () => {

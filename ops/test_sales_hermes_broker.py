@@ -111,8 +111,12 @@ class HermesBrokerTests(unittest.TestCase):
         self.config = broker.Config(
             sales_api="http://127.0.0.1:8790/api/internal/codex",
             hermes_api="http://127.0.0.1:8642/v1",
+            mesh_api="http://127.0.0.1:9443/api/internal/sales",
             sales_token="s" * 64,
             hermes_key="h" * 64,
+            mesh_token=None,
+            mesh_mode="off",
+            mesh_timeout=60,
             runtime_dir=runtime,
             exchange_dir=exchange,
             documents_dir=documents,
@@ -127,6 +131,78 @@ class HermesBrokerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_mesh_route_requires_a_complex_proposal(self) -> None:
+        simple = {
+            "context": {
+                "lead": {
+                    "description": "Fix one CSS margin.",
+                    "recommended_price": 30_000,
+                }
+            }
+        }
+        self.assertEqual(broker.mesh_route_reasons("draft_compose", simple), [])
+
+        explicit_range = {
+            "context": {
+                "lead": {
+                    "description": "Нужна грубая вилка цены и предлагаемый стек.",
+                    "recommended_price": 100_000,
+                }
+            }
+        }
+        self.assertEqual(
+            broker.mesh_route_reasons("draft_compose", explicit_range),
+            ["buyer_requested_nonstandard_commercial_answer"],
+        )
+
+        complex_payload = {
+            "context": {
+                "lead": {
+                    "description": "FB-01 " + "x" * 1_600,
+                    "recommended_price": 750_000,
+                    "analysis": {
+                        "understanding": {
+                            "confirmed_scope": ["minimum"],
+                            "wishlist_or_future_scope": ["full"],
+                        }
+                    },
+                }
+            }
+        }
+        self.assertEqual(
+            broker.mesh_route_reasons("draft_compose", complex_payload),
+            [
+                "buyer_requested_nonstandard_commercial_answer",
+                "long_specification",
+                "high_value",
+                "multiple_scope_contours",
+            ],
+        )
+        self.assertEqual(broker.mesh_route_reasons("lead_analysis", complex_payload), [])
+
+    def test_mesh_timeout_cancels_the_team_run_before_fallback(self) -> None:
+        config = replace(
+            self.config,
+            mesh_token="m" * 64,
+            mesh_mode="prefer",
+            mesh_timeout=0,
+        )
+        http = FakeHttp(
+            [
+                {"run_id": "run_" + "b" * 32, "state": "queued"},
+                {"run_id": "run_" + "b" * 32, "state": "cancelled"},
+            ]
+        )
+        client = broker.MeshClient(config, http)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(broker.BrokerError, "timeout"):
+            client.run(
+                "task-mesh-timeout",
+                "draft_compose",
+                {"context": {"lead": {"description": "FB-01"}}},
+                ["buyer_requested_nonstandard_commercial_answer"],
+            )
+        self.assertEqual([request["method"] for request in http.requests], ["POST", "DELETE"])
 
     def test_loopback_validation_rejects_external_and_credentials(self) -> None:
         with self.assertRaises(broker.BrokerError):

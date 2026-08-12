@@ -426,12 +426,18 @@ export class TelegramService {
     return { ok: true };
   }
 
+  async monitoringEnabled(): Promise<boolean> {
+    const value = await this.settings.getPublic<{ enabled?: boolean }>('telegram_monitoring');
+    return value?.enabled !== false;
+  }
+
   async verifyWebhookSecret(header: string | undefined) {
     const expected = await this.settings.getSecret('telegram_webhook_secret');
     return Boolean(expected && header && expected === header);
   }
 
   async processUpdate(update: Record<string, any>) {
+    if (!(await this.monitoringEnabled())) return;
     const ownerMessage = update.message || update.edited_message;
     if (ownerMessage?.chat?.id) {
       const owner = await this.settings.getPublic<{ id?: number }>('telegram_owner');
@@ -534,6 +540,9 @@ export class TelegramService {
       voice?: boolean;
     }>,
   ) {
+    if (!(await this.monitoringEnabled())) {
+      return { inserted: 0, queued: 0, disabled: true };
+    }
     let insertedCount = 0;
     let queuedCount = 0;
     for (const item of items.slice(0, 500)) {

@@ -181,3 +181,51 @@ describe('AiService analyzer optimization', () => {
     expect(result.pricing_modifiers).toEqual([]);
   });
 });
+
+
+describe('AiService proposal latency', () => {
+  test('creates a first proposal with exactly one AI task', async () => {
+    const tasks = {
+      run: jest.fn().mockResolvedValue({
+        content: 'Добрый день!\n\nГотов взяться, опыт с такими задачами есть.\n\nЯ делал похожий проект, https://www.fl.ru/user/test/portfolio/1/. У вас важно заранее проверить обмен данными. Я проверю его на реальных сценариях.\n\nОриентировочно выходит 100000 рублей и 20 дней, это исходя из того, как я понял задачу по описанию. Что у вас уже готово? Готов ответить на вопросы в чате.',
+        human_score: 90,
+        sales_score: 90,
+        specificity_score: 95,
+        factual_score: 100,
+        issues: [],
+      }),
+    };
+    const settings = {
+      getPublic: jest.fn().mockImplementation((key: string) => {
+        if (key === 'seller_profile') return Promise.resolve({});
+        if (key === 'style_profile') return Promise.resolve({});
+        if (key === 'fl_portfolio_cases') return Promise.resolve([{
+          title: 'Похожий проект',
+          description: 'Сервис с обменом данными и проверкой реальных сценариев.',
+          url: 'https://www.fl.ru/user/test/portfolio/1/',
+        }]);
+        return Promise.resolve(null);
+      }),
+    };
+    const db = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const optimized = new AiService(settings as never, tasks as never, db as never);
+
+    await optimized.draftReply({
+      mode: 'response',
+      lead: {
+        id: 'lead-1',
+        source: 'fl',
+        title: 'Интеграция данных',
+        description: 'Нужно связать две системы и проверить обмен данными на реальных сценариях.',
+        recommended_price: 100000,
+        recommended_days: 20,
+        analysis: { confidence: 85 },
+        requirements: {},
+      },
+      messages: [],
+    }).catch(() => undefined);
+
+    expect(tasks.run).toHaveBeenCalledTimes(1);
+    expect(tasks.run).toHaveBeenCalledWith('draft_compose', expect.any(Object));
+  });
+});

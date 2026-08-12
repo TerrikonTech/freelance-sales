@@ -8,6 +8,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
+import { JobProgressService } from './job-progress.service';
 import { SettingsService } from './settings.service';
 
 const IMAGE_MODEL = 'gpt-image-2';
@@ -90,6 +91,7 @@ export class DesignConceptService {
     private readonly db: DatabaseService,
     private readonly settings: SettingsService,
     private readonly tasks: CodexTaskService,
+    private readonly progress: JobProgressService,
   ) {}
 
   async configured(): Promise<boolean> {
@@ -148,6 +150,7 @@ export class DesignConceptService {
       ? await this.renderWithOpenAi(apiKey as string, brief.image_prompt, count)
       : await this.renderWithCodex(brief, lead, count);
     if (!renders.length) throw new Error('Генерация не вернула ни одного изображения');
+    await this.progress.advance('save', 'Сохраняю изображения', `вариантов ${renders.length}`);
     const generatedRoot = join(this.root, 'design-concepts', leadId);
     await mkdir(generatedRoot, { recursive: true, mode: 0o700 });
     const assets: DesignAsset[] = [];
@@ -261,6 +264,7 @@ export class DesignConceptService {
           total: count,
           canvas: { width: MOCKUP_WIDTH, height: MOCKUP_HEIGHT },
         }, 8 * 60_000);
+        await this.progress.advance('render', 'Рендерю PNG в Chromium', `вариант ${variant} из ${count}`);
         renders.push({
           buffer: await this.renderHtmlToPng(page.html),
           label: String(page.label || `Вариант ${variant}`).slice(0, 200),
@@ -281,6 +285,7 @@ export class DesignConceptService {
     prompt: string,
     count: number,
   ): Promise<Array<{ buffer: Buffer; label: string; model: string }>> {
+    await this.progress.advance('render', 'Рисую изображения', 'через OpenAI Images');
     const body = await this.callImageApi(apiKey, prompt, count);
     const items = Array.isArray(body.data) ? body.data.slice(0, count) : [];
     return items.map((item: Record<string, unknown>, index: number) => ({

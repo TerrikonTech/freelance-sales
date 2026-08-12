@@ -10,6 +10,7 @@ import { DatabaseService } from './database.service';
 import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
+import { JobProgressService } from './job-progress.service';
 import { QueueService } from './queue.service';
 import { PresenceProfile } from './research-controls';
 import { ResearchService } from './research.service';
@@ -33,6 +34,7 @@ export class AppController {
     private readonly sandbox: SandboxService,
     private readonly autonomy: AutonomyService,
     private readonly research: ResearchService,
+    private readonly progress: JobProgressService,
   ) {}
 
   @Get('health')
@@ -104,6 +106,24 @@ export class AppController {
     return { metrics: counts.rows[0], recent: recent.rows, connectors, scan: scan.rows[0], architecture: architecture.rows[0], research };
   }
 
+  /**
+   * What the system is doing at this exact second.  The dashboard polls this every
+   * couple of seconds so a pressed button never looks like it did nothing.
+   */
+  @Get('activity')
+  @UseGuards(AuthGuard)
+  async activity(@Query('leadId') leadId?: string, @Query('scope') scope?: string) {
+    const feed = await this.progress.feed({
+      leadId: leadId || undefined,
+      includeSandbox: scope === 'all' || Boolean(leadId),
+      limit: leadId ? 8 : 12,
+    });
+    const queued = await this.db.query<{ waiting: string }>(
+      `SELECT count(*)::text AS waiting FROM ai_tasks WHERE status IN ('pending','claimed')`,
+    );
+    return { ...feed, aiQueue: Number(queued.rows[0]?.waiting || 0) };
+  }
+
   @Get('research/overview')
   @UseGuards(AuthGuard)
   async researchOverview() {
@@ -116,10 +136,42 @@ export class AppController {
     return this.research.setPresenceProfile(body);
   }
 
+  @Get('live-events')
+  @UseGuards(AuthGuard)
+  async liveEvents() {
+    const [lead, draft, message] = await Promise.all([
+      this.db.query(`SELECT id,title,created_at
+        FROM leads WHERE source='fl' AND source<>'sandbox' AND status<>'archived'
+        ORDER BY created_at DESC LIMIT 1`),
+      this.db.query(`SELECT d.id,d.lead_id,l.title,d.created_at
+        FROM drafts d JOIN leads l ON l.id=d.lead_id
+        WHERE l.source<>'sandbox' AND d.channel='fl' AND d.status='pending'
+        ORDER BY d.created_at DESC LIMIT 1`),
+      this.db.query(`SELECT m.id,m.lead_id,l.title,m.content,m.created_at
+        FROM messages m JOIN leads l ON l.id=m.lead_id
+        WHERE l.source<>'sandbox' AND m.channel='fl' AND m.direction='inbound'
+        ORDER BY m.created_at DESC LIMIT 1`),
+    ]);
+    return {
+      serverTime: new Date().toISOString(),
+      lead: lead.rows[0] || null,
+      draft: draft.rows[0] || null,
+      message: message.rows[0] || null,
+    };
+  }
+
   @Get('leads')
   @UseGuards(AuthGuard)
   async leads() {
-    return (await this.db.query("SELECT id,title,source,status,score,confidence,recommended_price,recommended_days,budget_text,url,updated_at FROM leads WHERE status<>'archived' AND source<>'sandbox' ORDER BY updated_at DESC LIMIT 300")).rows;
+    return (await this.db.query(`SELECT
+      id,title,source,status,score,confidence,recommended_price,recommended_days,
+      budget_text,url,created_at,updated_at,
+      COALESCE(
+        NULLIF(requirements->'project'->>'published_at','')::timestamptz,
+        created_at
+      ) AS published_at
+      FROM leads WHERE status<>'archived' AND source<>'sandbox'
+      ORDER BY published_at DESC LIMIT 300`)).rows;
   }
 
   @Get('chats')
@@ -407,7 +459,7 @@ export class AppController {
       const result = await client.query(`SELECT d.*,l.last_inbound_message_id FROM drafts d JOIN leads l ON l.id=d.lead_id WHERE d.id=$1 FOR UPDATE`, [id]);
       const draft = result.rows[0];
       if (!draft) throw new NotFoundException();
-      if (draft.status !== 'pending') throw new ConflictException('Черновик уже обработан');
+      if (!['pending', 'failed'].includes(String(draft.status))) throw new ConflictException('Черновик уже обработан');
       if ((draft.source_last_message_id || null) !== (draft.last_inbound_message_id || null)) {
         await client.query("UPDATE drafts SET status='stale',updated_at=now() WHERE id=$1", [id]);
         throw new ConflictException('Появилось новое сообщение — нужен свежий ответ');
@@ -417,7 +469,7 @@ export class AppController {
       await client.query("INSERT INTO activities(lead_id,actor,action,details) VALUES($1,$2,'draft_approved',$3)", [draft.lead_id, req.user!.email, JSON.stringify({ draftId: id, hash: draft.content_hash })]);
       return draft;
     });
-    await this.queue.add('send-draft', { draftId: id }, `send-${id}`);
+    await this.queue.add('send-draft', { draftId: id }, `send-${id}-${Date.now()}`);
     await this.autonomy.recordOwnerFeedback(id, 'approved');
     return { queued: true, hash: approved.content_hash };
   }
@@ -447,13 +499,21 @@ export class AppController {
   @Get('settings')
   @UseGuards(AuthGuard)
   async getSettings() {
-    const [seller, style, connectors, telegram, fl, images, contractTemplate, flCookies] = await Promise.all([
+    const [seller, style, connectors, telegram, fl, images, contractTemplate, flCookies, telegramMonitoring] = await Promise.all([
       this.settings.getPublic('seller_profile'), this.settings.getPublic('style_profile'), this.settings.connectorSummary(),
       this.settings.getSecret('telegram_bot_token'), this.settings.getSecret('fl_cookies'),
       this.design.configured(), this.documents.hasContractTemplate(), this.fl.cookieStatus(),
+      this.settings.getPublic<{ enabled?: boolean }>('telegram_monitoring'),
     ]);
     const codex = connectors.find((item) => String(item.connector) === 'codex');
-    return { seller: seller || {}, style: style || {}, connectors, flCookies, configured: { codex: Boolean(codex?.healthy), telegram: Boolean(telegram), fl: Boolean(fl), images: Boolean(images), contractTemplate } };
+    return {
+      seller: seller || {},
+      style: style || {},
+      connectors,
+      flCookies,
+      telegramMonitoring: telegramMonitoring?.enabled !== false,
+      configured: { codex: Boolean(codex?.healthy), telegram: Boolean(telegram), fl: Boolean(fl), images: Boolean(images), contractTemplate },
+    };
   }
 
   @Patch('settings/profile')
@@ -482,11 +542,23 @@ export class AppController {
 
   @Post('settings/telegram')
   @UseGuards(AuthGuard)
-  async configureTelegram(@Body() body: { botToken?: string }) {
-    if (!body.botToken?.includes(':')) throw new ConflictException('Некорректный bot token');
-    await this.settings.setSecret('telegram_bot_token', body.botToken.trim());
-    await this.settings.setSecret('telegram_webhook_secret', randomBytes(32).toString('hex'));
-    return this.telegram.configureWebhook();
+  async configureTelegram(@Body() body: { botToken?: string; enabled?: boolean }) {
+    const botToken = String(body.botToken || '').trim();
+    if (body.botToken !== undefined && !botToken.includes(':')) {
+      throw new ConflictException('Некорректный bot token');
+    }
+    if (!botToken && typeof body.enabled !== 'boolean') {
+      throw new ConflictException('Укажите bot token или состояние мониторинга');
+    }
+    const monitoringEnabled = body.enabled ?? Boolean(botToken);
+    await this.settings.setPublic('telegram_monitoring', { enabled: monitoringEnabled });
+    if (botToken) {
+      await this.settings.setSecret('telegram_bot_token', botToken);
+      await this.settings.setSecret('telegram_webhook_secret', randomBytes(32).toString('hex'));
+      const result = await this.telegram.configureWebhook();
+      return { ...result, monitoringEnabled };
+    }
+    return { ok: true, monitoringEnabled };
   }
 
   @Post('settings/images')
@@ -519,8 +591,11 @@ export class AppController {
   @Post('connectors/fl/scan')
   @UseGuards(AuthGuard)
   async scanFl() {
-    const [projects, chats] = await Promise.all([this.fl.scan({ force: true }), this.fl.syncChats()]);
-    return { projects, chats };
+    return this.progress.track('scan-fl', { title: 'Проверяю FL.ru по вашей команде' }, async () => {
+      const [projects, chats] = await Promise.all([this.fl.scan({ force: true }), this.fl.syncChats()]);
+      await this.progress.describe(`Найдено ${projects.found ?? 0}, новых ${projects.created ?? 0}`);
+      return { projects, chats };
+    });
   }
 
   @Get('documents/:id/download')

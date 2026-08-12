@@ -44,7 +44,7 @@ describe('Design concept safety', () => {
         rows: [{ file_path: '/tmp/freelance-sales-design-test/design-concepts/asset.png', content_type: 'image/png' }],
       }),
     };
-    const service = new DesignConceptService(db as never, {} as never, {} as never);
+    const service = new DesignConceptService(db as never, {} as never, {} as never, {} as never);
     const url = new URL(service.publicAssetUrl('4b99902e-2fc4-4dc8-92b4-8a20c8d9897b', 120));
     await expect(service.publicAsset(
       '4b99902e-2fc4-4dc8-92b4-8a20c8d9897b',
@@ -78,7 +78,7 @@ describe('Design engine selection', () => {
   test('Codex needs no OpenAI key and costs nothing extra', async () => {
     delete process.env.DESIGN_ENGINE;
     const settings = { getSecret: jest.fn().mockResolvedValue(null) };
-    const service = new DesignConceptService({} as never, settings as never, {} as never);
+    const service = new DesignConceptService({} as never, settings as never, {} as never, {} as never);
     await expect(service.configured()).resolves.toBe(true);
     expect(service.estimate(4)).toBe(0);
     expect(settings.getSecret).not.toHaveBeenCalled();
@@ -87,7 +87,7 @@ describe('Design engine selection', () => {
   test('the OpenAI engine still demands its key and reports a price', async () => {
     process.env.DESIGN_ENGINE = 'openai';
     const settings = { getSecret: jest.fn().mockResolvedValue(null) };
-    const service = new DesignConceptService({} as never, settings as never, {} as never);
+    const service = new DesignConceptService({} as never, settings as never, {} as never, {} as never);
     await expect(service.configured()).resolves.toBe(false);
     expect(service.estimate(4)).toBeGreaterThan(0);
   });

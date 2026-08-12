@@ -1,13 +1,20 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { JobProgressService } from './job-progress.service';
 import { SettingsService } from './settings.service';
 
 @Injectable()
 export class CodexTaskService {
-  constructor(private readonly db: DatabaseService, private readonly settings: SettingsService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly settings: SettingsService,
+    private readonly progress: JobProgressService,
+  ) {}
 
   async run<T>(kind: string, payload: Record<string, unknown>, timeoutMs = 20 * 60_000): Promise<T> {
-    const modelTier = ['owner_query', 'owner_overview', 'draft_strategy', 'draft_review', 'conversation_turn'].includes(kind)
+    // The owner sees this stage light up the moment the AI call starts.
+    await this.progress.advanceForAiKind(kind).catch(() => undefined);
+    const modelTier = ['owner_query', 'owner_overview', 'draft_compose', 'draft_strategy', 'draft_review', 'conversation_turn'].includes(kind)
       ? 'smart'
       : 'fast';
     const created = await this.db.query<{ id: string }>(
@@ -16,12 +23,29 @@ export class CodexTaskService {
     );
     const id = created.rows[0].id;
     const deadline = Date.now() + timeoutMs;
+    const startedAt = Date.now();
+    let lastBeat = Date.now();
+    let queueReported = false;
+    let startReported = false;
     while (Date.now() < deadline) {
       const task = (await this.db.query<{ status: string; result: T | null; error: string | null }>(
         'SELECT status,result,error FROM ai_tasks WHERE id=$1', [id],
       )).rows[0];
       if (task?.status === 'completed' && task.result) return task.result;
       if (task?.status === 'failed') throw new Error(task.error || 'Codex не выполнил задачу');
+      // Waiting on a busy AI worker looks identical to a hang from the outside.
+      // Say which of the two is happening.
+      if (task?.status === 'claimed' && !startReported) {
+        startReported = true;
+        await this.progress.note('ИИ пишет ответ').catch(() => undefined);
+      } else if (task?.status === 'pending' && !queueReported && Date.now() - startedAt > 8_000) {
+        queueReported = true;
+        await this.progress.note('жду свободный ИИ-воркер').catch(() => undefined);
+      }
+      if (Date.now() - lastBeat > 15_000) {
+        lastBeat = Date.now();
+        await this.progress.touch().catch(() => undefined);
+      }
       await new Promise((resolve) => setTimeout(resolve, 1_500));
     }
     await this.db.query("UPDATE ai_tasks SET status='failed',error='Время ожидания Codex истекло',updated_at=now() WHERE id=$1 AND status IN ('pending','claimed')", [id]);
@@ -36,9 +60,14 @@ export class CodexTaskService {
          ORDER BY CASE kind
            WHEN 'owner_query' THEN 0
            WHEN 'owner_overview' THEN 0
+           WHEN 'draft_compose' THEN 1
            WHEN 'draft_review' THEN 1
            WHEN 'draft_candidates' THEN 2
+           -- A draft the owner is waiting for must not queue behind a burst of
+           -- background lead scoring; draft_strategy opens that chain.
+           WHEN 'draft_strategy' THEN 2
            WHEN 'draft_reply' THEN 3
+           WHEN 'conversation_turn' THEN 3
            ELSE 4
          END, created_at
          FOR UPDATE SKIP LOCKED LIMIT 1

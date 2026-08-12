@@ -14,7 +14,6 @@
 | `docker-compose.yml` | production-like services и safety flags |
 | `deploy.sh` | первичная установка, build, health и выбор broker |
 | `.env.example` | перечень конфигурации без секретных значений |
-| `docs/CONFIGURATION.md` | runtime-переменные, режимы и источники секретов |
 | `docs/RESEARCH_ROADMAP.md` | реализация исследования и safety gates фаз 0–3 |
 
 ## `apps/api/src`

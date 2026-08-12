@@ -1,13 +1,14 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { Job, Worker } from 'bullmq';
+import { Job, UnrecoverableError, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { createHash } from 'node:crypto';
-import { AiService } from './ai.service';
+import { AiService, ProposalQualityError } from './ai.service';
 import { AutonomyService } from './autonomy.service';
 import { DatabaseService } from './database.service';
 import { DesignConceptService } from './design-concept.service';
 import { DocumentsService } from './documents.service';
 import { FlService } from './fl.service';
+import { JobProgressService } from './job-progress.service';
 import { QueueService } from './queue.service';
 import { followupInstruction } from './research-controls';
 import { ResearchService } from './research.service';
@@ -32,10 +33,12 @@ export class ProcessorService implements OnModuleDestroy {
   private readonly logger = new Logger(ProcessorService.name);
   private worker?: Worker;
   private scanTimer?: NodeJS.Timeout;
+  private portfolioTimer?: NodeJS.Timeout;
   private chatTimer?: NodeJS.Timeout;
   private announceTimer?: NodeJS.Timeout;
   private researchTimer?: NodeJS.Timeout;
   private connection?: IORedis;
+  private scanInProgress = false;
 
   constructor(
     private readonly db: DatabaseService,
@@ -49,9 +52,13 @@ export class ProcessorService implements OnModuleDestroy {
     private readonly autonomy: AutonomyService,
     private readonly salesAgent: SalesAgentService,
     private readonly research: ResearchService,
+    private readonly progress: JobProgressService,
   ) {}
 
   async start() {
+    await this.progress.sweep().catch((error) => this.logger.warn(
+      `Progress sweep skipped: ${error instanceof Error ? error.message : 'unknown'}`,
+    ));
     await this.recoverAmbiguousDeliveries();
     this.connection = new IORedis(process.env.REDIS_URL || 'redis://redis:6379', { maxRetriesPerRequest: null });
     this.worker = new Worker('sales', (job) => this.process(job), {
@@ -62,7 +69,8 @@ export class ProcessorService implements OnModuleDestroy {
       maxStalledCount: 1,
     });
     this.worker.on('failed', (job, error) => this.logger.error(`Job ${job?.name || 'unknown'} failed: ${error.message}`));
-    const scanInterval = Math.max(60, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 120)) * 1_000;
+    const scanInterval = Math.max(15, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 30)) * 1_000;
+    const portfolioCheckInterval = 30 * 60_000;
     const chatInterval = Math.max(60, Number(process.env.FL_CHAT_SCAN_INTERVAL_SECONDS || 300)) * 1_000;
     const scheduleScan = async () => {
       const bucket = Math.floor(Date.now() / scanInterval);
@@ -72,9 +80,14 @@ export class ProcessorService implements OnModuleDestroy {
       const bucket = Math.floor(Date.now() / chatInterval);
       await this.queue.add('sync-fl-chats', {}, `sync-fl-chats-${bucket}`).catch((error) => this.logger.warn(error.message));
     };
+    const schedulePortfolio = async () => {
+      const bucket = Math.floor(Date.now() / portfolioCheckInterval);
+      await this.queue.add('sync-fl-portfolio', {}, `sync-fl-portfolio-${bucket}`).catch((error) => this.logger.warn(error.message));
+    };
     this.scanTimer = setInterval(scheduleScan, scanInterval);
     this.chatTimer = setInterval(scheduleChats, chatInterval);
-    await Promise.all([scheduleScan(), scheduleChats()]);
+    this.portfolioTimer = setInterval(schedulePortfolio, portfolioCheckInterval);
+    await Promise.all([scheduleScan(), scheduleChats(), schedulePortfolio()]);
     // The owner's own session finishes handed-off sends, so nothing in this process
     // ever learns the outcome. Poll fast and keep the promise the bot already made.
     this.announceTimer = setInterval(
@@ -173,9 +186,61 @@ export class ProcessorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Background jobs the owner starts by hand get a visible progress row; the periodic
+   * housekeeping ones do not, so the feed stays readable.
+   */
+  private static readonly TRACKED_JOBS = new Set([
+    'analyze-lead', 'draft-reply', 'generate-documents', 'generate-design', 'send-draft', 'owner-command',
+  ]);
+
+  /**
+   * Failures that will repeat identically no matter how often they are replayed.
+   * BullMQ retries a draft three times, so treating these as transient made the owner
+   * wait roughly ten minutes for an outcome that was already decided in the first three.
+   */
+  private static readonly PERMANENT_FAILURES = [
+    'exceeds the Hermes input limit',
+    'exceed the Hermes instruction limit',
+    'не прошёл финальную проверку качества',
+    'не поддерживается',
+    'Текст изменён после одобрения',
+    'Состав изображений изменён после одобрения',
+  ];
+
+  static isPermanentFailure(message: string) {
+    return ProcessorService.PERMANENT_FAILURES.some((marker) => message.includes(marker));
+  }
+
   async process(job: Job) {
+    if (!ProcessorService.TRACKED_JOBS.has(job.name)) return this.run(job);
+    const leadId = await this.jobLeadId(job);
+    try {
+      return await this.progress.track(job.name, { leadId }, () => this.run(job));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      if (ProcessorService.isPermanentFailure(message)) {
+        this.logger.warn(`Job ${job.name} failed permanently, replay disabled: ${message}`);
+        throw new UnrecoverableError(message);
+      }
+      throw error;
+    }
+  }
+
+  private async jobLeadId(job: Job): Promise<string | null> {
+    const direct = String(job.data?.leadId || '');
+    if (direct) return direct;
+    const draftId = String(job.data?.draftId || '');
+    if (!draftId) return null;
+    const row = await this.db.query<{ lead_id: string }>('SELECT lead_id FROM drafts WHERE id=$1', [draftId])
+      .catch(() => ({ rows: [] as Array<{ lead_id: string }> }));
+    return row.rows[0]?.lead_id || null;
+  }
+
+  private async run(job: Job) {
     switch (job.name) {
-      case 'scan-fl': return this.fl.scan();
+      case 'scan-fl': return this.scanFl();
+      case 'sync-fl-portfolio': return this.fl.syncPortfolioIfDue();
       case 'sync-fl-chats': {
         const result = await this.fl.syncChats();
         for (const alert of result.alerts || []) {
@@ -205,6 +270,16 @@ export class ProcessorService implements OnModuleDestroy {
       case 'process-followups': return this.processFollowups();
       case 'health-watchdog': return this.healthWatchdog();
       default: throw new Error(`Unknown job ${job.name}`);
+    }
+  }
+
+  private async scanFl() {
+    if (this.scanInProgress) return { skipped: true, reason: 'scan_in_progress' };
+    this.scanInProgress = true;
+    try {
+      return await this.fl.scan();
+    } finally {
+      this.scanInProgress = false;
     }
   }
 
@@ -289,6 +364,11 @@ export class ProcessorService implements OnModuleDestroy {
       const analysis = localAnalysis || await this.ai.analyzeLead(lead);
       const analysisMode = localAnalysis ? 'local_prefilter' : 'gpt_single_pass';
       const shouldRespond = analysis.should_respond && analysis.score >= Number(process.env.MIN_LEAD_SCORE || 65);
+      await this.progress.advance(
+        'save',
+        'Сохраняю оценку и решаю, подходит ли заказ',
+        `${analysis.score}/100 · ${shouldRespond ? 'подходит' : 'отсеян'}`,
+      );
       const storedAnalysis = {
         ...analysis,
         analyzer: {
@@ -370,6 +450,7 @@ export class ProcessorService implements OnModuleDestroy {
       return;
     }
     const mode = resolveDraftMode(channel, requestedMode, Boolean(lead.client?.fl_dialog_id));
+    await this.progress.retitle(mode === 'response' ? 'Готовлю отклик на заказ' : 'Готовлю ответ клиенту в чат');
     // A live mission both steers the wording ("reply in Elvish") and unlocks autonomy
     // for this one lead.  Owner instructions typed right now still win over it.
     const mission = await this.autonomy.missionRuntime(leadId);
@@ -386,13 +467,26 @@ export class ProcessorService implements OnModuleDestroy {
     const agentTurn = mode === 'chat' && !effectiveInstructions
       ? await this.salesAgent.prepareTurn(leadId, channel)
       : null;
-    const content = agentTurn?.reply
-      || await this.ai.draftReply({
-        lead,
-        messages: messages.rows,
-        mode,
-        ownerInstructions: effectiveInstructions.slice(0, 4_000),
-      });
+    // A draft that fails the automatic style checks is still worth showing: the owner
+    // reads it, fixes a sentence or regenerates, instead of waiting minutes for nothing.
+    let qualityIssues: string[] = [];
+    let content = agentTurn?.reply || '';
+    if (!content) {
+      try {
+        content = await this.ai.draftReply({
+          lead,
+          messages: messages.rows,
+          mode,
+          ownerInstructions: effectiveInstructions.slice(0, 4_000),
+        });
+      } catch (error) {
+        if (!(error instanceof ProposalQualityError)) throw error;
+        content = error.content;
+        qualityIssues = error.issues;
+        await this.progress.note('автопроверка нашла замечания — сохраню черновик с пометкой');
+        this.logger.warn(`Draft for lead ${leadId} kept with ${qualityIssues.length} quality warnings`);
+      }
+    }
     const proposalReview = mode === 'response'
       ? await this.ai.proposalReviewContext(lead, content)
       : null;
@@ -440,7 +534,9 @@ export class ProcessorService implements OnModuleDestroy {
                 ...(proposalReview.technologyFit.risk === 'elevated' ? ['technology_fit_unverified'] : []),
                 ...(!proposalReview.availabilityConfigured ? ['availability_missing'] : []),
                 ...(!proposalReview.voiceprint.ready ? ['voiceprint_insufficient'] : []),
+                ...(qualityIssues.length ? ['style_check_failed'] : []),
               ],
+              quality_issues: qualityIssues,
             }
             : null,
         }
@@ -476,6 +572,7 @@ export class ProcessorService implements OnModuleDestroy {
         return;
       }
     }
+    await this.progress.advance('save', 'Сохраняю черновик — он ждёт вашего решения');
     const inserted = await this.db.query<{ id: string }>(
       `INSERT INTO drafts(lead_id,kind,channel,target_external_id,content,content_hash,source_last_message_id,metadata)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
@@ -668,6 +765,7 @@ export class ProcessorService implements OnModuleDestroy {
       this.ai.generateContractData(context),
       this.salesAgent.buildCodexHandoff(leadId),
     ]);
+    await this.progress.advance('save', 'Сохраняю документы');
     const versionResult = await this.db.query<{ version: number }>('SELECT COALESCE(max(version),0)+1 AS version FROM documents WHERE lead_id=$1 AND kind=$2', [leadId, 'specification']);
     const version = Number(versionResult.rows[0].version);
     const path = await this.docs.writeDocx(leadId, 'specification', version, markdown);
@@ -844,6 +942,11 @@ export class ProcessorService implements OnModuleDestroy {
     }
 
     try {
+      await this.progress.advance(
+        'send',
+        'Отправляю в канал клиента',
+        draft.channel === 'telegram' ? 'Telegram' : 'FL.ru',
+      );
       let externalId: string | null = null;
       if (draft.channel === 'telegram') {
         const mediaAssetIds = Array.isArray(draft.metadata?.mediaAssetIds)
@@ -865,6 +968,7 @@ export class ProcessorService implements OnModuleDestroy {
       } else {
         throw new Error(`Канал ${draft.channel} не поддерживается`);
       }
+      await this.progress.advance('confirm', 'Записываю результат в журнал доставок', 'отправлено');
       await this.db.transaction(async (client) => {
         await client.query(
           `UPDATE outbound_deliveries SET status='sent',external_id=$2,completed_at=now(),updated_at=now()
@@ -945,6 +1049,7 @@ export class ProcessorService implements OnModuleDestroy {
 
   async onModuleDestroy() {
     if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.portfolioTimer) clearInterval(this.portfolioTimer);
     if (this.chatTimer) clearInterval(this.chatTimer);
     if (this.announceTimer) clearInterval(this.announceTimer);
     if (this.researchTimer) clearInterval(this.researchTimer);

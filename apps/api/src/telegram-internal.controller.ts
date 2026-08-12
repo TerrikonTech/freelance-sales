@@ -80,6 +80,9 @@ export class TelegramInternalController {
     },
   ) {
     this.authorize(token);
+    if (!(await this.telegram.monitoringEnabled())) {
+      return { queued: false, disabled: true };
+    }
     const ownerId = Number(body.ownerId);
     const chatId = Number(body.chatId);
     const messageId = Number(body.messageId);

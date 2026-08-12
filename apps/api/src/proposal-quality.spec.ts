@@ -5,7 +5,7 @@ import {
   proposalFinalBlockingIssues,
   proposalHumanityMetrics,
   proposalHumanityWarnings,
-  proposalOpeningSeed,
+  proposalOpeningPlan,
   proposalProfileForLead,
   proposalResearchIssues,
   proposalTechnologyFitContext,
@@ -42,29 +42,104 @@ describe('proposal inputs', () => {
     expect(proposalProfileForLead({ description: 'Мобильный интернет-магазин с каталогом, корзиной и заказами'.repeat(5), recommended_price: 1_200_000 })).toBe('premium');
   });
 
-  test('rejects the old short paraphrase that has no plan or acceptance criterion', () => {
+  test('a bare paraphrase is rejected for missing the proof and the gotcha', () => {
     const issues = proposalResearchIssues(
       'Здравствуйте. Telegram и MAX подключу к одной регистрации, чтобы данные не расходились. Доступ к API уже есть?',
       'standard',
     );
-    expect(issues.join(' ')).toContain('100–200 слов');
-    expect(issues.join(' ')).toContain('критерий приёмки');
-    expect(issues.join(' ')).toContain('микро-план');
+    expect(issues.join(' ')).toContain('70–130 слов');
+    expect(issues.join(' ')).toContain('делал похожий проект');
+    expect(issues.join(' ')).toContain('ссылку на свой кейс');
+    expect(issues.join(' ')).toContain('затык');
+    // The owner cut these out of the shape, so their absence must no longer be an issue.
+    expect(issues.join(' ')).not.toContain('микро-план');
+    expect(issues.join(' ')).not.toContain('критерий приёмки');
   });
 
-  test('accepts a structured FL proposal built from the research checklist', () => {
-    const content = `У вас Telegram и MAX должны вести партнёра в одну запись: согласие с офертой, документы и partner_id не должны расходиться. Данные не разойдутся.
+  test('accepts the short shape the owner dictated', () => {
+    const content = `Добрый день!
 
-Сначала я проверю, как MAX идентифицирует пользователя и принимает файлы. Когда методы будут ясны, соберу общий путь регистрации и выдачи QR-кода. Затем ваш менеджер получит тестовое уведомление и сам проведёт партнёра по обоим мессенджерам. Приёмка: данные остаются в одной карточке.
+Готов взяться, опыт в таких задачах есть. Делал похожее. EXPO MATCH, сервис нетворкинга на выставке, где анкета, профиль и QR-бейдж партнёра жили одной записью и сверялись на входе, вот он https://example.test/expo
 
-Я делал анкету участника, профиль и QR-бейдж в EXPO MATCH — у вас совпадает сама связка регистрации с идентификатором: https://example.test/expo По деньгам это 110 000 ₽ и 16 дней. Старт — после согласования объёма и получения доступов. У MAX уже есть одобренный API или его ещё нужно получать?`;
+Нюанс тут обычно в идентификаторе. Пока не решено, что считается одним партнёром, каналы разъезжаются по документам и согласиям. Вылезает это уже на живых людях. У вас я разведу это до сборки, чтобы потом не сводить записи руками.
+
+По деньгам ориентировочно выходит 110 000 рублей и 16 дней, это исходя из того, как я понял задачу по описанию. У вас уже есть одобренный API у MAX? Если появятся вопросы, готов ответить здесь в чате или в телеграме @saveliissdd`;
     expect(proposalResearchIssues(content, 'standard', {
-      price: 110_000,
-      days: 16,
-      availability: 'после согласования объёма и получения доступов',
-      availabilityConfigured: true,
-      acceptanceLabel: 'acceptance',
+      price: 110_000, days: 16, contactTelegram: '@saveliissdd', estimateMode: 'grounded',
     })).toEqual([]);
+  });
+
+  test('a thin brief must admit the number is a ballpark', () => {
+    const content = `Добрый день!
+
+Возьмусь, такие правки делал много раз. Собирал похожее. Сайт бренда с управляемыми блоками, где новые разделы редактор добавлял сам, без разработчика, вот он https://example.test/brand
+
+Косяк тут обычно на адаптиве. Блоки, вынесенные в общий шаблон, начинают жить своей жизнью на планшетных ширинах, если состояния не описаны. Я проверю их у вас отдельно.
+
+По деньгам навскидку это порядка 60 000 рублей и около 7 дней, но вводных пока мало, так что цифра очень примерная. Посмотрю вашу задачу подробнее и посчитаю точнее. Скинете список правок или доступ к сайту? Если что, пишите в чат или в телеграм @saveliissdd`;
+    expect(proposalResearchIssues(content, 'standard', {
+      price: 60_000, days: 7, contactTelegram: '@saveliissdd', estimateMode: 'rough',
+    })).toEqual([]);
+  });
+
+  test('a grounded wording is not enough when the brief is actually thin', () => {
+    const grounded = `Добрый день!
+
+Готов взяться, опыт в таких задачах есть. Делал похожее. EXPO MATCH, сервис нетворкинга на выставке, где анкета, профиль и QR-бейдж партнёра жили одной записью и сверялись на входе, вот он https://example.test/expo
+
+Нюанс тут обычно в идентификаторе. Пока не решено, что считается одним партнёром, каналы разъезжаются по документам и согласиям. Вылезает это уже на живых людях. У вас я разведу это до сборки, чтобы потом не сводить записи руками.
+
+По деньгам ориентировочно выходит 110 000 рублей и 16 дней, это исходя из того, как я понял задачу по описанию. У вас уже есть одобренный API у MAX? Если появятся вопросы, готов ответить здесь в чате или в телеграме @saveliissdd`;
+    const issues = proposalResearchIssues(grounded, 'standard', {
+      price: 110_000, days: 16, contactTelegram: '@saveliissdd', estimateMode: 'rough',
+    });
+    expect(issues.join(' ')).toContain('Вводных в заказе мало');
+    expect(issues.join(' ')).toContain('уточнить цифры');
+  });
+
+  test('a price with no hedge at all reads as a firm quote and is rejected', () => {
+    const firm = `Добрый день!
+
+Готов взяться, опыт в таких задачах есть. Делал похожее. EXPO MATCH, сервис нетворкинга на выставке, где анкета, профиль и QR-бейдж партнёра жили одной записью и сверялись на входе, вот он https://example.test/expo
+
+Нюанс тут обычно в идентификаторе. Пока не решено, что считается одним партнёром, каналы разъезжаются по документам и согласиям. Вылезает это уже на живых людях. У вас я разведу это до сборки, чтобы потом не сводить записи руками.
+
+По деньгам ориентировочно выходит 110 000 рублей и 16 дней, это исходя из того, как я понял задачу по описанию. У вас уже есть одобренный API у MAX? Если появятся вопросы, готов ответить здесь в чате или в телеграме @saveliissdd`.replace('ориентировочно выходит', 'выходит ровно');
+    const issues = proposalResearchIssues(firm, 'standard', {
+      price: 110_000, days: 16, contactTelegram: '@saveliissdd', estimateMode: 'grounded',
+    });
+    expect(issues.join(' ')).toContain('звучат как готовая смета');
+  });
+
+  test('typeset punctuation and a missing contact are both reported', () => {
+    const withDashes = `Добрый день!
+
+Готов взяться, опыт в таких задачах есть. Делал похожее. EXPO MATCH, сервис нетворкинга на выставке, где анкета, профиль и QR-бейдж партнёра жили одной записью и сверялись на входе, вот он https://example.test/expo
+
+Нюанс тут обычно в идентификаторе. Пока не решено, что считается одним партнёром, каналы разъезжаются по документам и согласиям. Вылезает это уже на живых людях. У вас я разведу это до сборки, чтобы потом не сводить записи руками.
+
+По деньгам выходит 110 000 рублей и 16 дней. У вас уже есть одобренный API у MAX? Если появятся вопросы, готов ответить здесь в чате или в телеграме @saveliissdd`.replace('EXPO MATCH, сервис', 'EXPO MATCH — сервис');
+    const issues = proposalResearchIssues(withDashes, 'standard', {
+      price: 110_000, days: 16, contactTelegram: '@nosuchuser',
+    });
+    expect(issues.join(' ')).toContain('тире');
+    expect(issues.join(' ')).toContain('@nosuchuser');
+    // The link keeps its own colon and slashes without being flagged.
+    expect(issues.join(' ')).not.toContain('слеш');
+  });
+
+  test('the reference proposal carries its proof up front, with the link beside it', () => {
+    const content = `Добрый день!
+
+Telegram и MAX у вас должны вести партнёра в одну запись — в этом вся задача. Делал похожее: EXPO MATCH, сервис нетворкинга на выставке, где анкета, profile и QR-бейдж жили одной записью — https://example.test/expo
+
+Затык обычно в идентификаторе. Пока не решено, что считается одним партнёром, каналы разъезжаются по документам и согласиям, а вылезает это уже на живых людях. Я разведу это до сборки, чтобы потом не переклеивать записи руками.
+
+По деньгам: 110 000 ₽ и 16 дней. У вас уже есть одобренный API у MAX?`;
+    const proofParagraph = content.split(/\n\s*\n/u).findIndex((paragraph) => paragraph.includes('http'));
+    // The proof must not be something the client has to scroll for.
+    expect(proofParagraph).toBeLessThanOrEqual(1);
+    expect(content).toMatch(/Делал похожее/u);
   });
 
   test('measures human rhythm and rejects a sterile proposal voice', () => {
@@ -105,12 +180,25 @@ describe('proposal inputs', () => {
     expect(metrics.longSentenceFollowupMissCount).toBeGreaterThan(0);
   });
 
-  test('rotates a deterministic opening seed and keeps a confirmed greeting', () => {
-    expect(proposalOpeningSeed('lead-42', 'Владимир')).toMatch(/^Здравствуйте, Владимир!\n\n/u);
-    expect(proposalOpeningSeed('lead-42')).not.toContain('Владимир');
+  test('rotates an opening approach instead of dictating a first phrase', () => {
+    const named = proposalOpeningPlan('lead-42', 'Владимир');
+    expect(named.greeting).toBe('Здравствуйте, Владимир!');
+    expect(proposalOpeningPlan('lead-42').greeting).toBeNull();
+    // The plan must never hand the model a ready-made first sentence.
+    expect(named.angle_brief).toMatch(/^После приветствия/u);
+    expect(named.banned_openings).toContain('у вас в задаче');
   });
 
-  test('accepts the owner naturalness-regulation reference after reducing it to one question', () => {
+  test('an opening already used in recent drafts is reported so it is not repeated', () => {
+    const plan = proposalOpeningPlan('lead-7', '', [
+      'Здравствуйте! У вас в задаче смешаны витрина и магазин, я бы развёл их по этапам.',
+      'Я делал маркетплейс фермерских продуктов, там была та же связка каталога и остатков.',
+    ]);
+    expect(plan.already_used_openings).toEqual(expect.arrayContaining(['у вас в задаче смешаны']));
+    expect(plan.already_used_openings.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('the earlier long reference is now out of shape: the owner asked for a short letter', () => {
     const content = `Здравствуйте!
 
 У вас в задаче смешаны две разные вещи: сайт-витрина клиники и будущий магазин с корзиной и оплатой. Я бы их сразу развёл. Витрину делаем сейчас, а под магазин просто закладываем структуру каталога, чтобы потом не переписывать. Иначе смета расползётся ещё до старта.
@@ -129,9 +217,12 @@ describe('proposal inputs', () => {
       days: 45,
       availabilityConfigured: false,
     });
-    expect(issues).toHaveLength(1);
-    expect(issues[0]).toContain('Ритм провален');
-    expect(proposalFinalBlockingIssues(content, issues)).toEqual([]);
+    // This text was the reference in the previous naturalness round. The owner has since
+    // dictated a much shorter shape, so it is expected to fail on length and on the
+    // missing gotcha — this test records that reversal deliberately.
+    expect(issues.join(' ')).toContain('70–130 слов');
+    expect(issues.join(' ')).toContain('затык');
+    expect(proposalFinalBlockingIssues(content, issues).length).toBeGreaterThan(0);
   });
 
   test('rejects synthetic short fillers instead of counting them as human rhythm', () => {
@@ -165,13 +256,13 @@ describe('proposal inputs', () => {
     )).toEqual([]);
   });
 
-  test('uses Unicode-safe boundaries for Russian first-person openings', () => {
+  test('allows the owner-requested first-person opening', () => {
     const issues = proposalResearchIssues(
       'Я разработчик и готов выполнить вашу задачу. Сначала я сверю макеты. Потом соберу страницы. В конце ваш сотрудник проверит сайт. Всё будет понятно. Приёмка: страницы открываются. Цена 110 000 ₽, срок 16 дней. Мобильные макеты у вас готовы?',
       'standard',
       { price: 110_000, days: 16, acceptanceLabel: 'acceptance' },
     ).join(' ');
-    expect(issues).toContain('не об исполнителе');
+    expect(issues).not.toContain('не об исполнителе');
   });
 
   test('does not treat ordinary domain terms and adverbs as bureaucratic nominalizations', () => {
@@ -209,7 +300,7 @@ describe('proposal inputs', () => {
     expect(selected.slice(0, 2).join(' ')).toContain('варианты товара');
   });
 
-  test('requires price, duration, availability and a known client name in the cover letter', () => {
+  test('requires price, duration and availability without forcing a client name', () => {
     const content = `По задаче есть конкретный план. 1) Сверю исходник. 2) Внесу правку. Приёмка: текст на сайте совпадает с исходником. Кейс: https://example.test/case Прислать ссылку?`;
     const issues = proposalResearchIssues(content, 'compact', {
       price: 25_000,
@@ -221,7 +312,7 @@ describe('proposal inputs', () => {
     expect(issues).toContain('25 000');
     expect(issues).toContain('2 дней');
     expect(issues).toContain('старта');
-    expect(issues).toContain('Владимир');
+    expect(issues).not.toContain('Владимир');
   });
 
   test('rotates the acceptance wording away from a repeated AI fingerprint', () => {
