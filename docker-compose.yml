@@ -153,6 +153,10 @@ services:
       SALES_HERMES_MODEL: ${SALES_HERMES_MODEL:-gpt-5.6-sol}
       SALES_HERMES_MODEL_FAST: ${SALES_HERMES_MODEL_FAST:-}
       SALES_HERMES_MODEL_SMART: ${SALES_HERMES_MODEL_SMART:-}
+      SALES_MESH_MODE: ${SALES_MESH_MODE:-shadow}
+      SALES_MESH_API: http://127.0.0.1:9443/api/internal/sales
+      SALES_MESH_TIMEOUT_SECONDS: ${SALES_MESH_TIMEOUT_SECONDS:-180}
+      SALES_MESH_TOKEN_FILE: /run/secrets/sales-mesh-token
       SALES_HERMES_API_KEY_FILE: /run/secrets/hermes-api-key
       SALES_BROKER_ENV_FILE: /run/secrets/sales-broker.env
       SALES_HERMES_RUNTIME_DIR: /project/runtime/hermes-jobs
@@ -161,6 +165,7 @@ services:
       - ./:/project:ro
       - ./runtime/hermes-jobs:/project/runtime/hermes-jobs
       - /etc/codex-mesh/hermes-api-key:/run/secrets/hermes-api-key:ro
+      - /etc/codex-mesh/sales-bridge-token:/run/secrets/sales-mesh-token:ro
       - /etc/freelance-sales-broker.env:/run/secrets/sales-broker.env:ro
       - /var/lib/codex-mesh-hermes/exchange/sales:/hermes-exchange
     logging:
@@ -187,6 +192,10 @@ services:
       SALES_HERMES_MODEL: ${SALES_HERMES_MODEL:-gpt-5.6-sol}
       SALES_HERMES_MODEL_FAST: ${SALES_HERMES_MODEL_FAST:-}
       SALES_HERMES_MODEL_SMART: ${SALES_HERMES_MODEL_SMART:-}
+      SALES_MESH_MODE: ${SALES_MESH_MODE:-shadow}
+      SALES_MESH_API: http://127.0.0.1:9443/api/internal/sales
+      SALES_MESH_TIMEOUT_SECONDS: ${SALES_MESH_TIMEOUT_SECONDS:-180}
+      SALES_MESH_TOKEN_FILE: /run/secrets/sales-mesh-token
       SALES_HERMES_API_KEY_FILE: /run/secrets/hermes-api-key
       SALES_BROKER_ENV_FILE: /run/secrets/sales-broker.env
       SALES_HERMES_RUNTIME_DIR: /project/runtime/hermes-jobs-secondary
@@ -195,6 +204,7 @@ services:
       - ./:/project:ro
       - ./runtime/hermes-jobs-secondary:/project/runtime/hermes-jobs-secondary
       - /etc/codex-mesh/hermes-api-key:/run/secrets/hermes-api-key:ro
+      - /etc/codex-mesh/sales-bridge-token:/run/secrets/sales-mesh-token:ro
       - /etc/freelance-sales-broker.env:/run/secrets/sales-broker.env:ro
       - /var/lib/codex-mesh-hermes/exchange/sales:/hermes-exchange
     logging:
