@@ -1,0 +1,63 @@
+{
+  "package": "telegram-594793-demo-portfolio",
+  "status": "ready_for_owner_review",
+  "publication": {
+    "fl_ru": false,
+    "database_load": false,
+    "external_messages": false
+  },
+  "generator": {
+    "requested_name": "GPT_nogeneral",
+    "used_workflow": "built-in GPT image generation",
+    "exact_local_preset_identifier_found": false,
+    "note": "The requested label was present in the owner's dictated brief but no repository or system configuration entry with that exact name was found. Images were generated with the available GPT image workflow and the retained prompts remain reproducible."
+  },
+  "validation": {
+    "cases": 5,
+    "visual_specs": 5,
+    "images": 5,
+    "width": 1672,
+    "height": 941,
+    "format": "PNG",
+    "visible_demo_label": true,
+    "validator": "python3 validate.py"
+  },
+  "files": [
+    {
+      "case": "FLOW BRIDGE",
+      "file": "images/81-flow-bridge-demo.png",
+      "bytes": 1529361,
+      "sha256": "db874a3fb8fa33f62856a77e30e5b50b333eef8a1ffb164ef2afd24f7410796e",
+      "normalized": false
+    },
+    {
+      "case": "COURSE BOT",
+      "file": "images/82-course-bot-demo.png",
+      "bytes": 1332459,
+      "sha256": "a299a3b222677e7e851a2d8e4a8a12271d74a778993b063c112c849352d114d4",
+      "normalized": false
+    },
+    {
+      "case": "IDENTITY CORE",
+      "file": "images/83-identity-core-demo.png",
+      "bytes": 1738941,
+      "sha256": "755bdaa5bf86955b03d079d797c4cb778002227e379218031be1134f20c87885",
+      "normalized": true
+    },
+    {
+      "case": "FUNNEL RADAR",
+      "file": "images/84-funnel-radar-demo.png",
+      "bytes": 1622186,
+      "sha256": "cb6d9f3975afe1cdcdacb2420c3c528fe469e0baad9dd14ffcd1f07d0b8ded90",
+      "normalized": true
+    },
+    {
+      "case": "RECOVERY LOOP",
+      "file": "images/85-recovery-loop-demo.png",
+      "bytes": 1838586,
+      "sha256": "eac3d5c587de764a8621a305065b4e2268caa30530077690b410748c095a3b6f",
+      "normalized": true
+    }
+  ],
+  "backup": "/Users/savelii/Desktop/freelance-sales-backups/20260817-174500-funnel-594793"
+}
