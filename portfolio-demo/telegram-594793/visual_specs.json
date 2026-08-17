@@ -1,0 +1,108 @@
+{
+  "generator_requirement": "Use the same approved GPT_nogeneral image workflow as the previous 80 FL portfolio boards. If that exact preset is unavailable, do not substitute another renderer; keep these prompts as the handoff specification.",
+  "reference_set": {
+    "path": "/Users/savelii/Desktop/портфолио 50 кейсов",
+    "count": 80,
+    "dominant_layout": "landscape 16:9, most commonly 1672x941; several older boards are 1536x1024",
+    "repo_samples": "portfolio-assets/01-domklyuch-pro contains two 864x1821 experimental vertical boards and is not the dominant reference"
+  },
+  "common_requirements": {
+    "format": "PNG",
+    "target_width": 1672,
+    "target_height": 941,
+    "aspect_ratio": "16:9",
+    "images_per_case": 1,
+    "visible_demo_mark": true,
+    "language": "Russian UI labels, English product name",
+    "prohibited": [
+      "real client logos",
+      "fake testimonials",
+      "budgets",
+      "claimed performance metrics",
+      "unreadable microtext",
+      "random stock people"
+    ]
+  },
+  "cases": [
+    {
+      "id": 81,
+      "slug": "flow-bridge-demo",
+      "title": "FLOW BRIDGE",
+      "filename": "81-flow-bridge-demo.png",
+      "palette": "deep navy, electric violet, coral accent, ice blue",
+      "visual_direction": "Omnichannel integration control center with a strong left-to-right journey and event flow.",
+      "hero_elements": [
+        "Instagram Direct inbox with referral source",
+        "signed Telegram deep-link handoff",
+        "Telegram bot phone screen",
+        "GetCourse registration and payment status",
+        "central user journey timeline"
+      ],
+      "prompt": "Create one premium 16:9 landscape portfolio case-study board, target 1672x941 px, matching a polished FL.ru/Behance SaaS presentation. Show a coherent product UI across 3 to 5 large readable panels with realistic Russian interface labels, crisp typography, careful grid, subtle depth, no stock photos, no real client logos, no fake testimonials, no budgets and no performance claims. The title and the visible label «ДЕМО-КЕЙС» must be clean and correctly spelled. Use only short interface text to reduce glyph errors. Do not create a generic wireframe, phone-only collage, isometric 3D scene, illegible microtext or random charts. Product: FLOW BRIDGE, a demo omnichannel funnel orchestrator. Visual direction: deep navy and electric violet control center with coral status accents. Compose a strong left-to-right flow Instagram Direct → Telegram bot → GetCourse → payment, connected by one glowing event spine. Include one desktop control dashboard, one Telegram phone mockup, one user journey card, and a compact integration health panel. Visible Russian labels may include «Путь пользователя», «Источник», «Регистрация», «Оплата», «События». Put «FLOW BRIDGE» and «ДЕМО-КЕЙС» prominently."
+    },
+    {
+      "id": 82,
+      "slug": "course-bot-demo",
+      "title": "COURSE BOT",
+      "filename": "82-course-bot-demo.png",
+      "palette": "warm white, Telegram blue, royal purple, mint",
+      "visual_direction": "Conversational product story focused on repeat entry, saved state and GetCourse status.",
+      "hero_elements": [
+        "Telegram chat with resume action",
+        "server-side scenario state",
+        "GetCourse student and order card",
+        "payment access state",
+        "manager handoff"
+      ],
+      "prompt": "Create one premium 16:9 landscape portfolio case-study board, target 1672x941 px, matching a polished FL.ru/Behance SaaS presentation. Show a coherent product UI across 3 to 5 large readable panels with realistic Russian interface labels, crisp typography, careful grid, subtle depth, no stock photos, no real client logos, no fake testimonials, no budgets and no performance claims. The title and the visible label «ДЕМО-КЕЙС» must be clean and correctly spelled. Use only short interface text to reduce glyph errors. Do not create a generic wireframe, phone-only collage, isometric 3D scene, illegible microtext or random charts. Product: COURSE BOT, a demo Telegram and GetCourse automation. Visual direction: warm white canvas, Telegram blue, royal purple and mint status accents. Show a large Telegram conversation where a student resumes an unfinished questionnaire, a desktop scenario-state editor, a GetCourse student and order status card, and a manager handoff panel. Make the saved step and repeat entry visually obvious. Visible Russian labels may include «Продолжить с шага», «Анкета сохранена», «Заказ», «Оплачено», «Передать менеджеру». Put «COURSE BOT» and «ДЕМО-КЕЙС» prominently."
+    },
+    {
+      "id": 83,
+      "slug": "identity-core-demo",
+      "title": "IDENTITY CORE",
+      "filename": "83-identity-core-demo.png",
+      "palette": "graphite, soft black, neon lime, teal, white",
+      "visual_direction": "Identity resolution console with three external identities merging into one canonical profile.",
+      "hero_elements": [
+        "Instagram scoped identity",
+        "Telegram user identity",
+        "GetCourse contact record",
+        "canonical person profile",
+        "manual merge review and audit"
+      ],
+      "prompt": "Create one premium 16:9 landscape portfolio case-study board, target 1672x941 px, matching a polished FL.ru/Behance SaaS presentation. Show a coherent product UI across 3 to 5 large readable panels with realistic Russian interface labels, crisp typography, careful grid, subtle depth, no stock photos, no real client logos, no fake testimonials, no budgets and no performance claims. The title and the visible label «ДЕМО-КЕЙС» must be clean and correctly spelled. Use only short interface text to reduce glyph errors. Do not create a generic wireframe, phone-only collage, isometric 3D scene, illegible microtext or random charts. Product: IDENTITY CORE, a demo identity resolution and deduplication service. Visual direction: graphite and soft black with neon lime and teal signals. Center the composition on one clean canonical profile. Three distinct source cards from Instagram, Telegram and GetCourse converge into it through precise connection lines. Include a manual merge review drawer, confidence chips, audit timeline and an undo merge action. Visible Russian labels may include «Единый профиль», «Связи», «Проверить вручную», «История», «Отменить слияние». Put «IDENTITY CORE» and «ДЕМО-КЕЙС» prominently."
+    },
+    {
+      "id": 84,
+      "slug": "funnel-radar-demo",
+      "title": "FUNNEL RADAR",
+      "filename": "84-funnel-radar-demo.png",
+      "palette": "clean white, cobalt, emerald, amber, dark navy",
+      "visual_direction": "Executive analytics board with one truthful funnel and drill-down to individual users.",
+      "hero_elements": [
+        "step funnel with counts not percentages",
+        "cohort trend",
+        "source filters",
+        "technical errors separated from drop-off",
+        "user journey drill-down"
+      ],
+      "prompt": "Create one premium 16:9 landscape portfolio case-study board, target 1672x941 px, matching a polished FL.ru/Behance SaaS presentation. Show a coherent product UI across 3 to 5 large readable panels with realistic Russian interface labels, crisp typography, careful grid, subtle depth, no stock photos, no real client logos, no fake testimonials, no budgets and no performance claims. The title and the visible label «ДЕМО-КЕЙС» must be clean and correctly spelled. Use only short interface text to reduce glyph errors. Do not create a generic wireframe, phone-only collage, isometric 3D scene, illegible microtext or random charts. Product: FUNNEL RADAR, a demo cross-channel analytics dashboard. Visual direction: clean white analytical workspace with cobalt and emerald, amber only for warnings. Show a large six-step funnel Direct → Бот → Анкета → GetCourse → Обучение → Оплата using neutral demo counts, a cohort trend, source filters, freshness indicators, a separate technical-errors card, and a drill-down list of users stopped at a stage. Avoid invented growth percentages. Visible Russian labels may include «Воронка», «Когорты», «Источник», «Технические сбои», «Путь пользователя». Put «FUNNEL RADAR» and «ДЕМО-КЕЙС» prominently."
+    },
+    {
+      "id": 85,
+      "slug": "recovery-loop-demo",
+      "title": "RECOVERY LOOP",
+      "filename": "85-recovery-loop-demo.png",
+      "palette": "near black, graphite, amber, signal red, success green",
+      "visual_direction": "Reliability operations board combining webhook health, retry queue, dead letter and winback guard.",
+      "hero_elements": [
+        "webhook health map",
+        "retry queue with backoff",
+        "dead letter inspection",
+        "Telegram technical alert",
+        "winback cancellation after payment"
+      ],
+      "prompt": "Create one premium 16:9 landscape portfolio case-study board, target 1672x941 px, matching a polished FL.ru/Behance SaaS presentation. Show a coherent product UI across 3 to 5 large readable panels with realistic Russian interface labels, crisp typography, careful grid, subtle depth, no stock photos, no real client logos, no fake testimonials, no budgets and no performance claims. The title and the visible label «ДЕМО-КЕЙС» must be clean and correctly spelled. Use only short interface text to reduce glyph errors. Do not create a generic wireframe, phone-only collage, isometric 3D scene, illegible microtext or random charts. Product: RECOVERY LOOP, a demo reliability and user-return system. Visual direction: near-black operations center with graphite cards, amber warnings, restrained signal red and success green. Show a webhook health map for Instagram, Telegram and GetCourse, a retry queue with backoff stages, a dead-letter inspection panel, one Telegram technical alert preview, and a winback task visibly cancelled after payment. Include a small before-and-after outage timeline showing queued events delivered once. Visible Russian labels may include «Очередь», «Повтор», «Ошибка», «Доставлено», «Возврат отменён». Put «RECOVERY LOOP» and «ДЕМО-КЕЙС» prominently."
+    }
+  ]
+}
