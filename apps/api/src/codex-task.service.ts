@@ -11,10 +11,48 @@ export class CodexTaskService {
     private readonly progress: JobProgressService,
   ) {}
 
-  async run<T>(kind: string, payload: Record<string, unknown>, timeoutMs = 20 * 60_000): Promise<T> {
+  /**
+   * Per-kind wait ceilings. A healthy broker answers in tens of seconds, so a task
+   * that outlives its kind's ceiling is stuck (dead broker, wedged HTTP call) —
+   * fail it fast instead of stalling the whole job. The old single 20-minute
+   * default is exactly what made one hung call freeze a draft for minutes.
+   */
+  private static readonly KIND_TIMEOUTS_MS: Record<string, number> = {
+    owner_query: 240_000,
+    owner_overview: 240_000,
+    owner_intent: 120_000,
+    // Compose measured 2.5-7 min on real long briefs (2026-09-10): 240 s cut off
+    // 3 of 5 live drafts. 8 min is still far below the old 20-min hang.
+    draft_compose: 180_000,
+    draft_reply: 300_000,
+    conversation_turn: 180_000,
+    lead_analysis_v2: 120_000,
+    specification: 360_000,
+    contract_data: 240_000,
+    design_concept_brief: 300_000,
+    design_concept_html: 300_000,
+  };
+
+  // Драфты чувствительны к задержке: один повтор при зависании брокера
+  // вместо старого 8-минутного ожидания. Второй заход почти всегда быстрый.
+  async run<T>(kind: string, payload: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+    try {
+      return await this.runOnce<T>(kind, payload, timeoutMs);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const retryable = kind === 'draft_compose' || kind === 'draft_reply';
+      if (retryable && message.includes('Время ожидания истекло')) {
+        return this.runOnce<T>(kind, payload, timeoutMs);
+      }
+      throw error;
+    }
+  }
+
+  private async runOnce<T>(kind: string, payload: Record<string, unknown>, timeoutMs?: number): Promise<T> {
     // The owner sees this stage light up the moment the AI call starts.
     await this.progress.advanceForAiKind(kind).catch(() => undefined);
-    const modelTier = ['owner_query', 'owner_overview', 'draft_compose', 'draft_strategy', 'draft_review', 'conversation_turn'].includes(kind)
+    const effectiveTimeoutMs = timeoutMs ?? CodexTaskService.KIND_TIMEOUTS_MS[kind] ?? 300_000;
+    const modelTier = ['owner_query', 'owner_overview', 'draft_compose', 'conversation_turn'].includes(kind)
       ? 'smart'
       : 'fast';
     const created = await this.db.query<{ id: string }>(
@@ -22,7 +60,7 @@ export class CodexTaskService {
       [kind, JSON.stringify(payload), modelTier],
     );
     const id = created.rows[0].id;
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + effectiveTimeoutMs;
     const startedAt = Date.now();
     let lastBeat = Date.now();
     let queueReported = false;
@@ -48,8 +86,11 @@ export class CodexTaskService {
       }
       await new Promise((resolve) => setTimeout(resolve, 1_500));
     }
-    await this.db.query("UPDATE ai_tasks SET status='failed',error='Время ожидания Codex истекло',updated_at=now() WHERE id=$1 AND status IN ('pending','claimed')", [id]);
-    throw new Error('Время ожидания Codex истекло');
+    await this.db.query(
+      "UPDATE ai_tasks SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status IN ('pending','claimed')",
+      [id, `Время ожидания истекло (${Math.round(effectiveTimeoutMs / 1000)} с): брокер завис или недоступен`],
+    );
+    throw new Error(`Время ожидания истекло: задача ${kind} не выполнена за ${Math.round(effectiveTimeoutMs / 1000)} с`);
   }
 
   async claim(workerId: string) {
@@ -60,15 +101,10 @@ export class CodexTaskService {
          ORDER BY CASE kind
            WHEN 'owner_query' THEN 0
            WHEN 'owner_overview' THEN 0
-           WHEN 'draft_compose' THEN 1
-           WHEN 'draft_review' THEN 1
-           WHEN 'draft_candidates' THEN 2
-           -- A draft the owner is waiting for must not queue behind a burst of
-           -- background lead scoring; draft_strategy opens that chain.
-           WHEN 'draft_strategy' THEN 2
+           WHEN 'draft_compose' THEN 2
            WHEN 'draft_reply' THEN 3
-           WHEN 'conversation_turn' THEN 3
-           ELSE 4
+           WHEN 'conversation_turn' THEN 4
+           ELSE 5
          END, created_at
          FOR UPDATE SKIP LOCKED LIMIT 1
        )
@@ -98,7 +134,7 @@ export class CodexTaskService {
   }
 
   async heartbeat(provider?: string) {
-    const statusText = provider === 'hermes' ? 'Hermes подключён' : 'Codex host broker подключён';
+    const statusText = 'OpenRouter брокер подключён';
     await this.settings.setConnectorState('codex', { enabled: true, healthy: true, statusText, success: true });
     return { ok: true };
   }

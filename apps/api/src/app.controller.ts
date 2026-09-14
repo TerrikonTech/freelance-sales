@@ -160,9 +160,86 @@ export class AppController {
     };
   }
 
+  /**
+   * One answer to "что сейчас происходит и всё ли живо": queue depth, running jobs,
+   * when FL was last scanned, the broker heartbeat and the thresholds in force.
+   * The interface shows this without the owner having to guess whether a button worked.
+   */
+  @Get('status')
+  @UseGuards(AuthGuard)
+  async status() {
+    const autoDraftKey = `auto-draft:${new Date().toISOString().slice(0, 10)}`;
+    const [counts, ai, scan, drafts, connectors, feed, errors] = await Promise.all([
+      this.queue.queue.getJobCounts('waiting', 'active', 'delayed', 'failed')
+        .catch(() => ({ waiting: 0, active: 0, delayed: 0, failed: 0 })),
+      this.db.query<{ pending: string; claimed: string; done24: string; failed24: string; waiting_ms: string }>(`SELECT
+        count(*) FILTER (WHERE status='pending')::text AS pending,
+        count(*) FILTER (WHERE status='claimed')::text AS claimed,
+        count(*) FILTER (WHERE status='completed' AND completed_at >= now()-interval '24 hours')::text AS done24,
+        count(*) FILTER (WHERE status='failed' AND updated_at >= now()-interval '24 hours')::text AS failed24,
+        COALESCE(extract(epoch FROM now()-min(created_at) FILTER (WHERE status IN ('pending','claimed')))*1000,0)::text AS waiting_ms
+        FROM ai_tasks`),
+      this.db.query(`SELECT created_at,found_count,new_count,analyzed_count,duration_ms
+        FROM scan_runs WHERE connector='fl' ORDER BY created_at DESC LIMIT 1`),
+      this.db.query<{ today: string }>(`SELECT count(*)::text AS today FROM drafts WHERE created_at >= current_date`),
+      this.settings.connectorSummary(),
+      this.progress.feed({ limit: 5 }),
+      this.db.query<{ message: string; count: string; last_at: string }>(`SELECT left(error,240) AS message, count(*)::text AS count,
+        max(finished_at) AS last_at
+        FROM job_runs WHERE status='failed' AND finished_at >= now()-interval '24 hours' AND error IS NOT NULL
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 3`),
+    ]);
+    const redis = this.queue.connection;
+    const [workerSeen, autoUsed] = await Promise.all([
+      redis.get('worker:heartbeat').catch(() => null),
+      redis.get(autoDraftKey).catch(() => null),
+    ]);
+    const pick = (name: string) => (connectors as Array<Record<string, unknown>>).find((row) => row.connector === name) || null;
+    const fl = pick('fl');
+    const broker = pick('codex');
+    return {
+      serverTime: new Date().toISOString(),
+      worker: { seenAt: workerSeen ? new Date(Number(workerSeen)).toISOString() : null },
+      queue: {
+        waiting: Number(counts.waiting || 0),
+        active: Number(counts.active || 0),
+        delayed: Number(counts.delayed || 0),
+        failed: Number(counts.failed || 0),
+      },
+      ai: ai.rows[0] || { pending: '0', claimed: '0', done24: '0', failed24: '0', waiting_ms: '0' },
+      scan: {
+        last: scan.rows[0] || null,
+        intervalSeconds: Math.max(15, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 30)),
+        enabled: Boolean(fl?.enabled),
+        healthy: Boolean(fl?.healthy),
+        statusText: fl?.status_text || null,
+        lastSuccessAt: fl?.last_success_at || null,
+      },
+      broker: { healthy: Boolean(broker?.healthy), statusText: broker?.status_text || null, lastSuccessAt: broker?.last_success_at || null },
+      drafts: { today: Number(drafts.rows[0]?.today || 0), autoUsed: Number(autoUsed || 0) },
+      policy: {
+        minScore: Number(process.env.MIN_LEAD_SCORE || 65),
+        minDealPrice: Number(process.env.MIN_DEAL_PRICE_RUB || 0),
+        autoDraft: /^(?:1|true|on|yes)$/i.test(String(process.env.AUTO_DRAFT_FL || 'false').trim()),
+        autoDraftLimit: Number(process.env.AUTO_DRAFT_DAILY_LIMIT || 10),
+        autoSend: false,
+      },
+      running: feed.active || [],
+      errors: errors.rows || [],
+    };
+  }
+
   @Get('leads')
   @UseGuards(AuthGuard)
-  async leads() {
+  async leads(@Query('limit') limit?: string, @Query('q') q?: string, @Query('status') status?: string) {
+    // The table holds thousands of rows: sending all of them at once froze the browser,
+    // so the list is capped and every filter the owner can see is pushed into SQL.
+    const take = Math.min(Math.max(Number(limit) || 150, 1), 500);
+    const params: unknown[] = [];
+    let where = "status<>'archived' AND source<>'sandbox'";
+    if (q && q.trim()) { params.push(`%${q.trim()}%`); where += ` AND title ILIKE $${params.length}`; }
+    if (status && status.trim()) { params.push(status.trim()); where += ` AND status=$${params.length}`; }
+    params.push(take);
     return (await this.db.query(`SELECT
       id,title,source,status,score,confidence,recommended_price,recommended_days,
       budget_text,url,created_at,updated_at,
@@ -170,8 +247,8 @@ export class AppController {
         NULLIF(requirements->'project'->>'published_at','')::timestamptz,
         created_at
       ) AS published_at
-      FROM leads WHERE status<>'archived' AND source<>'sandbox'
-      ORDER BY published_at DESC LIMIT 300`)).rows;
+      FROM leads WHERE ${where}
+      ORDER BY published_at DESC LIMIT $${params.length}`, params)).rows;
   }
 
   @Get('chats')
@@ -592,9 +669,9 @@ export class AppController {
   @UseGuards(AuthGuard)
   async scanFl() {
     return this.progress.track('scan-fl', { title: 'Проверяю FL.ru по вашей команде' }, async () => {
-      const [projects, chats] = await Promise.all([this.fl.scan({ force: true }), this.fl.syncChats()]);
+      const projects = await this.fl.scan({ force: true });
       await this.progress.describe(`Найдено ${projects.found ?? 0}, новых ${projects.created ?? 0}`);
-      return { projects, chats };
+      return { projects };
     });
   }
 

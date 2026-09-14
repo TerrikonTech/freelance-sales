@@ -1,4 +1,7 @@
-import { AiService } from './ai.service';
+import {
+  AiService,
+  selectRelevantPortfolio,
+} from './ai.service';
 
 describe('AiService analyzer optimization', () => {
   const service = new AiService({} as never, {} as never, {} as never);
@@ -183,11 +186,25 @@ describe('AiService analyzer optimization', () => {
 });
 
 
+/** Passes every deterministic check, so any extra model call here is a real regression. */
+const PASSING_DRAFT = [
+  'Добрый день!',
+  '',
+  'Готов взяться за связку двух систем, опыт с обменом данными есть. Я собрал похожий сервис, где обмен шёл по расписанию, а сбои ловились на реальных сценариях. https://www.fl.ru/user/test/portfolio/1/',
+  '',
+  'Затык у вас будет в повторной отправке. Система шлёт запрос заново, и в вашей базе появляются дубли. Я помечаю операцию ключом.',
+  '',
+  'По деньгам навскидку 100000 рублей и 20 дней, вводных мало, это грубый порядок. Уточню объём и посчитаю точнее. Пришлёте форматы обмена?',
+  'Готов ответить на вопросы в чате.',
+].join('\n');
+
+const FAILING_DRAFT = 'Добрый день!\n\nГотов взяться, опыт с такими задачами есть.\n\nЯ делал похожий проект, https://www.fl.ru/user/test/portfolio/1/. У вас важно заранее проверить обмен данными. Я проверю его на реальных сценариях.\n\nОриентировочно выходит 100000 рублей и 20 дней, это исходя из того, как я понял задачу по описанию. Что у вас уже готово? Готов ответить на вопросы в чате.';
+
 describe('AiService proposal latency', () => {
-  test('creates a first proposal with exactly one AI task', async () => {
+  test('a clean proposal still costs exactly one writing call', async () => {
     const tasks = {
       run: jest.fn().mockResolvedValue({
-        content: 'Добрый день!\n\nГотов взяться, опыт с такими задачами есть.\n\nЯ делал похожий проект, https://www.fl.ru/user/test/portfolio/1/. У вас важно заранее проверить обмен данными. Я проверю его на реальных сценариях.\n\nОриентировочно выходит 100000 рублей и 20 дней, это исходя из того, как я понял задачу по описанию. Что у вас уже готово? Готов ответить на вопросы в чате.',
+        content: PASSING_DRAFT,
         human_score: 90,
         sales_score: 90,
         specificity_score: 95,
@@ -225,7 +242,72 @@ describe('AiService proposal latency', () => {
       messages: [],
     }).catch(() => undefined);
 
+    // order_passport is disabled (returns null without a model call), so a clean
+    // proposal costs exactly one writing call: draft_compose.
     expect(tasks.run).toHaveBeenCalledTimes(1);
     expect(tasks.run).toHaveBeenCalledWith('draft_compose', expect.any(Object));
+  });
+
+  test('a failed draft is rewritten once, not handed over broken and not looped', async () => {
+    const tasks = {
+      run: jest.fn().mockResolvedValue({
+        content: FAILING_DRAFT,
+        human_score: 90,
+        sales_score: 90,
+        specificity_score: 95,
+        factual_score: 100,
+        issues: [],
+      }),
+    };
+    const settings = {
+      getPublic: jest.fn().mockImplementation((key: string) => {
+        if (key === 'seller_profile') return Promise.resolve({});
+        if (key === 'style_profile') return Promise.resolve({});
+        if (key === 'fl_portfolio_cases') return Promise.resolve([{
+          title: 'Похожий проект',
+          description: 'Сервис с обменом данными и проверкой реальных сценариев.',
+          url: 'https://www.fl.ru/user/test/portfolio/1/',
+        }]);
+        return Promise.resolve(null);
+      }),
+    };
+    const db = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const service = new AiService(settings as never, tasks as never, db as never);
+
+    const result = await service.draftReply({
+      mode: 'response',
+      lead: {
+        id: 'lead-1',
+        source: 'fl',
+        title: 'Интеграция данных',
+        description: 'Нужно связать две системы и проверить обмен данными на реальных сценариях.',
+        recommended_price: 100000,
+        recommended_days: 20,
+        analysis: { confidence: 85 },
+        requirements: {},
+      },
+      messages: [],
+    });
+
+    // Gate removed (owner decision): the draft ships as-is, one compose call,
+    // no revision loop, no rejection — the owner reviews it either way.
+    const composeCalls = tasks.run.mock.calls.filter(([kind]) => kind === 'draft_compose');
+    expect(composeCalls).toHaveLength(1);
+    expect(composeCalls[0][1]).not.toHaveProperty('revision');
+    expect(result).toContain('Добрый день!');
+  });
+});
+
+describe('portfolio picking', () => {
+
+
+
+  test('a rare mechanic word outranks a long card that shares only common words', () => {
+    const portfolio = [
+      { title: 'ГОРОД.ONLINE', description: 'Создание платформы: создание заявок, обработка обращений, выполнение задач, ключевые роли, уведомления жителям, документы, профиль, telegram, анкета, обработка и создание отчётов'.repeat(3), url: 'https://example.test/city' },
+      { title: 'VIDEO REVIEW', description: 'Клиент ставит комментарий на таймкоде, версии роликов складываются друг на друга, согласование оформляется статусом, ffmpeg режет исходники.', url: 'https://example.test/video' },
+    ];
+    const [best] = selectRelevantPortfolio(portfolio, 'Монтаж видео\nНужно нарезать ролики, добавить субтитры и согласование перед публикацией');
+    expect(best.title).toBe('VIDEO REVIEW');
   });
 });

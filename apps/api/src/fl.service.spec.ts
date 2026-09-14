@@ -1,4 +1,31 @@
-import { flCookieHeader, flProfileIdentity, matchesExistingFlOffer } from './fl.service';
+import {
+  carryOverManualCases, flCookieHeader, flProfileIdentity, matchesExistingFlOffer,
+} from './fl.service';
+
+describe('FL portfolio sync keeps hand-written cases', () => {
+  const manual = {
+    title: 'FUNNEL OPS', url: '', source: 'manual', solution_details: 'сквозная метка до оплаты',
+  };
+  const scrapedCase = { title: 'HR BRAND SITE', url: 'https://www.fl.ru/user/x/portfolio/1/', source: 'fl' };
+
+  test('carries an unpublished manual case through a sync that cannot see it', () => {
+    expect(carryOverManualCases([scrapedCase], [scrapedCase, manual])).toEqual([manual]);
+  });
+
+  test('never carries a scraped case, so FL.ru stays the source of truth', () => {
+    expect(carryOverManualCases([scrapedCase], [scrapedCase])).toEqual([]);
+  });
+
+  test('retires a manual case once FL.ru publishes the same title', () => {
+    const published = { title: 'funnel ops', url: 'https://www.fl.ru/user/x/portfolio/2/', source: 'fl' };
+    expect(carryOverManualCases([published], [published, manual])).toEqual([]);
+  });
+
+  test('does not collide two unpublished manual cases on their empty url', () => {
+    const second = { title: 'WEBHOOK GUARD', url: '', source: 'manual' };
+    expect(carryOverManualCases([], [manual, second])).toEqual([manual, second]);
+  });
+});
 
 describe('FL scan session', () => {
   test('uses the configured FL session without malformed cookies', () => {

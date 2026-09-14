@@ -4,11 +4,19 @@ import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
 import { SettingsService } from './settings.service';
 import {
+  calculateBottomUpPrice,
   calculateCatalogPrice,
+  DEFAULT_DAILY_RATE_RUB,
+  DEFAULT_MIN_DEAL_PRICE_RUB,
   DEFAULT_PRICING_POLICY,
+  dealValueScore,
   PricingCategory,
   PricingLevel,
   PricingModifier,
+  reconcileEstimate,
+  sizeGrade,
+  underpricingRatio,
+  SizeGrade,
 } from './pricing-policy';
 
 export type BuyerIntent = 'ready' | 'exploratory' | 'contradictory' | 'unrealistic' | 'irrelevant';
@@ -39,6 +47,8 @@ export interface LeadAnalysis {
   commercial_fit: number;
   brief_quality: number;
   delivery_risk: number;
+  /** What the order is worth to the business, 0…100; part of the score. */
+  deal_value?: number;
   recommended_price: number;
   recommended_days: number;
   fit_reason: string;
@@ -50,6 +60,27 @@ export interface LeadAnalysis {
   pricing_level: PricingLevel;
   pricing_modifiers: PricingModifier[];
   understanding: LeadUnderstanding;
+  /** The list of work the price was built from, so a quote can be argued instead of asserted. */
+  work_breakdown?: Array<Record<string, unknown>>;
+  /** Honest spread of the same estimate; the buyer sees it, FL.ru fields keep the centre. */
+  price_range?: [number, number];
+  days_range?: [number, number];
+  estimate_source?: 'breakdown' | 'catalog';
+  /** Fair-price bucket: small / medium / large. Arithmetic, not another model opinion. */
+  size_grade?: SizeGrade;
+  /**
+   * The client's named fixed budget is far below the fair price: replying with
+   * the named number would quietly commit to a losing deal. The draft is held
+   * and the owner is alerted instead of auto-replying.
+   */
+  underpriced?: { named_budget: number; fair_price: number; ratio: number } | null;
+  /** The brief explicitly stages the project (этап 1, очереди) — a long-term client signal. */
+  ltv_stage_signal?: boolean;
+  /** A separately costed cheapest working path, when one honestly exists. */
+  lean_breakdown?: Array<Record<string, unknown>>;
+  lean_price?: number;
+  lean_days?: number;
+  lean_tradeoff?: string;
 }
 
 type ModelLeadAnalysis = Omit<LeadAnalysis, 'understanding'>;
@@ -87,23 +118,30 @@ const DEFAULT_STYLE_PROFILE = {
 };
 
 export type ProposalProfile = 'compact' | 'standard' | 'premium';
-export type ProposalHookPattern = 'observation_detail' | 'result_first' | 'proof_first' | 'direct_commitment' | 'first_step';
-export type ProposalAcceptanceLabel = 'ready_equals' | 'acceptance' | 'stage_closed' | 'result_accepted' | 'result_check';
 
 export type ProposalCommercialContext = {
   price?: number;
   days?: number;
   availability?: string;
   availabilityConfigured?: boolean;
-  clientName?: string;
-  hookPattern?: ProposalHookPattern;
-  acceptanceLabel?: ProposalAcceptanceLabel;
   technologyFit?: ProposalTechnologyFit;
   contactTelegram?: string;
   estimateMode?: ProposalEstimateMode;
+  /** Honest spread behind the single number, when the price came from a work breakdown. */
+  priceRange?: [number, number];
+  daysRange?: [number, number];
 };
 
 export type ProposalEstimateMode = 'grounded' | 'rough';
+
+/** Only a real, ordered, positive spread is worth showing a buyer. */
+export function proposalRangeFrom(value: unknown): [number, number] | undefined {
+  if (!Array.isArray(value) || value.length !== 2) return undefined;
+  const low = Math.round(Number(value[0]));
+  const high = Math.round(Number(value[1]));
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low <= 0 || high <= low) return undefined;
+  return [low, high];
+}
 
 export type ProposalHumanityMetrics = {
   wordCount: number;
@@ -254,71 +292,11 @@ export function proposalTechnologyIssues(content: string, fit?: ProposalTechnolo
   return issues;
 }
 
-/**
- * The owner's own spec: greeting, a short take, "делал похожее" with one sentence about
- * the project and a link, the gotcha, done. That is 70–130 words, not 200+.
- * This deliberately overrides the earlier band (155–240) that came from GigRadar's
- * English Upwork curve: the owner writes to FL.ru clients and asked for short.
- */
 const PROPOSAL_LIMITS: Record<ProposalProfile, { minWords: number; maxWords: number; minChars: number; maxChars: number }> = {
   compact: { minWords: 35, maxWords: 85, minChars: 220, maxChars: 620 },
-  standard: { minWords: 70, maxWords: 130, minChars: 450, maxChars: 950 },
+  standard: { minWords: 100, maxWords: 200, minChars: 650, maxChars: 2400 },
   premium: { minWords: 90, maxWords: 160, minChars: 600, maxChars: 1_150 },
 };
-
-const PROPOSAL_HOOK_PATTERNS: ProposalHookPattern[] = [
-  'observation_detail', 'result_first', 'proof_first', 'direct_commitment', 'first_step',
-];
-
-const PROPOSAL_ACCEPTANCE_LABELS: ProposalAcceptanceLabel[] = [
-  'ready_equals', 'acceptance', 'stage_closed', 'result_accepted', 'result_check',
-];
-
-/**
- * These used to be literal phrases the model pasted in ("Проверим просто:"), which read
- * like a form field.  They now describe the *shape* of the acceptance scene, so the
- * wording stays the writer's own while the variety survives.
- */
-const ACCEPTANCE_LABEL_TEXT: Record<ProposalAcceptanceLabel, string> = {
-  ready_equals: 'Опиши приёмку через готовность: что должно уметь работать, чтобы этап считался сделанным.',
-  acceptance: 'Опиши приёмку как проверку: что заказчик нажмёт и что увидит.',
-  stage_closed: 'Опиши приёмку через закрытие этапа: какое действие переводит работу на следующий шаг.',
-  result_accepted: 'Опиши приёмку глазами сотрудника заказчика: что он сделает сам, без тебя.',
-  result_check: 'Опиши приёмку как короткий сценарий пользователя от начала до конца.',
-};
-
-export function proposalVariationPlan(recentDrafts: string[], seed: string) {
-  const joined = recentDrafts.join('\n').toLowerCase();
-  const acceptanceCounts: Record<ProposalAcceptanceLabel, number> = {
-    ready_equals: (joined.match(/(?:готово\s*=|работа\s+готова,?\s+когда)/gu) || []).length,
-    acceptance: (joined.match(/(?:при[ёе]мка\s*:|проверим\s+просто\s*:)/gu) || []).length,
-    stage_closed: (joined.match(/(?:этап\s+считается\s+закрыт|этап\s+закрываем,?\s+когда)/gu) || []).length,
-    result_accepted: (joined.match(/(?:результат\s+можно\s+принимать|на\s+при[ёе]мке\s+ваш\s+сотрудник)/gu) || []).length,
-    result_check: (joined.match(/(?:проверка\s+результата\s*:|финальная\s+проверка\s+простая\s*:)/gu) || []).length,
-  };
-  const seedNumber = Number.parseInt(createHash('sha256').update(seed).digest('hex').slice(0, 8), 16);
-  const acceptanceLabel = [...PROPOSAL_ACCEPTANCE_LABELS]
-    .sort((left, right) => acceptanceCounts[left] - acceptanceCounts[right]
-      || ((PROPOSAL_ACCEPTANCE_LABELS.indexOf(left) - seedNumber) % PROPOSAL_ACCEPTANCE_LABELS.length)
-      - ((PROPOSAL_ACCEPTANCE_LABELS.indexOf(right) - seedNumber) % PROPOSAL_ACCEPTANCE_LABELS.length))[0];
-  const hookPattern = PROPOSAL_HOOK_PATTERNS[seedNumber % PROPOSAL_HOOK_PATTERNS.length];
-  return {
-    hookPattern,
-    acceptanceLabel,
-    acceptanceText: ACCEPTANCE_LABEL_TEXT[acceptanceLabel],
-  };
-}
-
-/**
- * Openings that mark a proposal as mass-produced.  Reciting the brief back is the
- * worst of them: the client wrote it and learns nothing from reading it again.
- */
-export const PROPOSAL_BANNED_OPENINGS = [
-  'у вас в задаче', 'у вас в проекте', 'по вашему описанию', 'вам нужно', 'вам требуется',
-  'задача понятна', 'я внимательно прочитал', 'я внимательно изучил', 'ознакомился с вашим',
-  'доброго времени суток', 'уважаемый заказчик', 'меня зовут', 'я разработчик', 'я фулстек',
-  'готов приступить', 'готов реализовать', 'хочу предложить свои услуги', 'заинтересовало ваше',
-];
 
 /**
  * Phrases with a measured negative effect on reply rate, plus the ones the owner's own
@@ -333,7 +311,7 @@ export const PROPOSAL_CLICHES = [
   'у меня есть опыт работы с', 'имею опыт работы с', 'имею большой опыт', // −3.67pp
   'я помогу вам с', 'готов помочь вам решить', // −3.17pp
   'будете ли вы открыты', 'не хотели бы вы', // −2.74pp
-  'созвон', 'установочный звонок', 'обсудим детали в звонке', 'обсудить детали', // −2.17pp
+  'предлагаю созвон', 'установочный звонок', 'обсудим детали в звонке', 'обсудить детали', // −2.17pp
   'этот отклик написан не нейросетью', 'написано не нейросетью', // −1.55pp
   'индивидуальный подход', 'решение под ваши задачи', 'современное решение', // −1.15pp
   'выберите меня', 'буду рад сотрудничеству', // −0.88pp
@@ -355,7 +333,7 @@ export const PROPOSAL_CLICHES = [
   'уже прикинул концепт', 'в обозначенных границах', 'коммерческая рамка',
   'тут по описанию получается', 'нужно уточнить границу', 'готов собрать',
   'рабочий контур', 'первый контур', 'в портфолио есть fullstack', 'сложная бизнес-логика',
-  'fullstack', 'важно отметить', 'ключевой момент', 'это особенно важно',
+  'важно отметить', 'ключевой момент', 'это особенно важно',
   'в современных реалиях', 'таким образом', 'подводя итог',
   'не служит подтверждением', 'не является гарантией',
 ];
@@ -365,49 +343,36 @@ export const PROPOSAL_CLICHES = [
  * every proposal opened with "У вас в задаче" and read as a brief recital.  Rotating the
  * *approach* and forbidding repeats gives variety without putting words in the mouth.
  */
-/**
- * The owner rejected abstract openings outright: a first sentence about the task appears
- * out of nowhere and the client wonders what he is even reading.  He wants the letter to
- * open the way a person opens one — greeting, then "готов взяться, опыт в этом есть".
- * These vary the wording of that same move; none of them is an abstract statement.
- */
-const PROPOSAL_OPENING_ANGLES = [
-  { key: 'ready_experience', brief: 'После приветствия скажи просто: готов взяться, опыт в такой задаче есть. Своими словами, одной короткой фразой.' },
-  { key: 'ready_done', brief: 'После приветствия скажи, что готов взяться и такое уже делал. Коротко и по-человечески.' },
-  { key: 'ready_familiar', brief: 'После приветствия скажи, что задача знакомая и ты готов её взять. Без пафоса, одной фразой.' },
-  { key: 'ready_direct', brief: 'После приветствия скажи прямо: возьмусь, в этом разбираюсь. Одна короткая фраза, никаких рассуждений о задаче.' },
-];
-
-const openingFingerprint = (text: string) => String(text || '')
-  .replace(/^\s*(?:здравствуйте|добрый день|привет)[^\n.!?]*[.!\n]*/iu, '')
-  .trim().toLowerCase()
-  .match(/[\p{L}\p{N}]+/gu)?.slice(0, 5).join(' ') || '';
-
-export function proposalOpeningPlan(seed: string, clientName = '', recentDrafts: string[] = []) {
-  const name = clientName.trim().split(/\s+/u)[0];
-  const seedNumber = Number.parseInt(createHash('sha256').update(seed).digest('hex').slice(0, 8), 16);
-  const usedFingerprints = recentDrafts.map(openingFingerprint).filter(Boolean);
-  const usage = (angle: string) => recentDrafts.filter((draft) => draft.includes(`__angle:${angle}`)).length;
-  const angle = [...PROPOSAL_OPENING_ANGLES]
-    .sort((left, right) => usage(left.key) - usage(right.key)
-      || ((PROPOSAL_OPENING_ANGLES.indexOf(left) - seedNumber) % PROPOSAL_OPENING_ANGLES.length)
-      - ((PROPOSAL_OPENING_ANGLES.indexOf(right) - seedNumber) % PROPOSAL_OPENING_ANGLES.length))[0];
-  return {
-    greeting: name ? `Здравствуйте, ${name}!` : null,
-    angle: angle.key,
-    angle_brief: angle.brief,
-    rule: 'Первую содержательную фразу пиши своими словами под этот заход. Никаких абстрактных утверждений о задаче с порога: клиент должен сразу понять, что ему пишет человек, который берётся за работу.',
-    banned_openings: PROPOSAL_BANNED_OPENINGS,
-    already_used_openings: [...new Set(usedFingerprints)].slice(0, 8),
-  };
-}
-
 export function proposalProfileForLead(lead: Record<string, unknown>): ProposalProfile {
   const description = String(lead.description || '').trim();
   const price = Number(lead.recommended_price) || 0;
   if (description.length <= 220 || (price > 0 && price <= 40_000)) return 'compact';
   if (price >= 500_000) return 'premium';
+  // Two implementation paths with an honest downside for each cannot be said in 130
+  // words: the letter either drops a path or drops the reason it matters. When the
+  // task genuinely splits, buy the room instead of cutting the argument.
+  if (proposalOffersOptions(lead)) return 'premium';
   return 'standard';
+}
+
+/**
+ * A brief supports cheap-versus-proper options when the same outcome can be reached by
+ * wiring existing services or by building the thing, and the buyer signalled that money
+ * or speed is the constraint.
+ */
+export function proposalOffersOptions(lead: Record<string, unknown>): boolean {
+  const analysis = (lead.analysis && typeof lead.analysis === 'object'
+    ? lead.analysis
+    : {}) as Record<string, unknown>;
+  const breakdown = Array.isArray(analysis.work_breakdown) ? analysis.work_breakdown : [];
+  const range = Array.isArray(analysis.price_range) ? analysis.price_range : null;
+  const spread = range && Number(range[0]) > 0 ? Number(range[1]) / Number(range[0]) : 0;
+  const text = `${lead.title || ''} ${lead.description || ''}`.toLowerCase();
+  // "бот" without a boundary also matches разраБОТка, раБОТа and обраБОТка, which is
+  // most of the briefs on the board.
+  const assemblable = /(?:интеграц|автоматизац|конвейер|(?<![а-яё])бот|парсинг|выгрузк|уведомлен|публикац|(?<![а-яё])сервис|(?<![а-яё])api)/iu.test(text);
+  // Five or more separate pieces of work means there is something to trade away.
+  return assemblable && breakdown.length >= 5 && spread >= 1.8;
 }
 
 const HUMANITY_WORD_PATTERN = /[\p{L}\p{N}]+(?:[-'][\p{L}\p{N}]+)*/gu;
@@ -435,19 +400,40 @@ function priceWithSpaces(value: number): string {
   return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 }
 
+/** Money amounts the reply names with a currency sign (₽ / руб). */
+export function proposalNamedPrices(content: string): number[] {
+  const amounts: number[] = [];
+  for (const match of String(content || '').matchAll(/(\d[\d\s]{2,12})\s*(?:₽|руб\.?|р\.)/giu)) {
+    const value = Number(match[1].replace(/\s+/g, ''));
+    if (Number.isFinite(value) && value >= 10_000) amounts.push(value);
+  }
+  return [...new Set(amounts)];
+}
+
 /** Safe deterministic cleanup for formatting that should not consume an AI retry. */
 export function normalizeProposalFormatting(
   content: string,
   commercial: ProposalCommercialContext = {},
 ): string {
+  let normalized = content.trim();
   const price = Math.round(Number(commercial.price) || 0);
-  if (price < 10_000) return content.trim();
-  const raw = String(price);
-  const grouped = priceWithSpaces(price);
-  return content.trim().replace(
-    new RegExp(`(^|[^\\d])${raw}(?=\\s*(?:₽|руб(?:\\.|лей|ля)?))`, 'gimu'),
-    (_match, prefix: string) => `${prefix}${grouped}`,
-  );
+  if (price >= 10_000) {
+    const raw = String(price);
+    const grouped = priceWithSpaces(price);
+    normalized = normalized.replace(
+      new RegExp(`(^|[^\\d])${raw}(?=\\s*(?:₽|руб(?:\\.|лей|ля)?))`, 'gimu'),
+      (_match, prefix: string) => `${prefix}${grouped}`,
+    );
+  }
+
+  // The contact is a profile fact, not prose the model may choose to omit. Keep the
+  // model instruction for a natural ending, but enforce the exact handle here so every
+  // generated and regenerated FL.ru proposal gives the client a way to reach the owner.
+  const contact = String(commercial.contactTelegram || '').trim();
+  if (contact && !normalized.includes(contact)) {
+    normalized += `\n\nЕсли появятся вопросы, готов ответить здесь в чате или в телеграме ${contact}.`;
+  }
+  return normalized;
 }
 
 /** Deterministic style diagnostics: editorial signals, not an AI-detector verdict. */
@@ -576,8 +562,11 @@ export function proposalHumanityMetrics(content: string): ProposalHumanityMetric
   const tablePricingCount = (content.match(
     /(?:стоимость|цена)\s*[—-]\s*\d[^.!?]{0,80}срок\s*[—-]/gimu,
   ) || []).length;
+  // The approved voice drops the pronoun like spoken Russian does: «сразу закладываю»,
+  // «сниму парсером».  So «я» is optional here and the verb list covers the present and
+  // future forms the owner actually writes, not just past-tense case reports.
   const firstPersonActionCount = (content.match(
-    /(?:^|[^\p{L}])я\s+(?:делал|сделал|собрал|соберу|разработал|реализовал|спроектировал|настроил|подключил|внедрил|создал|проверю|покажу|сверю|опишу|зафиксирую|предусмотрю|продумаю|проведу|разведу|договорюсь)(?=$|[^\p{L}])/gimu,
+    /(?:^|[^\p{L}])(?:я\s+)?(?:делал|делаю|сделал|сделаю|собрал|соберу|разработал|реализовал|реализую|спроектировал|настроил|настрою|подключил|подключу|внедрил|создал|проверю|покажу|сверю|опишу|зафиксирую|предусмотрю|продумаю|проведу|разведу|договорюсь|пишу|снимаю|сниму|закладываю|вынесу|набросаю|распишу|перенесу|напишу|посчитаю|прикручу|добавлю|выберу|разверну)(?=$|[^\p{L}])/gimu,
   ) || []).length;
   const conversationalConnectorCount = (content.match(
     // "скажу честно" was counted as a live connector while the cliché list bans it as an
@@ -638,7 +627,8 @@ export function portfolioHumanityIssues(content: string, portfolio: Record<strin
   const url = String(selected.url || '').trim();
   const paragraph = content.split(/\n\s*\n/u).find((item) => item.includes(url)) || content;
   const issues: string[] = [];
-  if (!/(?:^|[^\p{L}])я\s+(?:делал|сделал|собрал|разработал|реализовал|спроектировал|настроил|подключил|внедрил|создал|отвечал|проектировал)(?=$|[^\p{L}])/iu.test(paragraph)) {
+  // «Из похожего — делал X» drops the pronoun the same way the approved voice does.
+  if (!/(?:^|[^\p{L}])(?:я\s+)?(?:делал|делаю|сделал|собрал|разработал|реализовал|спроектировал|настроил|подключил|внедрил|создал|отвечал|проектировал)(?=$|[^\p{L}])/iu.test(paragraph)) {
     issues.push('Опиши кейс от первого лица: «я делал/собрал/разработал», а не безличной справкой.');
   }
   const caseCard = selected.case_card && typeof selected.case_card === 'object'
@@ -770,12 +760,6 @@ export function proposalResearchIssues(
   if (content.length < limits.minChars || content.length > limits.maxChars) {
     issues.push(`Объём для режима ${profile}: нужно ${limits.minChars}–${limits.maxChars} знаков, сейчас ${content.length}.`);
   }
-  const paragraphs = content.trim().split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
-  const substantiveParagraphs = paragraphs.filter((paragraph) => (
-    !/^(?:добрый\s+день|здравствуйте|привет)(?:,?\s+[\p{L} -]{2,40})?[!.]?$/iu.test(paragraph)
-  ));
-  if (substantiveParagraphs.length > 4) issues.push('Отклик короткий: оставь не более четырёх содержательных абзацев.');
-  if (substantiveParagraphs.length === 1 && content.length > 650) issues.push('Разбей стену текста на 2–3 сканируемых абзаца.');
 
   const humanity = proposalHumanityMetrics(content);
   // 0.60 is the editorial target. Only <0.55 is a hard generation failure;
@@ -815,10 +799,6 @@ export function proposalResearchIssues(
   }
   if (humanity.impersonalStartCount > 0) {
     issues.push('Не начинай фразы безлично с «важно/нужно/следует/необходимо/можно»: назови, кто и что делает.');
-  }
-  const requiredFirstPersonActions = 1;
-  if (humanity.firstPersonActionCount < requiredFirstPersonActions) {
-    issues.push(`Назови свои действия от первого лица живыми глаголами минимум ${requiredFirstPersonActions} раза: «я соберу/покажу/проверю» (сейчас ${humanity.firstPersonActionCount}).`);
   }
   if (humanity.conversationalConnectorCount > 3) {
     issues.push('Разговорных связок слишком много: оставь 1–3, иначе голос выглядит сыгранным.');
@@ -868,40 +848,44 @@ export function proposalResearchIssues(
   } else if (firstLine.length > 20) {
     issues.push('Приветствие поставь отдельной строкой, а дальше с новой строки пиши, что готов взяться.');
   }
-  if (!/(?:^|[^\p{L}])(?:делал|сделал|собирал|собрал|разрабатывал|разработал|реализовал|запускал|запустил)(?=$|[^\p{L}])/iu.test(content)) {
-    issues.push('Скажи прямо, что делал похожий проект: «делал похожее», «собирал такое».');
+  if (!/(?:^|[^\p{L}])(?:делал|сделал|собирал|собрал|разрабатывал|разработал|реализовал|запускал|запустил)(?=$|[^\p{L}])|похожая\s+задача\s+была/iu.test(content)) {
+    issues.push('Скажи прямо, что делал похожий проект: «делал похожее», «похожая задача была».');
   }
   if (!/https?:\/\//iu.test(content)) {
     issues.push('Дай ссылку на свой кейс из портфолио — без неё доказательства нет.');
   }
   // "Где могут быть затыки и косяки" — the one thing that proves the author has actually
   // built this before and is not guessing from the brief.
-  const gotchaPattern = /(?:затык|подводн|грабл|косяк|нюанс|подвох|обычно\s+(?:лом|спотык|всплыва|упира)|чаще\s+всего\s+(?:лом|упира)|main\s+risk|споткн|упир[ае]|разъезж|рассыпа|отвалива|сюрприз|дублир|дубли|задво|повторн(?:ая|ой|ую)?\s+(?:достав|запис|отправ)|тонкое\s+место|узкое\s+место|сложност[ьи]\s+(?:будет|обычно|тут|здесь)|на\s+практике\s+(?:лом|упира|вылеза|всплыва))/iu;
+  const gotchaPattern = /(?:затык|подводн|грабл|косяк|нюанс|подвох|обычно\s+(?:лом|спотык|всплыва|упира)|чаще\s+всего\s+(?:лом|упира)|main\s+risk|споткн|упир[ае]|разъезж|рассыпа|отвалива|сюрприз|дублир|дубли|задво|повторн(?:ая|ой|ую)?\s+(?:достав|запис|отправ)|тонкое\s+место|узкое\s+место|сложност[ьи]\s+(?:будет|обычно|тут|здесь|в\b|во\b)|на\s+практике\s+(?:лом|упира|вылеза|всплыва)|вста(?:нет|[её]т|ла))/iu;
   if (!gotchaPattern.test(content)) {
-    issues.push('Назови нюанс: где в такой задаче обычно затык или косяк. Это и показывает, что ты её уже делал.');
+    issues.push('Назови нюанс: где в такой задаче обычно сложность или косяк. Это и показывает, что ты её понимал.');
   }
   if (/(?:…|\.{3})/u.test(content)) {
     issues.push('В готовом отклике осталось многоточие-заглушка: замени его конкретным текстом.');
   }
   const numberedPlan = /(?:^|\s)1[.)]\s+[\s\S]{0,700}(?:^|\s)2[.)]\s+/mu.test(content);
   if (numberedPlan) issues.push('Убери нумерованный план: отклик короткий, план в нём не нужен.');
-  // The owner writes with full stops, commas, question marks and the odd exclamation.
-  // Dashes, colons and brackets are what make a letter look typeset rather than written.
+  // The owner's approved voice (2026-09-09) writes with dashes and colons like a live
+  // letter: «упал — чиню в тот же день», «Первый: …».  Dashes, colons and a link wrapped
+  // in parentheses are fine now; what still reads as typeset is «;» and «ёлочки».
   const withoutUrls = content.replace(/https?:\/\/[^\s)]+/giu, ' ссылка ');
   const fancyPunctuation = [
-    ['тире', /[—–]/u], ['двоеточие', /:/u], ['точка с запятой', /;/u],
-    ['скобки', /[()]/u], ['кавычки-ёлочки', /[«»]/u], ['слеш', /(?<![\p{L}\p{N}])\/(?![\p{L}\p{N}])/u],
+    ['точка с запятой', /;/u], ['кавычки-ёлочки', /[«»]/u], ['слеш', /(?<![\p{L}\p{N}])\/(?![\p{L}\p{N}])/u],
   ] as Array<[string, RegExp]>;
-  const foundPunctuation = fancyPunctuation.filter(([, pattern]) => pattern.test(withoutUrls)).map(([name]) => name);
+  // A link wrapped in parentheses is allowed: «(https://.../portfolio/8067050/)».
+  const punctuationProbe = withoutUrls.replace(/\(\s*ссылка\s*\)/gu, ' ссылка ');
+  const foundPunctuation = fancyPunctuation.filter(([, pattern]) => pattern.test(punctuationProbe)).map(([name]) => name);
   if (foundPunctuation.length) {
-    issues.push(`Лишние знаки препинания: ${foundPunctuation.join(', ')}. Оставь только точки, запятые, вопросительный и восклицательный знак.`);
+    issues.push(`Лишние знаки препинания: ${foundPunctuation.join(', ')}.`);
   }
   const contact = String(commercial.contactTelegram || '').trim();
   if (contact && !content.includes(contact)) {
     issues.push(`В конце оставь контакт для связи: ${contact}.`);
   }
+  // The approved voice asks with a plain question or a plain nudge («напишите об этом
+  // сразу»); the forced «… Верно?» diagnosis is gone, so only a ceiling remains.
   const questions = (content.match(/\?/g) || []).length;
-  if (questions !== 1) issues.push(`В финале нужен ровно один лёгкий вопрос, сейчас вопросов: ${questions}.`);
+  if (questions > 2) issues.push(`Вопросительных знаков больше двух, сейчас: ${questions}. Оставь максимум один-два живых вопроса.`);
   const urls = content.match(/https?:\/\/[^\s)]+/giu) || [];
   if (urls.length > 1) issues.push('Оставь ровно одно самое релевантное доказательство, без россыпи ссылок.');
 
@@ -923,7 +907,11 @@ export function proposalResearchIssues(
     }
   }
   if (Number(commercial.days) > 0) {
-    const daysPattern = new RegExp(`${Math.round(Number(commercial.days))}\\s*(?:рабоч(?:их|ие)?\\s*)?д(?:ень|ня|ней|\\.)`, 'iu');
+    // The approved voice writes «дней 14» as often as «14 дней», so both orders count.
+    const daysPattern = new RegExp(
+      `(?:${Math.round(Number(commercial.days))}\\s*(?:рабоч(?:их|ие)?\\s*)?д(?:ень|ня|ней|\\.)|д(?:ень|ня|ней|\\.)\\s*\\u2116?\\s*${Math.round(Number(commercial.days))})`,
+      'iu',
+    );
     if (!daysPattern.test(content)) issues.push(`Назови в тексте срок ${Math.round(Number(commercial.days))} дней.`);
   }
   if (commercial.availability) {
@@ -1009,30 +997,43 @@ export function portfolioEvidenceIssues(content: string, portfolio: Record<strin
 }
 
 const RESPONSE_PRINCIPLES = [
-  'Цель первого отклика — получить осмысленный ответ и снизить тревогу заказчика, а не пересказать бриф или показать весь стек.',
-  'Первые 150–200 символов должны содержать конкретную проблему, наблюдение, результат или близкое доказательство именно по этому заказу. Не начинать с «я», стажа или приветствия-филлера.',
-  'Пиши конкретному человеку, а не в пустоту: минимум два естественных обращения «у вас/вам/ваш». Это не повод пересказывать заказ фразой «вам нужно».',
-  'Ритм должен быть неровным по смыслу: целевой бёрстинесс не ниже 0,60, жёсткий провал ниже 0,55. После фразы от 25 слов ставь короткую до 8 слов. Нужен один содержательный удар на 2–5 слов; соседние предложения одинаковой длины и конструкции запрещены.',
-  'Действия называй глаголами и от первого лица: «я соберу», «покажу», «проверю». Безличные старты и канцелярские цепочки из слов на «-ение/-ация/-ость» переписывай.',
-  'Добавь 1–3 разговорные связки только там, где они естественны: «по деньгам», «на практике», «скажу честно». Искусственная разговорность не нужна.',
-  'Использовать минимум две уникальные детали задания и лексику клиента, но не перечислять уже написанные функции для вида.',
-  'Структура: один из пяти вариативных хуков → понимание цели → микро-план 2–3 шага → приёмка как живая сцена с сотрудником или пользователем → один кейс → цена, срок и подтверждённый старт при его наличии → один простой вопрос.',
-  'Техническая мысль допустима только когда объясняет пользу, риск, деньги или скорость. На дорогом проекте показать управляемость: этапность, QA, прозрачность или обратимость.',
-  'Доверие строить одним сильным уместным сигналом: близкий реальный кейс с прямой ссылкой, подтверждённый опыт или конкретный способ снять главный риск. 6 лет и Яндекс не вставлять как заполнитель.',
+  // Structure ethalon v14 (approved 2026-09-10 on the visa-bot draft): who I am with a
+  // case first, the plan second, terms in one line, one non-obvious question, contact.
+  'Структура эталона: приветствие → абзац «кто я»: «Шесть лет делаю …» под домен заказа и сразу похожий кейс было/стало с точной ссылкой → абзац «как сделаю»: 3–4 ключевых технических решения именно под этот заказ → условия одной-двумя строками → один вопрос → финальная строка с контактом.',
+  'Длина 100–160 слов. Лаконичность и есть часть голоса: каждый абзац несёт один смысл, пустых фраз не оставлять. Писать больше только если заказчик прямо просит детали.',
+  'После приветствия первый абзац — «кто я» со стажем и кейсом. Это не филлер, а доказательство. Филлер — пересказ ТЗ, «анализ главного риска» и любые слова о том, каким заказ виделся заказчику.',
+  'Не начинать с пересказа ТЗ и наблюдений о заказе («по ТЗ главное», «главный риск для вас»). Заказчик своё ТЗ знает, открывая отклик он хочет понять, кто ты и что ты уже делал такого.',
+  'Вопрос — ровно один, без анонсов: не «Уточню момент: …», а сразу вопрос с новой строки. Спрашивать только то, от чего зависит план работ или оценка: доступы, тестовые аккаунты, приоритет этапов. Очевидное для заказчика (его же решения, определённые на старте) не спрашивать. Конструкция «…, Верно?» запрещена.',
+  'Запрещены подписи-ярлыки и связки-анонсы: «Стек.», «Сроки и стоимость.», «Кейсы в профиле.», «Скажу честно:», «Мой план такой:», «Приёмка простая:», «Уточню один момент:». Текст течёт обычными абзацами, без заголовков и списков.',
+  'Условия — одной-двумя строками: ориентировочные цена и срок по commercial_terms, затем одна фраза про поддержку («Поддержка после сдачи — фиксом за месяц»). Не перечислять состав работ в цене, не обещать смету по модулям, договор и Безопасную сделку первым не поднимать.',
+  'Финал: «Готов созвониться или перепишемся: @ник», ник из commercial_terms.contact_telegram дословно. Без «на пятнадцать минут» и без вариантов формулировки.',
   'Если называешь кейс из portfolio — сразу давай его ссылку из portfolio[].url. Не писать «могу показать» без ссылки: заказчик должен мочь открыть работу в один клик.',
-  'Кейс упоминай по схеме «я делал → одна проверяемая деталь из portfolio.description → чем она совпадает с задачей клиента → точная ссылка». Нельзя дополнять карточку правдоподобными числами, ролями или результатами, которых в ней нет.',
+  'Кейс упоминай по схеме «я делал → одна проверяемая деталь из portfolio.description → чем она совпадает с задачей клиента → точная ссылка». Нельзя дополнять карточку числами, которых нет в утверждённом списке ниже: там они есть, в карточке нет.',
+  'МЕДСЕТЬ 24 (8057734): сеть из 24 филиалов, раньше администратор каждого филиала собирал отчёт по анализам вручную, на сеть уходило около 70 часов в месяц; после запуска отчёт собирается сам и уходит пациенту сразу после оплаты, повторные обращения выросли с 18 до 27 процентов.',
+  'DEALER CATALOG (8067048): около 40 дилеров, раньше прайс рассылали Excel-файлами полдня и цены расходились с реальными в день отправки; теперь администратор обновляет цены за десять минут, дилер видит их сразу после входа, заявка на отгрузку идёт в CRM без почты.',
+  'FLOW BRIDGE (8072067): раньше технические сбои теряли примерно каждый восьмой диалог, отвал замечали через неделю; после запуска отвал по технике упал до двух процентов, путь ученика от объявления до оплаты виден с датами, отвалы разбирают в тот же день.',
+  'RECOVERY LOOP (8072073): около четырёх тысяч заявок в месяц, при сбоях интеграции терялось до семи процентов заявок; после запуска очередь доставляет все без потерь, сбой виден в Telegram за пять минут, а не на следующий день по письму клиента.',
+  'TERRA MARKET (8057737): каталог на пять тысяч позиций, раньше остатки поставщиков велись в таблице и расходились с витриной раз в неделю, заказы брали то, чего нет; после запуска остатки в одной базе, витрина и заказы показывают одну цифру, заказ не берёт больше, чем есть на складе.',
+  'Для кейсов вне этого списка готовых метрик нет: их придумывает владелец на этапе разбора, генератору числовые результаты выдумывать запрещено.',
   'У case_card есть поля client_context, task, solution_details, challenge, result, stack и stack_mismatch_note. Используй только заполненные факты; пустое поле не разрешает домысливать деталь.',
   'Ссылку брать только из portfolio[].url дословно. Никогда не выдумывать адрес и не ссылаться на кейс, которого нет в portfolio.',
-  'Если заказ явно требует CMS или технологию, используй только доказательство из technology_fit. Словарь инфоблоков, компонентов и редакций не доказывает опыт сам по себе. При risk=elevated не заявляй, что работал с технологией: соседний кейс доказывает только механику проекта, а не стек.',
-  'Завершать ровно одним лёгким вопросом или бинарным выбором, который двигает разговор на один шаг. Не превращать отклик в анкету.',
+  'Если заказ явно требует CMS или технологию, используй только доказательство из technology_fit. При risk=elevated не заявляй, что работал с технологией: соседний кейс доказывает только механику проекта, а не стек.',
+  'Ритм должен быть неровным по смыслу: целевой бёрстинесс не ниже 0,60, жёсткий провал ниже 0,55. После фразы от 25 слов ставь короткую до 8 слов. Соседние предложения одинаковой длины и конструкции запрещены.',
+  'Действия называй глаголами и от первого лица: «я соберу», «покажу», «проверю». Канцелярские цепочки из слов на «-ение/-ация/-ость» переписывай.',
+  'Пиши конкретному человеку: минимум два естественных обращения «у вас/вам/ваш/вы». Это не повод пересказывать заказ фразой «вам нужно».',
+  'Использовать минимум две уникальные детали задания и лексику клиента, но не перечислять уже написанные функции для вида.',
+  'Техническая мысль допустима только когда объясняет пользу, риск, деньги или скорость. Управляемость (этапность, приёмка, обратимость) — одной строкой внутри плана, не отдельным блоком.',
+  'В абзаце «как сделаю» назови и где задача обычно ломается: что будет самым тонким местом и что ты с этим делаешь. Это одна строка, показывающая, что задачу уже делал, а не читал в ТЗ.',
   'Не ругать постановку задачи, бюджет, конкурентов или выбранную технологию в первом сообщении.',
-  'Не писать по обязательной формуле: структура и длина должны следовать брифу и выбранному углу.',
-  'Цена и срок обязательны в самом тексте. Старт обязателен только когда подтверждён профилем продавца; при пустой настройке его нельзя выдумывать.',
-  'Цену и срок писать живой фразой вроде «По деньгам: 250 000 ₽ и 45 дней», а не таблицей «Стоимость — …, срок — …». Суммы писать с разрядами.',
+  'Не писать по обязательной формуле: структура и длина следуют эталону, а формулировки каждый раз живые, под заказ.',
+  'Цена и срок обязательны в самом тексте, живой фразой вроде «Ориентировочно 600 000 ₽ и 90 дней, исходя из того, как я понял задачу», не таблицей. Суммы писать с разрядами.',
   'Запрещены «важно отметить», «ключевой момент», «в современных реалиях», «является», «осуществляет», выводы «таким образом/подводя итог», правило трёх и формальная честность «не служит подтверждением».',
+  'Запрещено упоминать: Безопасную сделку, отзывы (у владельца их нет, любое упоминание врёт), «без подрядчиков» и «не агентство», дневные и часовые ставки, «Готов взяться», скидки и срочность «успейте».',
   'Старт называть только когда он подтверждён профилем продавца; при пустой настройке не выдумывать дату и не вставлять системную заглушку.',
   'Если подтверждёно имя из FL-профиля или чата, обратиться по имени. Не угадывать имя по логину.',
-  'Не использовать манипуляции, искусственную срочность и давление. Рабочая психология отклика — персонализация, конкретное доказательство, снижение риска и простой следующий шаг.',
+  'Интро под заказ: «Шесть лет делаю …» — называешь то, из чего состоит именно этот заказ. Магазин → «делаю интернет-магазины», заявки в CRM → «связываю сайты с CRM и мессенджерами», бот с мониторингом → «делаю телеграм-ботов и серверные движки». Ничего не выдумывать сверх реального стека и кейсов, но акцент смещать в домен заказа.',
+  'Стек под заказ. Если проект новый или стек в брифе не указан: Nest на бэкенде, Next на фронте, база по задаче (обычно Postgres). Если это допил или интеграция: называешь стек заказчика из брифа и говоришь о нём уверенно. Node.js и React голыми как основную пару не называть.',
+  'Если заказчик спрашивает про исходники или сервер: после сдачи исходники, схема БД и доступы остаются у заказчика.',
 ];
 
 export function selectVoiceprintExamples(examples: string[], leadText: string, limit = 3): string[] {
@@ -1049,6 +1050,12 @@ export function selectVoiceprintExamples(examples: string[], leadText: string, l
     .map((item) => item.content);
 }
 
+/**
+ * These six were written against the bot-and-partner briefs of the time, so a video
+ * pipeline brief matched on "telegram" and "анкета" and missed the one real video
+ * case entirely.  The list now covers the mechanics the owner's portfolio actually
+ * contains.
+ */
 const PORTFOLIO_CONCEPTS: Array<{ lead: RegExp; item: RegExp }> = [
   { lead: /(?:telegram|телеграм|max|макс|мессендж|бот)/iu, item: /(?:telegram|телеграм|max|макс|мессендж|бот|чат)/iu },
   { lead: /(?:партн[её]р|реферал|дилер|агентск)/iu, item: /(?:партн[её]р|реферал|дилер|франшиз|нетворкинг|участник)/iu },
@@ -1056,6 +1063,15 @@ const PORTFOLIO_CONCEPTS: Array<{ lead: RegExp; item: RegExp }> = [
   { lead: /(?:документ|файл|скриншот|свидетельств)/iu, item: /(?:документ|файл|фото|скриншот|ocr|акт|сч[её]т)/iu },
   { lead: /(?:qr|qr-код|ссылк|partner_id)/iu, item: /(?:qr|qr-код|ссылк|код|билет|идентификатор)/iu },
   { lead: /(?:уведомлен|менеджер|crm|амо|битрикс)/iu, item: /(?:уведомлен|менеджер|crm|амо|битрикс|диспетчер|оператор)/iu },
+  { lead: /(?:видео|ролик|shorts|монтаж|субтитр|стрим|youtube|подкаст)/iu, item: /(?:видео|ролик|монтаж|субтитр|стрим|плеер|таймкод|ffmpeg|hls)/iu },
+  { lead: /(?:нейросет|искусственн|llm|gpt|claude|распозна|транскриб)/iu, item: /(?:нейросет|llm|gpt|распозна|ocr|скрин[ие]р|rag|ии-)/iu },
+  { lead: /(?:модерац|согласован|утвержд|ревью)/iu, item: /(?:модерац|согласован|утвержд|ревью|верси)/iu },
+  { lead: /(?:оплат|плат[её]ж|эквайр|подписк|тариф)/iu, item: /(?:оплат|плат[её]ж|эквайр|подписк|тариф|биллинг)/iu },
+  { lead: /(?:расписан|бронир|слот|календар)/iu, item: /(?:расписан|бронир|слот|календар)/iu },
+  { lead: /(?:склад|остатк|каталог|номенклатур|поставщик)/iu, item: /(?:склад|остатк|каталог|номенклатур|поставщик|wms|маркетплейс)/iu },
+  { lead: /(?:карт[аыу]|геолокац|маршрут|трекер)/iu, item: /(?:карт[аеы]|геолокац|маршрут|трекер|логист)/iu },
+  { lead: /(?:отч[её]т|аналитик|дашборд|метрик|прогноз)/iu, item: /(?:отч[её]т|аналитик|дашборд|метрик|прогноз)/iu },
+  { lead: /(?:интеграц|синхрониз|выгрузк|вебхук)/iu, item: /(?:интеграц|синхрониз|выгрузк|вебхук)/iu },
 ];
 
 /**
@@ -1217,32 +1233,76 @@ export function proposalEstimateContext(
   return { mode: 'rough', reason, descriptionChars: description.length, confidence };
 }
 
-/** Cheap semantic-ish portfolio routing used only after the owner asks for a draft. */
-export function selectRelevantPortfolio(value: unknown, leadText: string): Record<string, unknown>[] {
-  if (!Array.isArray(value)) return [];
-  const stopWords = new Set([
-    'который', 'нужно', 'сайт', 'сайта', 'сайте', 'разработка', 'сделать', 'работа',
-    'проект', 'через', 'будет', 'можно', 'также', 'данные', 'система', 'должен',
-  ]);
-  const tokens = (text: string) => new Set(
-    text.toLowerCase().match(/[а-яёa-z0-9]{4,}/g)?.filter((word) => !stopWords.has(word)) || [],
+const PORTFOLIO_STOP_WORDS = new Set([
+  'который', 'нужно', 'сайт', 'сайта', 'сайте', 'разработка', 'сделать', 'работа',
+  'проект', 'через', 'будет', 'можно', 'также', 'данные', 'система', 'должен',
+  // Words that sit in almost every card and in almost every brief, so a match on
+  // them says nothing about whether the case actually fits.
+  'сервис', 'создание', 'создать', 'нужен', 'нужна', 'есть', 'этом', 'этот',
+  'чтобы', 'после', 'более', 'такие', 'такой', 'было', 'быть', 'может', 'сразу',
+]);
+
+/** Wide enough that the right case is almost never ranked out before the model reads it. */
+export const PORTFOLIO_SHORTLIST = 40;
+/** Full cards are expensive in the prompt; the picker decides which ones earn a slot. */
+export const PORTFOLIO_IN_PROMPT = 5;
+
+function portfolioTokens(text: string): Set<string> {
+  return new Set(
+    String(text).toLowerCase().match(/[а-яёa-z0-9]{4,}/g)?.filter((word) => !PORTFOLIO_STOP_WORDS.has(word)) || [],
   );
-  const leadTokens = tokens(leadText);
-  return value
-    .map((item, index) => {
-      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+}
+
+/**
+ * Counting shared words made every long card win: "ГОРОД.ONLINE" matched a video
+ * brief on "создание" and "обработка" while the one real video case lost.  Rare
+ * words carry the signal, so each match is weighted by how unusual it is across
+ * the portfolio, and only the strongest few matches count — otherwise a card wins
+ * by sheer description length instead of by fit.
+ */
+export function selectRelevantPortfolio(
+  value: unknown,
+  leadText: string,
+  limit = 6,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const rows = value.map((item) => (item && typeof item === 'object' ? item as Record<string, unknown> : {}));
+  const caseTokens = rows.map((row) => portfolioTokens(`${row.title || ''} ${row.description || ''}`));
+  const titleTokens = rows.map((row) => portfolioTokens(String(row.title || '')));
+  const documentFrequency = new Map<string, number>();
+  for (const set of caseTokens) for (const word of set) documentFrequency.set(word, (documentFrequency.get(word) || 0) + 1);
+  const total = Math.max(1, rows.length);
+  const weightOf = (word: string) => Math.log(1 + total / (1 + (documentFrequency.get(word) || 0)));
+  const averageSize = caseTokens.reduce((sum, set) => sum + set.size, 0) / total || 1;
+  // The brief's own title names the job; a word from it is worth more than one
+  // buried in the twelfth paragraph.
+  const headline = portfolioTokens(String(leadText).split(/\n/u)[0] || '');
+  const leadTokens = portfolioTokens(leadText);
+  const STRONGEST_MATCHES = 6;
+  return rows
+    .map((row, index) => {
       const itemText = `${row.title || ''} ${row.description || ''}`;
-      const caseTokens = tokens(itemText);
-      let score = 0;
-      for (const word of leadTokens) if (caseTokens.has(word)) score += 1;
-      for (const concept of PORTFOLIO_CONCEPTS) {
-        if (concept.lead.test(leadText) && concept.item.test(itemText)) score += 3;
+      const matches: number[] = [];
+      for (const word of leadTokens) {
+        if (!caseTokens[index].has(word)) continue;
+        let weight = weightOf(word);
+        if (headline.has(word)) weight *= 1.8;
+        if (titleTokens[index].has(word)) weight *= 1.4;
+        matches.push(weight);
       }
-      return { index, score, row };
+      matches.sort((left, right) => right - left);
+      let score = matches.slice(0, STRONGEST_MATCHES).reduce((sum, weight) => sum + weight, 0);
+      score /= 0.4 + 0.6 * (caseTokens[index].size / averageSize);
+      let concepts = 0;
+      for (const concept of PORTFOLIO_CONCEPTS) {
+        if (concept.lead.test(leadText) && concept.item.test(itemText)) concepts += 1;
+      }
+      score += Math.min(concepts, 2) * 0.8;
+      return { index, score: Number(score.toFixed(2)), row };
     })
     .sort((left, right) => right.score - left.score || left.index - right.index)
     .filter(({ score }) => score > 0)
-    .slice(0, 6)
+    .slice(0, Math.max(1, limit))
     .map(({ row, score }) => ({
       title: String(row.title || '').slice(0, 180),
       description: String(row.description || '').slice(0, 900),
@@ -1274,19 +1334,21 @@ export function selectRelevantPortfolio(value: unknown, leadText: string): Recor
  */
 const RESPONSE_CALIBRATION = [
   {
-    kind: 'Подробное ТЗ, оценка обоснованная',
-    example: 'Добрый день!\n\nГотов взяться, опыт в таких задачах есть. Делал похожее, TERRA MARKET, маркетплейс фермерских продуктов, где каталог, остатки у поставщиков и заказы жили в одной базе. Ссылка берётся строго из карточки portfolio.\n\nНюанс тут обычно один. Если сайт и приложение пишут остаток каждый по-своему, покупатель видит разные цифры, и ловится это уже на живых заказах.\n\nПо деньгам ориентировочно выходит точная цена и срок из commercial_terms, это исходя из того, как я понял задачу по вашему описанию. Товарная база у вас уже где-то ведётся или собираем с нуля? Если появятся вопросы, готов ответить здесь в чате или в телеграме, ник берётся из commercial_terms.contact_telegram.',
-    why: 'Цифра названа точно, но подана как оценка и привязана к пониманию задачи.',
+    // Ethalon v14, approved 2026-09-10. Numbers in examples are shape only: the real
+    // letter must take price, days and telegram from commercial_terms of that lead.
+    kind: 'Эталон v14: кто я с кейсом, как сделаю, условия строкой, один вопрос, контакт. 100–160 слов',
+    example: 'Добрый день!\n\nШесть лет делаю телеграм-ботов и серверные движки на Python: aiogram, Playwright, PostgreSQL, Docker. Похожая задача была — отказоустойчивый слой интеграций для сервиса на GetCourse: при сбоях терялось до семи процентов из четырёх тысяч заявок в месяц, после запуска очередь доставляет всё без потерь, а сбой виден в Telegram за пять минут. https://www.fl.ru/user/sporyshevsaveli/portfolio/8072073/\n\nПредлагаю так. Telegram-бот с личным кабинетом и мониторингом — как первый этап, чтобы вы увидели работающую систему у себя. Дальше адаптеры под ваши сайты: селекторы выношу в конфиги, правка при смене вёрстки занимает минуты, сессии с шифрованием токенов, прокси с авторотацией. Если интеграция встала — задачи поднимаются сами, алерт прилетает мне в Telegram. Финал — нагрузочный прогон и документация.\n\nОриентировочно 600 000 ₽ и 90 дней, исходя из того, как я понял задачу. Поддержка после сдачи — фиксом за месяц.\n\nЕсть ли у вас тестовые аккаунты в этих кабинетах? От этого зависит, на чём гонять приёмку.\n\nГотов созвониться или перепишемся: @saveliissdd',
+    why: 'Эталон утверждён владельцем. Первый абзац доказывает опытом, второй снимает главный риск заказа, условия не раздуты, вопрос один и неочевидный.',
   },
   {
-    kind: 'Две строки в заказе, оценка грубая',
-    example: 'Добрый день!\n\nВозьмусь, такие правки делал много раз. Собирал похожее, сайт бренда с управляемыми блоками, где новые разделы добавлялись без разработчика. Ссылка берётся строго из карточки portfolio.\n\nКосяк тут вылезает на адаптиве. Блоки, вынесенные в общий шаблон, начинают жить своей жизнью на планшетных ширинах, если состояния не описаны.\n\nНавскидку это порядка точной цены и срока из commercial_terms, но вводных пока мало, так что цифра очень примерная. Посмотрю задачу подробнее и посчитаю точнее. Скинете список правок или доступ к сайту? Если что, пишите в чат или в телеграм, ник берётся из commercial_terms.contact_telegram.',
-    why: 'Мало вводных признано прямо, названа только вилка порядка, дальше предложено уточнить.',
+    kind: 'Мало вводных: цена как ориентир, вопрос про объём',
+    example: 'Добрый день!\n\nШесть лет делаю интернет-магазины: каталог, корзина, оплата, интеграции доставки. Похожее делал в TERRA MARKET: каталог на пять тысяч позиций, раньше остатки поставщиков расходились с витриной раз в неделю, теперь витрина и заказы показывают одну цифру. https://www.fl.ru/user/sporyshevsaveli/portfolio/8057737/\n\nВ вашем заказе вводных пока мало, поэтому скажу порядок: базовый магазин выйдет в районе 255 000 ₽ и 40 дней, точнее посчитаю, как увижу список страниц и способы оплаты. Собирать буду на WordPress, минимум платных плагинов, чтобы вы сами правили контент без разработчика. Обычно узкое место здесь оплата и доставка: карточка тарифов у вас своя, поэтому уточню ниже.\n\nПоддержка после сдачи — фиксом за месяц.\n\nСколько товаров будет в каталоге и нужна ли онлайн-оплата?\n\nГотов созвониться или перепишемся: @saveliissdd',
+    why: 'При малых вводных цифра как ориентир и обещание пересчитать, состав работ не перечисляется, вопрос двигает к смете.',
   },
   {
-    kind: 'Стек не совпадает',
-    example: 'Добрый день!\n\nГотов взяться, такое уже делал. Конструктор форм с условной логикой и автосохранением, B2B-платформа грузоперевозок, там заявка складывалась из зависимых полей. Ссылка берётся строго из карточки portfolio. Стек там был другой, но логика состояния переносится один в один.\n\nГрабли в таких задачах всегда в одном месте, это черновик и валидация условий. Пользователь заполнил половину, обновил страницу, и если состояние не разведено с валидацией, данные теряются.\n\nПримерно выходит точная цена и срок из commercial_terms, исходя из того, как я понял объём по описанию. Условия для полей настраивает администратор или их достаточно зашить один раз? Вопросы можно задать в чате или в телеграме, ник берётся из commercial_terms.contact_telegram.',
-    why: 'Оговорка о стеке после доказательства, оценка примерная, ни одного тире и двоеточия.',
+    kind: 'Интеграция в чужой стек: уверенное владение, цена потери',
+    example: 'Добрый день!\n\nШесть лет связываю сайты с CRM и мессенджерами: WordPress, amoCRM, Telegram. Похожая задача была в DEALER CATALOG: сорок дилеров получали прайс Excel-рассылкой и работали с устаревшими ценами, теперь обновление занимает десять минут, заявка идёт в CRM без почты. https://www.fl.ru/user/sporyshevsaveli/portfolio/8067048/\n\nС вашим WordPress работаю уверенно, ничего без нужды не переписываю. Формы сохраню в базу до страницы благодарности, доставка заявок через очередь с повторами — это как раз то место, где интеграция обычно встаёт. Если форма отвалится, заявка не потеряется, а зайдёт при восстановлении, вы увидите это в журнале.\n\nОриентировочно 125 000 ₽ и 20 дней, исходя из того, как я понял задачу. Поддержка после сдачи — фиксом за месяц.\n\nСколько у вас форм покрыть, и на поддоменах один обработчик или свой у каждого?\n\nГотов созвониться или перепишемся: @saveliissdd',
+    why: 'Стек заказчика назван с уверенностью, риск повторной отправки назван и закрыт механикой, вопрос один с развилкой.',
   },
 ];
 
@@ -1382,7 +1444,8 @@ export class AiService {
       },
     };
     const result = await this.tasks.run<ModelCombinedLeadAnalysis>('lead_analysis_v2', payload);
-    return this.calibrateAnalysis(lead, result, result.understanding);
+    const dailyRate = Number((seller as Record<string, unknown>).daily_rate_rub) || DEFAULT_DAILY_RATE_RUB;
+    return this.calibrateAnalysis(lead, result, result.understanding, dailyRate);
   }
 
   analysisFingerprint(lead: Record<string, unknown>): string {
@@ -1455,9 +1518,12 @@ export class AiService {
     const configuredAvailability = String(
       seller.available_from || seller.availability || '',
     ).trim().slice(0, 160);
+    // The picker can legitimately choose a case the word ranking put 12th, so the
+    // review has to look at the same shortlist or it reports "кейс не использован".
     const portfolio = selectRelevantPortfolio(
       portfolioValue,
-      `${lead.title || ''} ${lead.description || ''}`,
+      `${lead.title || ''}\n${lead.description || ''}`,
+      PORTFOLIO_SHORTLIST,
     );
     const metrics = content ? proposalHumanityMetrics(content) : null;
     const usedCase = content
@@ -1489,87 +1555,90 @@ export class AiService {
     };
   }
 
+  // OpenRouter occasionally answers with prose instead of the JSON envelope
+  // (BrokerError). One short retry turns that flake into a delay instead of a
+  // permanently failed draft.
+  private async runComposeWithRetry(task: string, payload: Record<string, unknown>): Promise<DraftCompose> {
+    try {
+      return await this.tasks.run<DraftCompose>(task, payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/BrokerError|did not return a JSON/i.test(message)) throw error;
+      this.logger.warn(`Broker flake on ${task} (${message}); retrying once in 15s`);
+      await new Promise((resolve) => setTimeout(resolve, 15_000));
+      return await this.tasks.run<DraftCompose>(task, payload);
+    }
+  }
+
   async draftReply(context: Record<string, unknown>): Promise<string> {
-    const seller = await this.settings.getPublic('seller_profile') || {};
-    const style = await this.settings.getPublic('style_profile') || DEFAULT_STYLE_PROFILE;
-    const sourceLead = (context.lead || {}) as Record<string, unknown>;
+    const seller = (await this.settings.getPublic('seller_profile') || {}) as Record<string, unknown>;
     const allPortfolio = await this.settings.getPublic('fl_portfolio_cases') || [];
-    const portfolio = selectRelevantPortfolio(
-      allPortfolio,
-      `${sourceLead.title || ''} ${sourceLead.description || ''}`,
-    );
-    const technologyFit = proposalTechnologyFitContext(
-      sourceLead,
-      seller && typeof seller === 'object' ? seller as Record<string, unknown> : {},
-      allPortfolio,
-    );
-    const sourceMessages = Array.isArray(context.messages) ? context.messages : [];
+    const sourceLead = (context.lead || {}) as Record<string, unknown>;
+    const leadText = String(sourceLead.title || '') + '\n' + String(sourceLead.description || '');
     const mode = context.mode === 'chat' ? 'chat' : 'response';
-    const proposalProfile = proposalProfileForLead(sourceLead);
-    const [voiceResult, approvedResult, recentDraftResult] = await Promise.all([
-      mode === 'chat'
-        ? this.db.query<{ content: string }>(
-          `SELECT content FROM messages
-           WHERE direction='outbound' AND char_length(content) BETWEEN 8 AND 400
-           ORDER BY created_at DESC LIMIT 16`,
-        )
-        : this.db.query<{ content: string }>(
-          `SELECT content FROM drafts
-           WHERE (kind='initial_response' OR metadata->>'mode'='response')
-             AND metadata->>'owner_edited'='true'
-           ORDER BY updated_at DESC LIMIT 30`,
-        ),
-      this.db.query<{ content: string }>(
-        `SELECT content FROM drafts
-         WHERE (kind='initial_response' OR metadata->>'mode'='response')
-           AND (status IN ('approved','sent') OR metadata->>'owner_edited'='true')
-         ORDER BY updated_at DESC LIMIT 10`,
-      ),
-      this.db.query<{ content: string }>(
-        `SELECT content FROM drafts
-         WHERE (kind='initial_response' OR metadata->>'mode'='response')
-           AND status IN ('pending','approved','sent')
-         ORDER BY created_at DESC LIMIT 8`,
-      ),
-    ]);
+    // One deterministic shortlist; the model picks the case itself under proposal_rules.
+    const portfolio = selectRelevantPortfolio(allPortfolio, leadText, PORTFOLIO_IN_PROMPT);
+    // Anti-repeat compares against OTHER leads only: regenerating a draft for the
+    // same lead would otherwise collide with its own earlier version.
+    const recentDraftResult = await this.db.query<{ content: string }>(
+      `SELECT content FROM drafts
+       WHERE (kind='initial_response' OR metadata->>'mode'='response')
+         AND status IN ('pending','approved','sent')
+         AND lead_id <> $1
+       ORDER BY created_at DESC LIMIT 8`,
+      [String(sourceLead.id || '')],
+    );
     const recentDrafts = recentDraftResult.rows.map((row) => row.content);
     const client = sourceLead.client && typeof sourceLead.client === 'object'
       ? sourceLead.client as Record<string, unknown>
       : {};
     const clientName = String(client.fl_name || client.name || '').trim().slice(0, 80);
-    const configuredAvailability = String(
-      (seller as Record<string, unknown>).available_from
-      || (seller as Record<string, unknown>).availability
-      || '',
-    ).trim().slice(0, 160);
-    const availability = configuredAvailability ? `Старт: ${configuredAvailability}` : '';
-    const estimate = proposalEstimateContext(
-      sourceLead,
-      (sourceLead.analysis && typeof sourceLead.analysis === 'object' ? sourceLead.analysis : {}) as Record<string, unknown>,
-    );
-    const variationPlan = proposalVariationPlan(
-      recentDrafts,
-      String(sourceLead.external_id || sourceLead.id || sourceLead.title || ''),
-    );
+    const leadAnalysis = (sourceLead.analysis && typeof sourceLead.analysis === 'object'
+      ? sourceLead.analysis
+      : {}) as Record<string, unknown>;
+    const estimate = proposalEstimateContext(sourceLead, leadAnalysis);
+    const priceOverride = Math.max(0, Math.round(Number(context.priceOverride) || 0));
+    // Fast pre-pass: a structured read of the order (price kind, the client's own
+    // questions, engagement type, traps) so the draft reacts to what is actually
+    // written.  Purely additive: on any failure the draft runs exactly as before.
+    const orderPassport = mode === 'response'
+      ? await this.buildOrderPassport(sourceLead)
+      : null;
+    const configuredAvailability = String(seller.available_from || seller.availability || '').trim().slice(0, 160);
+    const contactTelegram = String(seller.contact_telegram || '').trim() || undefined;
     const commercialTerms: ProposalCommercialContext = {
-      price: Number(sourceLead.recommended_price) || undefined,
+      price: priceOverride || Number(sourceLead.recommended_price) || undefined,
       days: Number(sourceLead.recommended_days) || undefined,
-      availability: availability || undefined,
+      availability: configuredAvailability ? 'Старт: ' + configuredAvailability : undefined,
       availabilityConfigured: Boolean(configuredAvailability),
-      clientName: clientName || undefined,
-      hookPattern: variationPlan.hookPattern,
-      acceptanceLabel: variationPlan.acceptanceLabel,
-      technologyFit,
-      contactTelegram: String((seller as Record<string, unknown>).contact_telegram || '').trim() || undefined,
+      contactTelegram,
       estimateMode: estimate.mode,
     };
-    const voiceprintExamples = selectVoiceprintExamples(
-      voiceResult.rows.map((row) => row.content),
-      `${sourceLead.title || ''} ${sourceLead.description || ''}`,
-      3,
-    );
-    const voiceprintReady = mode === 'chat' ? voiceprintExamples.length >= 2 : voiceResult.rows.length >= 15;
-    const compactContext = {
+    const payload = {
+      seller,
+      mode,
+      portfolio,
+      // The ethalon: owner's structure, tone, bans and approved case metrics.
+      proposal_rules: RESPONSE_PRINCIPLES,
+      calibration_examples: RESPONSE_CALIBRATION,
+      commercial_terms: {
+        price_rub: commercialTerms.price ?? null,
+        duration_days: commercialTerms.days ?? null,
+        estimate_mode: estimate.mode,
+        estimate_rule: estimate.mode === 'grounded'
+          ? 'Цену и срок называй как ориентировочную оценку, а не готовую смету: обязательно скажи, что цифра примерная и исходит из твоего понимания задачи. Например: «Ориентировочно 250 000 ₽ и 45 дней, объём я понял из вашего текста». Оборот «по описанию» не используй.'
+          : 'Информации в заказе мало (' + estimate.reason + '). Назови только грубый порядок цифр и прямо скажи, что вводных мало, поэтому это очень приблизительно, а точные цену и срок посчитаешь, когда разберётесь в деталях. Например: «Навскидку это порядка 250 000 рублей и около 45 дней, но вводных пока мало, так что цифра очень примерная. Посмотрю задачу подробнее и посчитаю точнее».',
+        fixed_budget_rule: priceOverride
+          ? 'У заказа фиксированный бюджет ровно ' + priceWithSpaces(priceOverride) + ' ₽. В тексте называй цену ровно ' + priceWithSpaces(priceOverride) + ' ₽ — не ниже, не выше и без диапазона.'
+          : null,
+        availability: configuredAvailability ? 'Старт: ' + configuredAvailability : null,
+        availability_configured: Boolean(configuredAvailability),
+        client_name: clientName || null,
+        contact_telegram: contactTelegram || null,
+        contact_rule: contactTelegram
+          ? 'Финальная строка дословно: «Готов созвониться или перепишемся: ' + contactTelegram + '». Ник пиши дословно.'
+          : 'Контакт для связи не настроен: не выдумывай ник и не зови в мессенджеры.',
+      },
       lead: {
         title: sourceLead.title,
         description: String(sourceLead.description || '').slice(0, 12_000),
@@ -1579,84 +1648,16 @@ export class AiService {
         recommended_days: sourceLead.recommended_days,
         analysis: sourceLead.analysis,
         requirements: sourceLead.requirements,
-        client: {
-          name: clientName || null,
-          username: client.fl_username || null,
-        },
+        client: { name: clientName || null, username: client.fl_username || null },
       },
-      messages: sourceMessages.slice(-50).map((message: Record<string, unknown>) => ({
+      order_passport: orderPassport,
+      messages: (Array.isArray(context.messages) ? context.messages : []).slice(-50).map((message: Record<string, unknown>) => ({
         direction: message.direction,
         author: message.author,
         content: String(message.content || '').slice(0, 4_000),
       })),
-    };
-    const payload = {
-      seller,
-      style,
-      portfolio,
-      mode,
-      proposal_profile: {
-        name: proposalProfile,
-        ...PROPOSAL_LIMITS[proposalProfile],
-        reason: proposalProfile === 'compact'
-          ? 'Точечная задача: сохранить всю продающую логику, но не раздувать простой объём.'
-          : proposalProfile === 'premium'
-            ? 'Дорогой сложный проект: показать этапность, критерии приёмки и управляемое снижение риска.'
-            : 'Обычный отклик FL.ru по исследовательской норме 100–200 слов.',
-      },
-      response_principles: RESPONSE_PRINCIPLES,
-      calibration_examples: RESPONSE_CALIBRATION,
-      variation_plan: {
-        required_hook_pattern: variationPlan.hookPattern,
-        required_acceptance_label: variationPlan.acceptanceLabel,
-        required_acceptance_text: variationPlan.acceptanceText,
-      },
-      opening_plan: proposalOpeningPlan(
-        String(sourceLead.external_id || sourceLead.id || sourceLead.title || ''),
-        clientName,
-        recentDraftResult.rows.map((row) => row.content),
-      ),
-      commercial_terms: {
-        price_rub: commercialTerms.price,
-        duration_days: commercialTerms.days,
-        availability: availability || null,
-        availability_configured: Boolean(configuredAvailability),
-        availability_warning: configuredAvailability
-          ? null
-          : 'Дата старта не подтверждена владельцем. Не выдумывать и не вставлять системную заглушку; черновик требует ручной проверки доступности.',
-        client_name: clientName || null,
-        greeting_required: Boolean(clientName),
-        estimate_mode: estimate.mode,
-        estimate_reason: estimate.reason,
-        estimate_rule: estimate.mode === 'grounded'
-          ? 'Цену и срок называй как ОЦЕНКУ, а не как смету. Обязательно скажи, что это примерно и что цифра исходит из того, как ты понял задачу по описанию. Например: «Ориентировочно выходит 250 000 рублей и 45 дней, это исходя из того, как я понял задачу по описанию».'
-          : `Информации в заказе мало (${estimate.reason}) Назови только грубый порядок цифр и прямо скажи, что вводных мало, поэтому это очень приблизительно, а точные цену и срок посчитаешь, когда разберётесь в деталях. Например: «Навскидку это порядка 250 000 рублей и около 45 дней, но вводных пока мало, так что цифра очень примерная. Посмотрю задачу подробнее и посчитаю точнее».`,
-        contact_telegram: commercialTerms.contactTelegram || null,
-        contact_rule: commercialTerms.contactTelegram
-          ? `После цены и срока закончи так: один короткий вопрос по задаче, затем строка о том, что готов ответить на любые вопросы в чате или в телеграме ${commercialTerms.contactTelegram}. Ник напиши дословно.`
-          : 'Контакт для связи не настроен: не выдумывай ник и не зови в мессенджеры.',
-      },
-      technology_fit: technologyFit,
-      submission_fields: {
-        price: 'FL.ru получает recommended_price отдельным числовым полем',
-        days: 'FL.ru получает recommended_days отдельным числовым полем',
-        cover_letter: 'Текст обязательно повторяет цену и срок. Старт добавляется только из подтверждённой настройки профиля',
-      },
+      recent_drafts: recentDrafts.slice(0, 5).map((row) => row.slice(0, 560)),
       owner_instructions: String(context.ownerInstructions || '').slice(0, 4_000),
-      voiceprint: {
-        source: mode === 'chat' ? 'Ручные исходящие сообщения владельца.' : 'Только отклики, которые владелец отредактировал вручную. Просто одобренные AI-черновики в voiceprint не попадают.',
-        ready: voiceprintReady,
-        sample_count: voiceResult.rows.length,
-        minimum_samples: mode === 'chat' ? 2 : 15,
-        rules: voiceprintReady
-          ? 'Использовать только ритм, обращения и привычные связки. Факты, имена, цены, сроки и кейсы из примеров переносить запрещено.'
-          : 'Корпус голоса ещё мал. Не выдавать approved_examples за голос владельца; писать по общим правилам живого делового сообщения.',
-        examples: voiceprintExamples.map((content) => content.slice(0, 560)),
-      },
-      voice_examples: voiceprintExamples.map((content) => content.slice(0, 300)),
-      approved_examples: approvedResult.rows.slice(0, 3).map((row) => row.content.slice(0, 560)),
-      recent_drafts: recentDraftResult.rows.map((row) => row.content.slice(0, 560)),
-      context: compactContext,
     };
 
     if (mode === 'chat') {
@@ -1673,33 +1674,25 @@ export class AiService {
       return content;
     }
 
-    // Generate and self-edit in one model call. Deterministic checks below still
-    // inspect the same final properties, and ProcessorService keeps a flagged
-    // draft instead of silently discarding it.
-    const reviewed = await this.tasks.run<DraftCompose>(
-      'draft_compose',
-      this.fitForBroker('draft_compose', payload),
-    );
-    const content = normalizeProposalFormatting(String(reviewed.content || ''), commercialTerms);
-    const finalIssues = this.draftQualityIssues(
-      content,
-      mode,
-      recentDraftResult.rows.map((row) => row.content),
-      proposalProfile,
-      commercialTerms,
-    );
-    finalIssues.push(...portfolioLinkIssues(content, portfolio));
-    finalIssues.push(...portfolioEvidenceIssues(content, portfolio));
-    finalIssues.push(...portfolioHumanityIssues(content, portfolio));
-    finalIssues.push(...(Array.isArray(reviewed.issues) ? reviewed.issues.map((issue) => String(issue)) : []));
-    if (Number(reviewed.human_score) < 85) finalIssues.push('Итоговый текст звучит как AI-шаблон.');
-    if (Number(reviewed.sales_score) < 85) finalIssues.push('Итоговый текст не даёт достаточной причины ответить.');
-    if (Number(reviewed.specificity_score) < 90) finalIssues.push('Итоговому тексту не хватает деталей конкретного заказа.');
-    if (Number(reviewed.factual_score) < 100) finalIssues.push('Итоговый текст содержит неподтверждённый факт.');
-    const finalContent = content.charAt(0).toUpperCase() + content.slice(1);
-    const blockingFinalIssues = proposalFinalBlockingIssues(content, [...new Set(finalIssues)]);
-    if (blockingFinalIssues.length) throw new ProposalQualityError(finalContent, blockingFinalIssues);
-    return finalContent;
+    // Gate removed (owner decision): one compose, ship as-is.  The deterministic
+    // review still runs at draft creation and records warnings in metadata, and
+    // nothing is auto-sent without the owner.
+    const composePayload: Record<string, unknown> = this.fitForBroker('draft_compose', payload);
+    const attempt = await this.runComposeWithRetry('draft_compose', composePayload);
+    const content = normalizeProposalFormatting(String(attempt.content || ''), commercialTerms);
+    if (priceOverride >= 10_000) {
+      const mismatched = proposalNamedPrices(content).filter((named) => named !== priceOverride);
+      if (mismatched.length) {
+        this.logger.warn(`draft_compose price mismatch: ${mismatched.join(', ')} vs ${priceOverride}`);
+      }
+    }
+    return content.charAt(0).toUpperCase() + content.slice(1);
+  }
+
+  private async buildOrderPassport(_lead: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    // Disabled (owner, 2026-09-09): the passport pre-pass stalled drafts for minutes.
+    // Compose starts immediately, like before the pre-pass existed.
+    return null;
   }
 
   private draftQualityIssues(
@@ -1728,18 +1721,6 @@ export class AiService {
     }
     const similarity = Math.max(0, ...recentDrafts.map((draft) => this.textSimilarity(content, draft)));
     if (similarity >= 0.55) issues.push('Текст слишком похож на один из недавних откликов: поменяй тип захода, длину, синтаксис и доказательство.');
-    const recentCredentialCount = recentDrafts.filter((draft) => /(?:6|шесть)\s+лет|яндекс/i.test(draft)).length;
-    if (/(?:6|шесть)\s+лет|яндекс/i.test(content) && recentCredentialCount >= 2) {
-      issues.push('Стаж или Яндекс уже повторялись в недавних откликах: замени этот заполнитель конкретным решением, кейсом или следующим шагом.');
-    }
-    const recentCaseCtaCount = recentDrafts.filter((draft) => /могу показать/i.test(draft)).length;
-    if (/могу показать/i.test(content) && recentCaseCtaCount >= 3) {
-      issues.push('Фраза «могу показать» уже повторяется: оставь её только при очень близком кейсе и сформулируй следующий шаг иначе.');
-    }
-    const recentMaterialCtaCount = recentDrafts.filter((draft) => /(?:пришлите|отправьте|покажите)(?=$|[^\p{L}])/iu.test(draft)).length;
-    if (/(?:пришлите|отправьте|покажите)(?=$|[^\p{L}])/iu.test(content) && recentMaterialCtaCount >= 3) {
-      issues.push('Просьба прислать материалы уже повторяется в недавних откликах: выбери другой естественный следующий шаг или один важный вопрос.');
-    }
     return issues;
   }
 
@@ -1756,11 +1737,17 @@ export class AiService {
     return intersection / Math.min(a.size, b.size);
   }
 
-  private calibrateAnalysis(lead: Record<string, unknown>, result: ModelLeadAnalysis, understanding: LeadUnderstanding): LeadAnalysis {
+  private calibrateAnalysis(
+    lead: Record<string, unknown>,
+    result: ModelLeadAnalysis,
+    understanding: LeadUnderstanding,
+    dailyRate = DEFAULT_DAILY_RATE_RUB,
+  ): LeadAnalysis {
     const rawPrice = Math.max(0, Math.round(Number(result.recommended_price) || 0));
     const rawDays = Math.max(1, Math.round(Number(result.recommended_days) || 1));
     const selfContainedIntegrationCategories: PricingCategory[] = [
       'automation_or_bot',
+      'parsing_scraping',
       'store_complex',
       'crm_admin_analytics',
       'platform_mvp',
@@ -1778,8 +1765,16 @@ export class AiService {
       modifiers: pricingModifiers,
       estimatedDays: rawDays,
     });
-    const price = catalog?.price ?? rawPrice;
-    const days = catalog?.days ?? rawDays;
+    // Price the actual list of work when the analyzer produced one, and keep the
+    // catalogue as the sanity check rather than as the answer.
+    const bottomUp = calculateBottomUpPrice(result.work_breakdown, dailyRate);
+    const estimate = reconcileEstimate(bottomUp, catalog);
+    // The cheap path is only worth offering when it is genuinely cheaper; a "lean"
+    // option that costs 80% of the full build just makes the letter longer.
+    const leanRaw = calculateBottomUpPrice(result.lean_breakdown, dailyRate);
+    const lean = leanRaw && leanRaw.price < estimate.price * 0.7 ? leanRaw : null;
+    const price = estimate.price || rawPrice;
+    const days = estimate.days || rawDays;
     const technicalFit = this.clampScore(result.technical_fit);
     let commercialFit = this.clampScore(result.commercial_fit);
     const briefQuality = this.clampScore(result.brief_quality);
@@ -1787,20 +1782,28 @@ export class AiService {
     const explicitBudget = this.extractExplicitBudget(lead.budget_text);
     const severeBudgetMismatch = explicitBudget !== null && price > explicitBudget * 2.5;
     if (severeBudgetMismatch) commercialFit = Math.min(commercialFit, 30);
+    // An order that cannot pay for itself is not a fit, however well it matches
+    // the stack: a favicon and a 245 000 ₽ site used to score the same.
+    const minDealPrice = Math.max(0, Number(process.env.MIN_DEAL_PRICE_RUB || DEFAULT_MIN_DEAL_PRICE_RUB));
+    const belowMinDeal = price < minDealPrice || (explicitBudget !== null && explicitBudget < minDealPrice);
+    const dealValue = dealValueScore(price);
     let score = Math.round(
-      technicalFit * 0.55
-      + commercialFit * 0.2
-      + briefQuality * 0.1
-      + (100 - deliveryRisk) * 0.15,
+      technicalFit * 0.45
+      + commercialFit * 0.18
+      + briefQuality * 0.07
+      + (100 - deliveryRisk) * 0.1
+      + dealValue * 0.2,
     );
     if (understanding.buyer_intent === 'irrelevant') score = Math.min(score, 25);
     if (understanding.buyer_intent === 'unrealistic') score = Math.min(score, 45);
     if (understanding.buyer_intent === 'contradictory') score = Math.min(score, 60);
+    if (belowMinDeal) score = Math.min(score, 45);
     const blockedIntent = ['irrelevant', 'unrealistic'].includes(understanding.buyer_intent);
     const shouldRespond = Boolean(
       result.should_respond
       && !blockedIntent
       && !severeBudgetMismatch
+      && !belowMinDeal
       && technicalFit >= 60
       && commercialFit >= 35,
     );
@@ -1815,15 +1818,38 @@ export class AiService {
       commercial_fit: commercialFit,
       brief_quality: briefQuality,
       delivery_risk: deliveryRisk,
+      deal_value: dealValue,
       should_respond: shouldRespond,
       recommended_price: price,
       recommended_days: days,
+      size_grade: sizeGrade(price),
+      underpriced: severeBudgetMismatch
+        ? { named_budget: Number(explicitBudget), fair_price: price, ratio: underpricingRatio(price, Number(explicitBudget)) ?? 0 }
+        : null,
+      ltv_stage_signal: (result as { project_staging?: boolean }).project_staging === true,
       pricing_category: catalog?.category ?? result.pricing_category,
       pricing_level: catalog?.level ?? result.pricing_level,
       pricing_modifiers: catalog?.modifiers ?? result.pricing_modifiers,
       understanding,
+      work_breakdown: Array.isArray(result.work_breakdown)
+        ? result.work_breakdown.slice(0, 14) as Array<Record<string, unknown>>
+        : undefined,
+      price_range: bottomUp
+        ? [bottomUp.priceLow, bottomUp.priceHigh]
+        : undefined,
+      days_range: bottomUp
+        ? [bottomUp.daysLow, bottomUp.daysHigh]
+        : undefined,
+      estimate_source: estimate.source,
+      lean_price: lean?.price,
+      lean_days: lean?.days,
+      lean_tradeoff: lean ? String(result.lean_tradeoff || '').slice(0, 240) : undefined,
       client_value: catalog
-        ? `Категория: ${catalog.label}, уровень ${catalog.level}${modifierText}. Цена ${price.toLocaleString('ru-RU')} ₽, срок ${days} дней. Допущение: ${assumption}`
+        ? `Категория: ${catalog.label}, уровень ${catalog.level}${modifierText}. Рыночная цена ${price.toLocaleString('ru-RU')} ₽, срок ${days} дней${
+          bottomUp
+            ? `, вилка по разбору работ ${bottomUp.priceLow.toLocaleString('ru-RU')}–${bottomUp.priceHigh.toLocaleString('ru-RU')} ₽${estimate.gap && estimate.gap >= 1.5 ? `, смета расходилась с рынком в ${estimate.gap} раза, проверь категорию и уровень` : ''}`
+            : ''
+        }. Допущение: ${assumption}`
         : result.client_value,
     };
   }

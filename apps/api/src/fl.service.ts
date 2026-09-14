@@ -74,6 +74,25 @@ export function matchesExistingFlOffer(existingOffer: string, draftContent: stri
   return draftTokens.length > 0 && matched / draftTokens.length >= 0.85;
 }
 
+/**
+ * The portfolio list is rebuilt from scratch on every 30-minute sync, so anything FL.ru
+ * does not serve is dropped.  Cases written by hand for a niche with no published work
+ * yet live only here, and without carrying them over they silently disappear before the
+ * owner ever gets to publish them.  A carried case retires once FL.ru serves the same
+ * URL or the same title, because from then on the scraped copy is the source of truth.
+ */
+export function carryOverManualCases(
+  scraped: Array<Record<string, unknown>>,
+  stored: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const key = (value: unknown) => String(value || '').trim().toLowerCase();
+  const scrapedUrls = new Set(scraped.map((item) => key(item.url)).filter(Boolean));
+  const scrapedTitles = new Set(scraped.map((item) => key(item.title)).filter(Boolean));
+  return stored.filter((item) => String(item.source || '') === 'manual'
+    && !(key(item.url) && scrapedUrls.has(key(item.url)))
+    && !scrapedTitles.has(key(item.title)));
+}
+
 @Injectable()
 export class FlService {
   private readonly logger = new Logger(FlService.name);
@@ -169,15 +188,15 @@ export class FlService {
         if (result.rows[0]) created += 1;
       }
 
-      // Database insertion and queue publication are not atomic. Reconcile all
-      // recent idle leads on every scan so a short Redis outage cannot leave an
-      // order invisible and unanalyzed forever.
+      // Database insertion and queue publication are not atomic. Reconcile recent
+      // idle leads on every scan so a short Redis outage cannot leave a fresh order
+      // invisible and unanalyzed. Orders older than 24 hours are ignored on purpose.
       const pending = await this.db.query<{ id: string }>(
         `SELECT id FROM leads
          WHERE source='fl' AND analysis_state='idle'
            AND external_id NOT LIKE 'dialog:%'
-           AND created_at >= now()-interval '24 hours'
-         ORDER BY created_at LIMIT 50`,
+           AND created_at >= now() - interval '24 hours'
+         ORDER BY created_at DESC LIMIT 2000`,
       );
       const analysisBucket = Math.floor(Date.now() / 60_000);
       for (const lead of pending.rows) {
@@ -271,6 +290,8 @@ export class FlService {
         response_days_min: detail.response_days_min,
         response_days_max: detail.response_days_max,
         age_minutes_at_parse: detail.age_minutes_at_parse,
+        budget_amount: detail.budget_amount,
+        budget_kind: detail.budget_kind,
         attachments: files,
       };
       await this.db.query(
@@ -298,7 +319,7 @@ export class FlService {
     try {
       const page = await browser.newPage();
       await page.setCookie(...cookies);
-      await page.goto('https://www.fl.ru/messages/', { waitUntil: 'networkidle2', timeout: 40_000 });
+      await this.gotoFl(page, 'https://www.fl.ru/messages/');
       await this.assertSession(page);
       // FL renders the chat list after navigation has already become network-idle.
       // Reading immediately intermittently produced a false, healthy "0 chats" result.
@@ -331,7 +352,7 @@ export class FlService {
         const chatPage = await browser.newPage();
         try {
           await chatPage.setCookie(...cookies);
-          await chatPage.goto(`https://www.fl.ru/messages/?dialogId=${encodeURIComponent(chat.dialogId)}&dialogType=offer`, { waitUntil: 'networkidle2', timeout: 40_000 });
+          await this.gotoFl(chatPage, `https://www.fl.ru/messages/?dialogId=${encodeURIComponent(chat.dialogId)}&dialogType=offer`);
           await this.assertSession(chatPage);
           await chatPage.waitForSelector('[id^="mes-"]', { timeout: 10_000 }).catch(() => undefined);
           const rawParsed = await chatPage.evaluate(() => Array.from(document.querySelectorAll('[id^="mes-"]')).map((element) => {
@@ -441,7 +462,9 @@ export class FlService {
       }
       const page = await browser.newPage();
       await page.setCookie(...cookies);
-      await page.goto(projectUrl.toString(), { waitUntil: 'networkidle2', timeout: 40_000 });
+      await this.gotoFl(page, projectUrl.toString());
+      await page.waitForSelector('body', { timeout: 30_000 }).catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
       await this.assertSession(page);
       const existingOffer = await page.$eval('#my-offer', (element) => element.textContent || '')
         .catch(() => '');
@@ -466,10 +489,10 @@ export class FlService {
         if (!['fl.ru', 'www.fl.ru'].includes(target.hostname)) {
           throw new OutboundPreflightError('layout_change', 'Кнопка отклика ведёт за пределы FL.ru');
         }
-        await page.goto(target.toString(), { waitUntil: 'networkidle2', timeout: 20_000 });
+        await this.gotoFl(page, target.toString(), 45_000);
         await this.assertSession(page);
       }
-      await page.waitForSelector('textarea[name="descr"]', { timeout: 15_000 }).catch((error) => {
+      await page.waitForSelector('textarea[name="descr"]', { timeout: 30_000 }).catch((error) => {
         throw new OutboundPreflightError('layout_change', 'Форма отклика FL.ru не найдена: интерфейс изменился', { cause: error });
       });
       await page.$eval('textarea[name="descr"]', (el, value) => {
@@ -479,16 +502,39 @@ export class FlService {
       }, input.content);
       if (input.price) await this.setInput(page, 'input[name="cost_from"]', String(input.price));
       if (input.days) await this.setInput(page, 'input[name="time_from"]', String(input.days));
+      const consentClicked = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const consent = buttons.find((button) => /соглашаюсь с условиями/i.test(button.textContent || ''));
+        if (consent) {
+          consent.click();
+          return true;
+        }
+        return false;
+      });
+      if (consentClicked) {
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+        const value = await page.$eval('textarea[name="descr"]', (el) => (el as HTMLTextAreaElement).value).catch(() => '');
+        if (value !== input.content) {
+          await page.$eval('textarea[name="descr"]', (el, next) => {
+            const field = el as HTMLTextAreaElement;
+            field.value = String(next);
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+          }, input.content);
+        }
+      }
       const submit = await page.$('button[type="submit"]');
       if (!submit) throw new OutboundPreflightError('layout_change', 'Кнопка отправки FL.ru не найдена: интерфейс изменился');
       try {
         await submit.click();
         await new Promise((resolve) => setTimeout(resolve, 2_500));
-        const textarea = await page.$('textarea[name="descr"]');
-        if (textarea) {
-          const value = await page.$eval('textarea[name="descr"]', (el) => (el as HTMLTextAreaElement).value);
-          if (value === input.content) {
-            throw new OutboundDeliveryUnknownError('FL.ru не подтвердил отправку отклика; проверьте проект вручную');
+        const offerNow = await page.$('#my-offer');
+        if (!offerNow) {
+          const textarea = await page.$('textarea[name="descr"]');
+          if (textarea) {
+            const value = await page.$eval('textarea[name="descr"]', (el) => (el as HTMLTextAreaElement).value);
+            if (value === input.content) {
+              throw new OutboundDeliveryUnknownError('FL.ru не подтвердил отправку отклика; проверьте проект вручную');
+            }
           }
         }
       } catch (error) {
@@ -511,7 +557,9 @@ export class FlService {
     try {
       const page = await browser.newPage();
       await page.setCookie(...cookies);
-      await page.goto(`https://www.fl.ru/messages/?dialogId=${encodeURIComponent(dialogId)}&dialogType=offer`, { waitUntil: 'networkidle2', timeout: 40_000 });
+      await this.gotoFl(page, `https://www.fl.ru/messages/?dialogId=${encodeURIComponent(dialogId)}&dialogType=offer`);
+      await page.waitForSelector('body', { timeout: 30_000 }).catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
       await this.assertSession(page);
       const selector = 'textarea[placeholder*="Сообщение"], textarea.form-control, #message-text';
       await page.waitForSelector(selector, { timeout: 15_000 }).catch((error) => {
@@ -653,7 +701,16 @@ export class FlService {
     const title = clean($('h1').first().text());
     const description = clean($('.fl-project-content__description-text').first().text());
     if (!title || !description) throw new Error('FL project page is missing title or description');
-    const budget = bodyLines.find((line) => line.startsWith('Бюджет:'))?.replace(/^Бюджет:\s*/, '') || '';
+    // Fixed budgets render as «Бюджет:» label line with the amount on the next line
+    // («150 000 руб»); negotiable ones read «Бюджет: договорная». Without the fallback
+    // the parser saw an empty label line and stored no budget at all.
+    const budgetLineIdx = bodyLines.findIndex((line) => line.startsWith('Бюджет:'));
+    const budgetLabelLine = budgetLineIdx >= 0 ? bodyLines[budgetLineIdx] : '';
+    const budgetNextLine = budgetLineIdx >= 0 ? String(bodyLines[budgetLineIdx + 1] || '') : '';
+    const budget = budgetLabelLine.replace(/^Бюджет:\s*/, '') || budgetNextLine;
+    const budgetAmountMatch = budget.match(/(\d[\d\s]{2,12})/);
+    const budgetAmount = budgetAmountMatch ? Number(budgetAmountMatch[1].replace(/\s+/g, '')) : null;
+    const budgetKind = budgetAmount && budgetAmount > 0 ? 'fixed' : (/договорн/i.test(budget) ? 'negotiable' : null);
     const published = body.match(/Опубликован\s+(\d{2}\.\d{2}\.\d{4}\s+в\s+\d{2}:\d{2})/i)?.[1] || '';
     const registered = body.match(/Зарегистрирован:\s*([^|]{1,120}?)(?=\s+(?:Откликнулись|Бюджет|Опубликован|$))/i)?.[1]?.trim() || '';
     const responseMatch = body.match(/Откликнулись:\s*([\d\s]+)\s+фрилансер/i);
@@ -661,7 +718,9 @@ export class FlService {
     const daysMatch = body.match(/Сроки:\s*от\s*([\d\s]+)\s*до\s*([\d\s]+)\s*д/i);
 
     const candidates: Array<{ url: string; name: string }> = [];
-    const roots = $('.fl-project-content__description-text, [class*="attachment"], [class*="project-file"]');
+    // fl.ru renders the attach block as `class="b-layout mt-22 base-attach-class"`,
+    // so `[class*="attachment"]` never matches; `[class*="attach"]` covers both.
+    const roots = $('.fl-project-content__description-text, [class*="attach"], [class*="project-file"]');
     roots.find('a[href]').each((_, element) => {
       candidates.push({ url: $(element).attr('href') || '', name: clean($(element).text()) });
     });
@@ -705,6 +764,8 @@ export class FlService {
       response_days_min: number(daysMatch?.[1]),
       response_days_max: number(daysMatch?.[2]),
       age_minutes_at_parse: publishedAt ? Math.max(0, Math.round((Date.now() - publishedAt.getTime()) / 60_000)) : null,
+      budget_amount: budgetAmount,
+      budget_kind: budgetKind,
       client: {
         ...(identity.name ? { fl_name: identity.name } : {}),
         ...(identity.username ? { fl_username: identity.username } : {}),
@@ -723,7 +784,7 @@ export class FlService {
           || process.env.FL_LOGIN || '').trim();
         if (!portfolioLogin) throw new Error('Не задан логин FL для синхронизации портфолио');
         // /my_portfolio/ does not exist on FL.ru and answers 404.
-        await page.goto(`https://www.fl.ru/users/${encodeURIComponent(portfolioLogin)}/portfolio/`, { waitUntil: 'networkidle2', timeout: 40_000 });
+        await this.gotoFl(page, `https://www.fl.ru/users/${encodeURIComponent(portfolioLogin)}/portfolio/`);
         await this.assertSession(page);
         const path = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]'))
           .map((element) => element.getAttribute('href') || '')
@@ -743,6 +804,13 @@ export class FlService {
     const uniqueUrls = [...new Set(urls)].slice(0, 120); // was 40: the owner has 87 published works
     const storedCases = await this.settings.getPublic<Array<Record<string, unknown>>>('fl_portfolio_cases') || [];
     const storedByUrl = new Map(storedCases.map((item) => [String(item.url || ''), item]));
+    // A hand-written case has no FL.ru address until the owner publishes it, so once it
+    // appears the URL lookup misses and the structured proof fields written by hand would
+    // be replaced by the empty defaults below.  Title is the only stable key across that
+    // transition.
+    const storedByTitle = new Map(storedCases
+      .filter((item) => String(item.title || '').trim())
+      .map((item) => [String(item.title).trim().toLowerCase(), item]));
     const cases: Array<Record<string, unknown>> = [];
     for (const caseUrl of uniqueUrls) {
       const caseResponse = await fetch(caseUrl, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' }, signal: AbortSignal.timeout(25_000) });
@@ -751,7 +819,7 @@ export class FlService {
       const title = casePage('.fl-portfolio-content-header__text').first().text().replace(/\s+/g, ' ').trim();
       const description = casePage('.fl-portfolio-content-text').first().text().replace(/\s+/g, ' ').trim();
       if (title && description) {
-        const stored = storedByUrl.get(caseUrl) || {};
+        const stored = storedByUrl.get(caseUrl) || storedByTitle.get(title.trim().toLowerCase()) || {};
         cases.push({
           title,
           description: description.slice(0, 8_000),
@@ -763,9 +831,11 @@ export class FlService {
           result: String(stored.result || '').slice(0, 1_000),
           stack: String(stored.stack || '').slice(0, 600),
           stack_mismatch_note: String(stored.stack_mismatch_note || '').slice(0, 600),
+          source: 'fl',
         });
       }
     }
+    cases.push(...carryOverManualCases(cases, storedCases));
     await this.settings.setPublic('fl_portfolio_cases', cases);
     await this.db.query(
       `UPDATE connector_state SET cursor=cursor || $2::jsonb,updated_at=now() WHERE connector=$1`,
@@ -854,6 +924,17 @@ export class FlService {
       return { enabled: false, cursor: state.cursor };
     }
     return state;
+  }
+
+  private async gotoFl(page: import('puppeteer-core').Page, url: string, timeout = 60_000) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // FL.ru keeps long-polling resources alive, DOMContentLoaded may never fire.
+      // The DOM itself is usable, so swallow pure timeouts and let callers verify.
+      if (!/timeout/i.test(message) || !/fl\.ru/.test(page.url())) throw error;
+    }
   }
 
   private browser() {

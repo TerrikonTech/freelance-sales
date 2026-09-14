@@ -1,8 +1,6 @@
 import {
   caseConcreteDetails,
   caseOneLiner,
-  proposalOpeningPlan,
-  PROPOSAL_BANNED_OPENINGS,
   selectRelevantPortfolio,
 } from './ai.service';
 
@@ -50,26 +48,6 @@ describe('portfolio proof material', () => {
   });
 });
 
-describe('opening plan', () => {
-  test('reciting the brief back is banned outright', () => {
-    expect(PROPOSAL_BANNED_OPENINGS).toContain('у вас в задаче');
-    expect(PROPOSAL_BANNED_OPENINGS).toContain('я внимательно прочитал');
-  });
-
-  test('the angle rotates with the lead instead of being one fixed phrase', () => {
-    const angles = new Set(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
-      .map((seed) => proposalOpeningPlan(seed).angle));
-    expect(angles.size).toBeGreaterThan(1);
-  });
-
-  test('every angle tells the writer where to start, never what to type', () => {
-    for (const seed of ['1', '2', '3', '4', '5', '6', '7']) {
-      const plan = proposalOpeningPlan(seed);
-      expect(plan.angle_brief).toMatch(/^После приветствия/u);
-      expect(plan.rule).toContain('своими словами');
-    }
-  });
-});
 
 describe('hollow short accents', () => {
   const lead = 'Длинное вводное предложение нужно только для того, чтобы разбор предложений вообще запустился и метрика посчиталась корректно. ';

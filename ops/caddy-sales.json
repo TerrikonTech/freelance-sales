@@ -1,85 +1,96 @@
 {
-  "logging": {
-    "logs": {
-      "default": { "exclude": ["http.log.access.log0"] },
-      "log0": {
-        "writer": { "output": "stdout" },
-        "encoder": {
-          "format": "filter",
-          "fields": {
-            "request>uri": {
-              "filter": "query",
-              "actions": [
-                {
-                  "type": "replace",
-                  "parameter": "ticket",
-                  "value": "REDACTED"
-                },
-                {
-                  "type": "replace",
-                  "parameter": "token",
-                  "value": "REDACTED"
-                }
-              ]
-            }
-          },
-          "wrap": { "format": "console" }
-        },
-        "include": ["http.log.access.log0"]
-      }
-    }
-  },
   "apps": {
     "http": {
       "http_port": 8080,
       "https_port": 80,
       "servers": {
         "srv0": {
-          "listen": [":80"],
+          "automatic_https": {
+            "disable_redirects": true
+          },
+          "listen": [
+            ":80"
+          ],
+          "logs": {
+            "logger_names": {
+              "vds.31-77-76-226.sslip.io:80": "log0"
+            }
+          },
           "routes": [
             {
-              "match": [{ "host": ["vds.31-77-76-226.sslip.io"] }],
               "handle": [
                 {
                   "handler": "subroute",
                   "routes": [
                     {
-                      "match": [{ "path": ["/mesh", "/mesh/*"] }],
-                      "handle": [
-                        { "handler": "rewrite", "strip_path_prefix": "/mesh" },
-                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:9443" }] }
-                      ],
-                      "terminal": true
-                    },
-                    {
-                      "match": [{ "path": ["/sales"] }],
                       "handle": [
                         {
-                          "handler": "static_response",
-                          "headers": { "Location": ["/sales/"] },
-                          "status_code": 308
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/mesh"
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:9443"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/mesh",
+                            "/mesh/*"
+                          ]
                         }
                       ],
                       "terminal": true
                     },
                     {
-                      "match": [{ "path": ["/sales/*"] }],
                       "handle": [
                         {
                           "handler": "headers",
                           "response": {
                             "set": {
-                              "Permissions-Policy": ["camera=(), microphone=(), geolocation=()"],
-                              "Referrer-Policy": ["same-origin"],
-                              "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
-                              "X-Content-Type-Options": ["nosniff"],
-                              "X-Frame-Options": ["DENY"]
+                              "Cache-Control": [
+                                "no-store"
+                              ],
+                              "Referrer-Policy": [
+                                "no-referrer"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ]
                             }
                           }
                         },
-                        { "handler": "rewrite", "strip_path_prefix": "/sales" },
-                        { "encodings": { "gzip": {}, "zstd": {} }, "handler": "encode", "prefer": ["zstd", "gzip"] },
-                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:8790" }] }
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/echo-turn"
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8788"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "method": [
+                            "GET"
+                          ],
+                          "path": [
+                            "/echo-turn/v1/credentials",
+                            "/echo-turn/healthz"
+                          ]
+                        }
                       ],
                       "terminal": true
                     },
@@ -89,18 +100,633 @@
                           "handler": "headers",
                           "response": {
                             "set": {
-                              "Permissions-Policy": ["camera=(), microphone=(), geolocation=()"],
-                              "Referrer-Policy": ["same-origin"],
-                              "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
-                              "X-Content-Type-Options": ["nosniff"],
-                              "X-Frame-Options": ["SAMEORIGIN"]
+                              "Cache-Control": [
+                                "no-store"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ]
                             }
                           }
                         },
-                        { "encodings": { "gzip": {}, "zstd": {} }, "handler": "encode", "prefer": ["zstd", "gzip"] },
-                        { "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:8787" }] }
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/recruiter"
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8810"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "method": [
+                            "POST"
+                          ],
+                          "path": [
+                            "/recruiter/telegram/webhook"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "static_response",
+                          "headers": {
+                            "Location": [
+                              "/recruiter/"
+                            ]
+                          },
+                          "status_code": 308
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/recruiter"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Cache-Control": [
+                                "no-store"
+                              ],
+                              "Content-Security-Policy": [
+                                "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+                              ],
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "DENY"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/recruiter"
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8810"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/recruiter/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "static_response",
+                          "headers": {
+                            "Location": [
+                              "/kontur/"
+                            ]
+                          },
+                          "status_code": 308
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/kontur"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(self), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "DENY"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/kontur"
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:13000"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/kontur/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "static_response",
+                          "headers": {
+                            "Location": [
+                              "/sales/"
+                            ]
+                          },
+                          "status_code": 308
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/sales"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "static_response",
+                          "headers": {
+                            "Location": [
+                              "/monitor/"
+                            ]
+                          },
+                          "status_code": 308
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/monitor"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "SAMEORIGIN"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/monitor"
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8090"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/monitor/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "DENY"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "handler": "rewrite",
+                          "strip_path_prefix": "/sales"
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8790"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/sales/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "DENY"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8791"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/donate",
+                            "/donate/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Permissions-Policy": [
+                                "camera=(), microphone=(), geolocation=()"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ],
+                              "X-Frame-Options": [
+                                "SAMEORIGIN"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8787"
+                            }
+                          ]
+                        }
                       ]
                     }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "vds.31-77-76-226.sslip.io"
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8096"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "vector.31-77-76-226.sslip.io"
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "body": "self.addEventListener('install',function(){self.skipWaiting();});self.addEventListener('activate',function(e){e.waitUntil((async function(){var ks=await caches.keys();await Promise.all(ks.map(function(k){return caches.delete(k);}));await self.registration.unregister();var cs=await self.clients.matchAll({type:'window'});cs.forEach(function(c){c.navigate(c.url);});})());});",
+                          "handler": "static_response",
+                          "headers": {
+                            "Cache-Control": [
+                              "no-store"
+                            ],
+                            "Content-Type": [
+                              "application/javascript; charset=utf-8"
+                            ]
+                          },
+                          "status_code": 200
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/sw.js"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "X-Robots-Tag": [
+                                "noindex"
+                              ],
+                              "X-Vector-Env": [
+                                "dev"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "handler": "reverse_proxy",
+                          "upstreams": [
+                            {
+                              "dial": "127.0.0.1:8097"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "dev.vector.31-77-76-226.sslip.io"
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Cache-Control": [
+                                "no-cache"
+                              ],
+                              "Permissions-Policy": [
+                                "camera=(self), microphone=(self), display-capture=(self)"
+                              ],
+                              "Referrer-Policy": [
+                                "same-origin"
+                              ],
+                              "Strict-Transport-Security": [
+                                "max-age=31536000; includeSubDomains"
+                              ],
+                              "X-Content-Type-Options": [
+                                "nosniff"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "encodings": {
+                            "gzip": {},
+                            "zstd": {}
+                          },
+                          "handler": "encode",
+                          "prefer": [
+                            "zstd",
+                            "gzip"
+                          ]
+                        },
+                        {
+                          "handler": "file_server",
+                          "root": "/opt/call/public"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "call.31-77-76-226.sslip.io"
                   ]
                 }
               ],
@@ -109,13 +735,55 @@
           ],
           "tls_connection_policies": [
             {
-              "match": { "sni": ["vds.31-77-76-226.sslip.io"] },
-              "certificate_selection": { "any_tag": ["cert0"] }
+              "certificate_selection": {
+                "any_tag": [
+                  "cert0"
+                ]
+              },
+              "match": {
+                "sni": [
+                  "vds.31-77-76-226.sslip.io"
+                ]
+              }
+            },
+            {
+              "certificate_selection": {
+                "any_tag": [
+                  "cert1"
+                ]
+              },
+              "match": {
+                "sni": [
+                  "vector.31-77-76-226.sslip.io"
+                ]
+              }
+            },
+            {
+              "certificate_selection": {
+                "any_tag": [
+                  "cert2"
+                ]
+              },
+              "match": {
+                "sni": [
+                  "dev.vector.31-77-76-226.sslip.io"
+                ]
+              }
+            },
+            {
+              "certificate_selection": {
+                "any_tag": [
+                  "cert3"
+                ]
+              },
+              "match": {
+                "sni": [
+                  "call.31-77-76-226.sslip.io"
+                ]
+              }
             },
             {}
-          ],
-          "automatic_https": { "disable_redirects": true },
-          "logs": { "logger_names": { "vds.31-77-76-226.sslip.io:80": "log0" } }
+          ]
         }
       }
     },
@@ -125,9 +793,72 @@
           {
             "certificate": "/etc/caddy/vds-console/fullchain.pem",
             "key": "/etc/caddy/vds-console/privkey.pem",
-            "tags": ["cert0"]
+            "tags": [
+              "cert0"
+            ]
+          },
+          {
+            "certificate": "/etc/caddy/vector/fullchain.pem",
+            "key": "/etc/caddy/vector/privkey.pem",
+            "tags": [
+              "cert1"
+            ]
+          },
+          {
+            "certificate": "/etc/caddy/vector-dev/fullchain.pem",
+            "key": "/etc/caddy/vector-dev/privkey.pem",
+            "tags": [
+              "cert2"
+            ]
+          },
+          {
+            "certificate": "/etc/caddy/call/fullchain.pem",
+            "key": "/etc/caddy/call/privkey.pem",
+            "tags": [
+              "cert3"
+            ]
           }
         ]
+      }
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "exclude": [
+          "http.log.access.log0"
+        ]
+      },
+      "log0": {
+        "encoder": {
+          "fields": {
+            "request>uri": {
+              "actions": [
+                {
+                  "parameter": "ticket",
+                  "type": "replace",
+                  "value": "REDACTED"
+                },
+                {
+                  "parameter": "token",
+                  "type": "replace",
+                  "value": "REDACTED"
+                }
+              ],
+              "filter": "query"
+            }
+          },
+          "format": "filter",
+          "wrap": {
+            "format": "console"
+          }
+        },
+        "include": [
+          "http.log.access.log0"
+        ],
+        "writer": {
+          "output": "stdout"
+        }
       }
     }
   }

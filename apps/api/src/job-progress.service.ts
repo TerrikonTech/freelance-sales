@@ -107,6 +107,7 @@ const PLANS: Record<string, { title: string; steps: [string, string][] }> = {
  */
 const AI_KIND_STEPS: Record<string, [string, string]> = {
   lead_analysis_v2: ['analysis', 'ИИ считает релевантность, цену и срок'],
+  portfolio_pick: ['strategy', 'Подбираю кейс, который реально совпадает по механике'],
   draft_compose: ['compose', 'Пишу и сразу проверяю готовый отклик'],
   draft_strategy: ['strategy', 'Придумываю, о чём писать в отклике'],
   draft_candidates: ['candidates', 'Пишу несколько вариантов текста'],

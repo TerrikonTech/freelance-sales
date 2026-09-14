@@ -262,9 +262,7 @@ CREATE TABLE IF NOT EXISTS connector_state (
 
 INSERT INTO connector_state(connector, enabled, healthy, status_text)
 VALUES
-  ('openai', false, false, 'Не настроен'),
   ('codex', false, false, 'Не настроен'),
-  ('images', false, false, 'Не настроен'),
   ('fl', false, false, 'Не настроен'),
   ('telegram', false, false, 'Не настроен')
 ON CONFLICT (connector) DO NOTHING;

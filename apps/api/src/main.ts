@@ -11,6 +11,10 @@ async function bootstrap() {
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cookieParser());
   const webRoot = join(__dirname, '..', '..', 'web', 'dist');
+  // The site lives under /sales, so the browser asks for /sales/assets/*.  Without this
+  // mount those requests fell through to the SPA fallback and came back as index.html,
+  // which the browser refuses to run — the page rendered unstyled and dead.
+  app.use('/sales', express.static(webRoot, { index: false, maxAge: '1h' }));
   app.use(express.static(webRoot, { index: false, maxAge: '1h' }));
   const expressApp = app.getHttpAdapter().getInstance() as express.Express;
   expressApp.get(/^(?!\/api).*/, (_req, res) => res.sendFile(join(webRoot, 'index.html')));

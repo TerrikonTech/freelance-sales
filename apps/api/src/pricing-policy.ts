@@ -14,6 +14,7 @@ export const PRICING_CATEGORIES = [
   'account_or_internal_service',
   'crm_admin_analytics',
   'automation_or_bot',
+  'parsing_scraping',
   'platform_mvp',
   'platform_large',
   'mobile_mvp',
@@ -42,15 +43,18 @@ type PriceRange = {
 };
 
 export const PRICING_CATALOG: Record<PricingCategory, PriceRange> = {
-  small_fix: { label: 'Точечная правка без разработки новой функции', price: [500, 1_500, 5_000], days: [1, 1, 2] },
-  site_revision: { label: 'Средняя доработка сайта', price: [60_000, 90_000, 120_000], days: [7, 14, 20] },
-  technical_seo: { label: 'Техническое SEO с исправлениями', price: [60_000, 90_000, 120_000], days: [7, 10, 14] },
+  // Half an hour of work still costs a whole day of the calendar: the reply, the
+  // call and the transfer eat the rest. Quoting 500 ₽ for "правки" loses money on
+  // the order and on the time spent winning it.
+  small_fix: { label: 'Точечная правка без разработки новой функции', price: [15_000, 25_000, 40_000], days: [1, 2, 4] },
+  site_revision: { label: 'Средняя доработка сайта', price: [40_000, 60_000, 90_000], days: [4, 7, 12] },
+  technical_seo: { label: 'Техническое SEO с исправлениями', price: [40_000, 70_000, 100_000], days: [5, 10, 14] },
   landing_standard: { label: 'Обычный лендинг', price: [80_000, 80_000, 100_000], days: [10, 14, 18] },
-  landing_immersive: { label: 'Иммерсивный лендинг с моушеном', price: [150_000, 150_000, 180_000], days: [17, 21, 28] },
-  corporate_standard: { label: 'Обычный корпоративный сайт', price: [150_000, 150_000, 180_000], days: [24, 30, 38] },
-  corporate_motion: { label: 'Корпоративный сайт с моушеном', price: [225_000, 225_000, 260_000], days: [35, 45, 55] },
-  complex_site: { label: 'Сложный сайт с нестандартной логикой', price: [250_000, 250_000, 300_000], days: [35, 45, 55] },
-  complex_site_motion: { label: 'Сложный иммерсивный сайт', price: [350_000, 350_000, 420_000], days: [50, 60, 75] },
+  landing_immersive: { label: 'Иммерсивный лендинг с моушеном', price: [140_000, 170_000, 220_000], days: [17, 21, 28] },
+  corporate_standard: { label: 'Обычный корпоративный сайт', price: [150_000, 200_000, 250_000], days: [24, 30, 38] },
+  corporate_motion: { label: 'Корпоративный сайт с моушеном', price: [225_000, 260_000, 320_000], days: [35, 45, 55] },
+  complex_site: { label: 'Сложный сайт с нестандартной логикой', price: [250_000, 300_000, 380_000], days: [35, 45, 55] },
+  complex_site_motion: { label: 'Сложный иммерсивный сайт', price: [350_000, 400_000, 480_000], days: [50, 60, 75] },
   store_simple: { label: 'Простой интернет-магазин', price: [300_000, 300_000, 350_000], days: [35, 45, 55] },
   store_full: { label: 'Полноценный интернет-магазин', price: [400_000, 400_000, 500_000], days: [50, 60, 75] },
   store_complex: { label: 'Сложный магазин с учётом и интеграциями', price: [550_000, 625_000, 700_000], days: [75, 85, 100] },
@@ -59,10 +63,13 @@ export const PRICING_CATALOG: Record<PricingCategory, PriceRange> = {
   // Calibrated against comparable FL.ru bot projects: a shared bot core should not
   // inherit agency/platform pricing merely because the brief mentions two channels.
   automation_or_bot: { label: 'Бот, автоматизация или интеграционный сервис', price: [60_000, 110_000, 180_000], days: [7, 16, 28] },
+  // Parsing market 2025: a one-off scrape starts near 10-25k, a scheduled parser
+  // sits around 60k, a multi-source monitored setup reaches 100-120k.
+  parsing_scraping: { label: 'Парсинг и сбор данных', price: [25_000, 60_000, 120_000], days: [3, 7, 14] },
   platform_mvp: { label: 'MVP платформы или SaaS', price: [600_000, 600_000, 750_000], days: [75, 90, 110] },
   platform_large: { label: 'Большая платформа', price: [800_000, 1_000_000, 1_200_000], days: [120, 150, 180] },
   mobile_mvp: { label: 'MVP мобильного приложения', price: [250_000, 300_000, 350_000], days: [35, 45, 60] },
-  support_monthly: { label: 'Ежемесячная поддержка и развитие', price: [50_000, 75_000, 100_000], days: [30, 30, 30] },
+  support_monthly: { label: 'Ежемесячная поддержка и развитие', price: [30_000, 55_000, 85_000], days: [30, 30, 30] },
 };
 
 export const DEFAULT_PRICING_POLICY = {
@@ -176,7 +183,170 @@ export function calculateCatalogPrice(input: PricingInput): PricingResult | null
     label: entry.label,
     level,
     modifiers,
-    price: category === 'small_fix' ? Math.ceil(price / 500) * 500 : roundPrice(price),
+    price: Math.max(MIN_QUOTE_PRICE_RUB, category === 'small_fix' ? Math.ceil(price / 500) * 500 : roundPrice(price)),
     days: Math.max(1, Math.ceil(days)),
   };
+}
+
+/**
+ * The catalogue answers "what does a project like this usually cost", which is a
+ * different question from "what does THIS project cost".  Across 1933 analysed leads
+ * it produced 47 distinct prices: the number was being picked off a menu, so a video
+ * pipeline with three publishing targets got the same 110 000 ₽ as a three-screen bot.
+ * A quote built from the actual list of work moves with the work.
+ */
+export type WorkItem = {
+  what: unknown;
+  days_optimistic: unknown;
+  days_realistic: unknown;
+  days_pessimistic: unknown;
+};
+
+export type BottomUpResult = {
+  price: number;
+  days: number;
+  priceLow: number;
+  priceHigh: number;
+  daysLow: number;
+  daysHigh: number;
+  itemCount: number;
+  dailyRate: number;
+};
+
+/**
+ * Derived from the owner's own catalogue: corporate_standard is 150 000 ₽ for 30 days,
+ * crm_admin_analytics 375 000 for 60, store_full 400 000 for 60.  The median day is
+ * worth about this much, so bottom-up quotes stay on the same scale as the old ones
+ * instead of silently repricing every category.
+ */
+export const DEFAULT_DAILY_RATE_RUB = 6_250;
+
+/** Below this an order costs more to win than it pays: no draft, no reply. */
+export const DEFAULT_MIN_DEAL_PRICE_RUB = 30_000;
+
+/** A quote under this reads as a joke even when the task is genuinely tiny. */
+export const MIN_QUOTE_PRICE_RUB = 10_000;
+
+/**
+ * Order size is read straight off the fair price instead of another model
+ * opinion: the same order must always land in the same bucket.
+ */
+export type SizeGrade = 'small' | 'medium' | 'large';
+
+export const SIZE_GRADE_THRESHOLDS = {
+  mediumFrom: 100_000,
+  largeFrom: 300_000,
+} as const;
+
+export function sizeGrade(priceRub: number): SizeGrade {
+  const value = Number(priceRub);
+  if (!Number.isFinite(value) || value < SIZE_GRADE_THRESHOLDS.mediumFrom) return 'small';
+  if (value < SIZE_GRADE_THRESHOLDS.largeFrom) return 'medium';
+  return 'large';
+}
+
+/**
+ * A named fixed budget far below the fair price is a trap: the letter would
+ * quietly commit to a ten-times-too-cheap deal. The ratio (fair ÷ named) is
+ * the single number both the flag and the owner alert are built on.
+ */
+export const UNDERPRICED_RATIO = 2.5;
+
+export function underpricingRatio(fairPrice: number, namedBudget: number): number | null {
+  const fair = Number(fairPrice);
+  const named = Number(namedBudget);
+  if (!Number.isFinite(fair) || fair <= 0 || !Number.isFinite(named) || named <= 0) return null;
+  return Number((fair / named).toFixed(2));
+}
+
+export function isUnderpriced(fairPrice: number, namedBudget: number): boolean {
+  const ratio = underpricingRatio(fairPrice, namedBudget);
+  return ratio !== null && ratio >= UNDERPRICED_RATIO;
+}
+
+/**
+ * How much an order is worth to the business, 0…100. Scoring used to rank a
+ * favicon level with a 245 000 ₽ site because fit was the only thing measured;
+ * this puts the money back into the ranking.
+ */
+export function dealValueScore(priceRub: number): number {
+  const points: Array<[number, number]> = [
+    [15_000, 0],
+    [30_000, 35],
+    [60_000, 60],
+    [150_000, 85],
+    [300_000, 100],
+  ];
+  const value = Number(priceRub);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if (value <= points[0][0]) return 0;
+  if (value >= points[points.length - 1][0]) return 100;
+  for (let index = 1; index < points.length; index += 1) {
+    const [highPrice, highScore] = points[index];
+    const [lowPrice, lowScore] = points[index - 1];
+    if (value <= highPrice) {
+      const ratio = (value - lowPrice) / (highPrice - lowPrice);
+      return Math.round(lowScore + ratio * (highScore - lowScore));
+    }
+  }
+  return 100;
+}
+
+/** Nobody delivers 40 days of work without a single day of coordination or fixes. */
+const OVERHEAD = 1.15;
+
+export function calculateBottomUpPrice(
+  breakdown: unknown,
+  dailyRate = DEFAULT_DAILY_RATE_RUB,
+): BottomUpResult | null {
+  if (!Array.isArray(breakdown) || !breakdown.length) return null;
+  const rate = Number(dailyRate) > 0 ? Number(dailyRate) : DEFAULT_DAILY_RATE_RUB;
+  let optimistic = 0;
+  let realistic = 0;
+  let pessimistic = 0;
+  let itemCount = 0;
+  for (const entry of breakdown) {
+    if (!entry || typeof entry !== 'object') continue;
+    const item = entry as WorkItem;
+    const mid = Number(item.days_realistic);
+    if (!Number.isFinite(mid) || mid <= 0 || mid > 200) continue;
+    const low = Number(item.days_optimistic);
+    const high = Number(item.days_pessimistic);
+    realistic += mid;
+    optimistic += Number.isFinite(low) && low > 0 && low <= mid ? low : mid * 0.75;
+    pessimistic += Number.isFinite(high) && high >= mid && high <= 400 ? high : mid * 1.4;
+    itemCount += 1;
+  }
+  if (!itemCount) return null;
+  const toDays = (value: number) => Math.max(1, Math.ceil(value * OVERHEAD));
+  const toPrice = (value: number) => Math.ceil((value * OVERHEAD * rate) / 5_000) * 5_000;
+  return {
+    price: Math.max(MIN_QUOTE_PRICE_RUB, toPrice(realistic)),
+    days: toDays(realistic),
+    priceLow: toPrice(optimistic),
+    priceHigh: toPrice(pessimistic),
+    daysLow: toDays(optimistic),
+    daysHigh: toDays(pessimistic),
+    itemCount,
+    dailyRate: rate,
+  };
+}
+
+/**
+ * The buyer is quoted what such projects cost on this market: the catalogue is
+ * the price source, the bottom-up list is the adequacy check.  A gap between
+ * the two means the analyzer picked the wrong category or level — that is
+ * reported, never silently priced in, so the same order always quotes the same.
+ */
+export function reconcileEstimate(
+  bottomUp: BottomUpResult | null,
+  catalog: PricingResult | null,
+): { price: number; days: number; source: 'breakdown' | 'catalog'; gap: number | null } {
+  if (!bottomUp && !catalog) return { price: 0, days: 0, source: 'catalog', gap: null };
+  if (!catalog && bottomUp) return { price: bottomUp.price, days: bottomUp.days, source: 'breakdown', gap: null };
+  if (!catalog) return { price: 0, days: 0, source: 'catalog', gap: null };
+  const gap = bottomUp
+    ? Number((bottomUp.price / Math.max(1, catalog.price)).toFixed(2))
+    : null;
+  return { price: catalog.price, days: catalog.days, source: 'catalog', gap };
 }

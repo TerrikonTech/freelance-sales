@@ -37,6 +37,7 @@ export class ProcessorService implements OnModuleDestroy {
   private chatTimer?: NodeJS.Timeout;
   private announceTimer?: NodeJS.Timeout;
   private researchTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
   private connection?: IORedis;
   private scanInProgress = false;
 
@@ -61,6 +62,11 @@ export class ProcessorService implements OnModuleDestroy {
     ));
     await this.recoverAmbiguousDeliveries();
     this.connection = new IORedis(process.env.REDIS_URL || 'redis://redis:6379', { maxRetriesPerRequest: null });
+    // The interface has no other way to tell "worker is alive but idle" from
+    // "worker is dead", and a silent worker looks exactly like a broken button.
+    const beat = () => { void this.connection?.set('worker:heartbeat', String(Date.now()), 'EX', 180).catch(() => undefined); };
+    beat();
+    this.heartbeatTimer = setInterval(beat, 30_000);
     this.worker = new Worker('sales', (job) => this.process(job), {
       connection: this.connection,
       concurrency: 3,
@@ -71,23 +77,19 @@ export class ProcessorService implements OnModuleDestroy {
     this.worker.on('failed', (job, error) => this.logger.error(`Job ${job?.name || 'unknown'} failed: ${error.message}`));
     const scanInterval = Math.max(15, Number(process.env.FL_SCAN_INTERVAL_SECONDS || 30)) * 1_000;
     const portfolioCheckInterval = 30 * 60_000;
-    const chatInterval = Math.max(60, Number(process.env.FL_CHAT_SCAN_INTERVAL_SECONDS || 300)) * 1_000;
     const scheduleScan = async () => {
       const bucket = Math.floor(Date.now() / scanInterval);
       await this.queue.add('scan-fl', {}, `scan-${bucket}`).catch((error) => this.logger.warn(error.message));
-    };
-    const scheduleChats = async () => {
-      const bucket = Math.floor(Date.now() / chatInterval);
-      await this.queue.add('sync-fl-chats', {}, `sync-fl-chats-${bucket}`).catch((error) => this.logger.warn(error.message));
     };
     const schedulePortfolio = async () => {
       const bucket = Math.floor(Date.now() / portfolioCheckInterval);
       await this.queue.add('sync-fl-portfolio', {}, `sync-fl-portfolio-${bucket}`).catch((error) => this.logger.warn(error.message));
     };
+    // FL chat polling was removed with the chats tab: every run died on a
+    // navigation timeout and spammed the log with a page nobody looked at.
     this.scanTimer = setInterval(scheduleScan, scanInterval);
-    this.chatTimer = setInterval(scheduleChats, chatInterval);
     this.portfolioTimer = setInterval(schedulePortfolio, portfolioCheckInterval);
-    await Promise.all([scheduleScan(), scheduleChats(), schedulePortfolio()]);
+    await Promise.all([scheduleScan(), schedulePortfolio()]);
     // The owner's own session finishes handed-off sends, so nothing in this process
     // ever learns the outcome. Poll fast and keep the promise the bot already made.
     this.announceTimer = setInterval(
@@ -206,6 +208,8 @@ export class ProcessorService implements OnModuleDestroy {
     'не поддерживается',
     'Текст изменён после одобрения',
     'Состав изображений изменён после одобрения',
+    // The broker rejects unknown task kinds instantly; replaying cannot help.
+    'Unsupported AI task kind',
   ];
 
   static isPermanentFailure(message: string) {
@@ -219,11 +223,41 @@ export class ProcessorService implements OnModuleDestroy {
       return await this.progress.track(job.name, { leadId }, () => this.run(job));
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      // A slot is spent when the draft is queued, so a draft that never materialised
+      // must give it back — otherwise ten broker failures cost a whole day of replies.
+      if (job.name === 'draft-reply' && String(job.id || '').startsWith('initial-draft-')) await this.refundAutoDraft();
       if (ProcessorService.isPermanentFailure(message)) {
         this.logger.warn(`Job ${job.name} failed permanently, replay disabled: ${message}`);
         throw new UnrecoverableError(message);
       }
       throw error;
+    }
+  }
+
+  /** One shared counter per day so a worker restart cannot reset the budget. */
+  private async autoDraftBudgetLeft(limit: number): Promise<boolean> {
+    if (!limit || !this.connection) return true;
+    const key = `auto-draft:${new Date().toISOString().slice(0, 10)}`;
+    try {
+      const used = Number(await this.connection.get(key)) || 0;
+      if (used >= limit) return false;
+      await this.connection.incr(key);
+      await this.connection.expire(key, 2 * 24 * 3600);
+      return true;
+    } catch (error) {
+      this.logger.warn(`Auto-draft budget check failed: ${error instanceof Error ? error.message : 'unknown'}`);
+      return true;
+    }
+  }
+
+  /** Gives the daily auto-draft slot back when the queued draft never became a draft. */
+  private async refundAutoDraft() {
+    if (!this.connection) return;
+    const key = `auto-draft:${new Date().toISOString().slice(0, 10)}`;
+    try {
+      if ((Number(await this.connection.get(key)) || 0) > 0) await this.connection.decr(key);
+    } catch (error) {
+      this.logger.warn(`Auto-draft refund failed: ${error instanceof Error ? error.message : 'unknown'}`);
     }
   }
 
@@ -241,15 +275,6 @@ export class ProcessorService implements OnModuleDestroy {
     switch (job.name) {
       case 'scan-fl': return this.scanFl();
       case 'sync-fl-portfolio': return this.fl.syncPortfolioIfDue();
-      case 'sync-fl-chats': {
-        const result = await this.fl.syncChats();
-        for (const alert of result.alerts || []) {
-          await this.telegram.notifyOwnerFlMessage(alert).catch((error) => this.logger.warn(
-            `Telegram FL message notification skipped: ${error instanceof Error ? error.message : 'unknown'}`,
-          ));
-        }
-        return result;
-      }
       case 'owner-command': return this.telegram.processOwnerMessage(job.data.message || {});
       case 'analyze-lead': return this.analyze(String(job.data.leadId), Boolean(job.data.force));
       case 'draft-reply': return this.draft(
@@ -363,7 +388,12 @@ export class ProcessorService implements OnModuleDestroy {
       const localAnalysis = this.ai.prefilterLead(lead);
       const analysis = localAnalysis || await this.ai.analyzeLead(lead);
       const analysisMode = localAnalysis ? 'local_prefilter' : 'gpt_single_pass';
-      const shouldRespond = analysis.should_respond && analysis.score >= Number(process.env.MIN_LEAD_SCORE || 65);
+      // Квалификация по крупности, не по скорингу: отвечаем на средние и крупные,
+      // мелочь пропускаем молча. Оценка score остаётся только справочной меткой.
+      const grade = String(analysis.size_grade || 'small');
+      const sizeQualified = grade === 'medium' || grade === 'large'
+        || analysis.recommended_price >= Number(process.env.MIN_DEAL_PRICE_RUB || 30000);
+      const shouldRespond = analysis.should_respond && sizeQualified;
       await this.progress.advance(
         'save',
         'Сохраняю оценку и решаю, подходит ли заказ',
@@ -397,11 +427,32 @@ export class ProcessorService implements OnModuleDestroy {
         "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,$2,'lead_analyzed',$3)",
         [leadId, localAnalysis ? 'system' : 'ai', JSON.stringify({ score: analysis.score, mode: analysisMode })],
       );
+      if (analysis.underpriced && lead.source === 'fl') {
+        // The client's named budget is far below the fair price: no auto-reply,
+        // the owner decides whether to walk away or bid the honest number.
+        const trap = analysis.underpriced;
+        await this.push.notify(
+          'Ловушка цены: заказ занижен',
+          `${lead.title} · просят ${trap.named_budget.toLocaleString('ru-RU')} ₽, справедливая цена ${trap.fair_price.toLocaleString('ru-RU')} ₽ (в ${trap.ratio} раза больше)`,
+          `/sales/?lead=${leadId}`,
+        ).catch((error) => this.logger.warn(`Push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+        this.logger.warn(
+          `Underpriced order ${leadId}: named ${trap.named_budget} ₽ vs fair ${trap.fair_price} ₽ (x${trap.ratio}); held for owner`,
+        );
+      }
       if (shouldRespond && lead.source === 'fl') {
         // The owner decides which orders are worth a reply: scoring is cheap, drafting is not.
         // AUTO_DRAFT_FL=true restores the old behaviour of drafting every qualified lead.
         if (/^(?:1|true|on|yes)$/i.test(String(process.env.AUTO_DRAFT_FL || 'false').trim())) {
-          await this.queue.add('draft-reply', { leadId, channel: 'fl', targetExternalId: lead.external_id }, `initial-draft-${leadId}-${Date.now()}`);
+          // Ten letters a day is roughly what one person can actually read and
+          // send; without a cap a scan burst drafts a hundred and the good ones
+          // drown. Manual drafts from the dashboard are never counted.
+          const limit = Math.max(0, Number(process.env.AUTO_DRAFT_DAILY_LIMIT || 10));
+          if (await this.autoDraftBudgetLeft(limit)) {
+            await this.queue.add('draft-reply', { leadId, channel: 'fl', targetExternalId: lead.external_id }, `initial-draft-${leadId}-${Date.now()}`);
+          } else {
+            this.logger.log(`Auto-draft daily limit reached (${limit}); skipping draft for ${leadId}`);
+          }
         }
         await this.push.notify(
           'Подходящий заказ на FL.ru',
@@ -429,6 +480,45 @@ export class ProcessorService implements OnModuleDestroy {
     }
   }
 
+  // Fixed budget from the parsed project page, with the listing text as fallback.
+  // Returns null when the reply must be skipped (fixed budget >20% below estimate),
+  // otherwise the price to name in the reply: the fixed budget, or 0 for
+  // negotiable/unknown budgets meaning «use the AI estimate».
+  private fixedBudgetOverride(lead: Record<string, any>, mode: string): number | null {
+    if (mode !== 'response' || !Number(lead.recommended_price)) return 0;
+    const project = (lead.requirements?.project || {}) as Record<string, unknown>;
+    let fixed = project.budget_kind === 'fixed' ? Number(project.budget_amount) || 0 : 0;
+    if (!fixed) fixed = this.budgetFromText(String(lead.budget_text || ''));
+    if (!fixed) fixed = this.statedBudgetFromDescription(String(lead.description || ''));
+    if (!fixed) return 0;
+    const estimate = Number(lead.recommended_price);
+    if (estimate > fixed * 1.2) return null;
+    return fixed;
+  }
+
+  private budgetFromText(text: string): number {
+    const clean = String(text || '');
+    if (/договорн/i.test(clean)) return 0;
+    const match = clean.match(/(\d[\d\s]{2,12})/);
+    return match ? Number(match[1].replace(/\s+/g, '')) || 0 : 0;
+  }
+
+  // Бюджет, названный прямо в описании заказа («Бюджет 4-5 млн», «бюджет: 500 000 ₽»).
+  // Клиент его озвучил — занижать нельзя. Для вилки берём нижнюю границу.
+  private statedBudgetFromDescription(text: string): number {
+    const clean = String(text || '').toLowerCase();
+    if (!clean.includes('бюджет')) return 0;
+    const m = clean.match(/бюджет[^\n.]{0,30}?(\d[\d\s]*(?:[.,]\d+)?)(?:\s*[-–—]\s*(\d[\d\s]*(?:[.,]\d+)?))?\s*(млн|миллион\w*|тыс\w*|₽|руб\w*|к(?![а-яё]))?/);
+    if (!m) return 0;
+    const num = (s: string) => Number(String(s).replace(/\s+/g, '').replace(',', '.')) || 0;
+    let value = num(m[1]);
+    const unit = m[3] || '';
+    if (!unit && value < 10000) return 0; // «бюджет 5» без единиц измерения — не цена, не рискуем
+    if (/^(млн|миллион)/.test(unit)) value *= 1000000;
+    else if (/^тыс/.test(unit) || unit === 'к') value *= 1000;
+    return Math.round(value);
+  }
+
   private async draft(
     leadId: string,
     channel: string,
@@ -450,6 +540,24 @@ export class ProcessorService implements OnModuleDestroy {
       return;
     }
     const mode = resolveDraftMode(channel, requestedMode, Boolean(lead.client?.fl_dialog_id));
+    // Owner pricing rules for FL proposals.  If the order has a fixed budget, the
+    // reply names that exact budget: never lower.  If the fixed budget sits more
+    // than 20% below the AI estimate, the order pays too little — no reply at all.
+    // Negotiable or unknown budget → reply with the AI estimate.
+    const priceOverride = this.fixedBudgetOverride(lead, mode);
+    if (priceOverride === null && !ownerRequested) {
+      const fixed = Number(lead.requirements?.project?.budget_amount) || this.budgetFromText(lead.budget_text);
+      await this.db.query(
+        "INSERT INTO activities(lead_id,actor,action,details) VALUES($1,'system','auto_skipped_low_budget',$2)",
+        [leadId, JSON.stringify({ fixed_budget: fixed, estimate: Number(lead.recommended_price) || 0 })],
+      );
+      await this.db.query(
+        "UPDATE leads SET next_action='auto_skipped_low_budget',updated_at=now() WHERE id=$1",
+        [leadId],
+      );
+      this.logger.log(`Draft skipped for ${leadId}: fixed budget ${fixed} is >20% below estimate ${lead.recommended_price}`);
+      return;
+    }
     await this.progress.retitle(mode === 'response' ? 'Готовлю отклик на заказ' : 'Готовлю ответ клиенту в чат');
     // A live mission both steers the wording ("reply in Elvish") and unlocks autonomy
     // for this one lead.  Owner instructions typed right now still win over it.
@@ -478,6 +586,7 @@ export class ProcessorService implements OnModuleDestroy {
           messages: messages.rows,
           mode,
           ownerInstructions: effectiveInstructions.slice(0, 4_000),
+          priceOverride,
         });
       } catch (error) {
         if (!(error instanceof ProposalQualityError)) throw error;
@@ -519,7 +628,7 @@ export class ProcessorService implements OnModuleDestroy {
           mode: 'response',
           strategy: 'proposal-research-v3-human-voice',
           projectUrl: lead.url,
-          price: lead.recommended_price,
+          price: priceOverride || lead.recommended_price,
           days: lead.recommended_days,
           priceDisplayedSeparately: true,
           regenerated: Boolean(ownerInstructions),
@@ -991,6 +1100,7 @@ export class ProcessorService implements OnModuleDestroy {
         .catch((error) => this.logger.warn(`Follow-up schedule skipped: ${error instanceof Error ? error.message : 'unknown'}`));
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      const messageWithStack = error instanceof Error && error.stack ? (message + ' || ' + error.stack.split('\n').slice(0, 4).join(' | ')) : message;
       const deliveryUnknown = isDeliveryUnknown(error);
       const needsOwner = error instanceof OutboundPreflightError;
       const ledgerStatus = deliveryUnknown ? 'send_unknown' : 'failed_before_send';
@@ -999,14 +1109,14 @@ export class ProcessorService implements OnModuleDestroy {
         await client.query(
           `UPDATE outbound_deliveries SET status=$2,error=$3,completed_at=now(),updated_at=now()
            WHERE id=$1 AND status='sending'`,
-          [draft.deliveryId, ledgerStatus, message.slice(0, 500)],
+          [draft.deliveryId, ledgerStatus, messageWithStack.slice(0, 500)],
         );
         await client.query(
           `UPDATE drafts SET status=$2,error=$3,
            approved_by=CASE WHEN $2='pending' THEN NULL ELSE approved_by END,
            approved_at=CASE WHEN $2='pending' THEN NULL ELSE approved_at END,
            updated_at=now() WHERE id=$1`,
-          [draftId, draftStatus, message.slice(0, 500)],
+          [draftId, draftStatus, messageWithStack.slice(0, 500)],
         );
         if (needsOwner) {
           await client.query(
@@ -1050,9 +1160,9 @@ export class ProcessorService implements OnModuleDestroy {
   async onModuleDestroy() {
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.portfolioTimer) clearInterval(this.portfolioTimer);
-    if (this.chatTimer) clearInterval(this.chatTimer);
     if (this.announceTimer) clearInterval(this.announceTimer);
     if (this.researchTimer) clearInterval(this.researchTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     await this.worker?.close();
     await this.connection?.quit();
   }

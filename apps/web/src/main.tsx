@@ -3,26 +3,6 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 
 const BASE = '/sales';
-let mermaidReady: Promise<any> | null = null;
-
-function loadMermaid() {
-  if (!mermaidReady) mermaidReady = import('mermaid').then(({ default: engine }) => {
-    engine.initialize({
-      startOnLoad: false,
-      securityLevel: 'strict',
-      theme: 'base',
-      flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
-      themeVariables: {
-        fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
-        fontSize: '14px',
-        lineColor: '#98a2b3',
-        primaryTextColor: '#344054',
-      },
-    });
-    return engine;
-  });
-  return mermaidReady;
-}
 
 async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = typeof FormData !== 'undefined' && options.body instanceof FormData;
@@ -32,205 +12,107 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
     headers: { ...(isForm ? {} : { 'content-type': 'application/json' }), ...(options.headers || {}) },
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/auth')) window.dispatchEvent(new Event('dsh:auth-expired'));
+    throw new Error(body.message || `HTTP ${response.status}`);
+  }
   return body as T;
 }
 
-type Page = 'dashboard' | 'sandbox' | 'chat-lab' | 'leads' | 'chats' | 'approvals' | 'settings';
-const validPage = (value: string | null): Page => ['dashboard', 'sandbox', 'chat-lab', 'leads', 'chats', 'approvals', 'settings'].includes(value || '') ? value as Page : 'dashboard';
-
-
-type LiveEventItem = { id: string; lead_id?: string; title: string; content?: string; created_at: string };
-type LiveEventFeed = { serverTime: string; lead: LiveEventItem | null; draft: LiveEventItem | null; message: LiveEventItem | null };
-type LivePageAlert = { kind: 'lead' | 'draft' | 'message'; leadId: string; title: string; text: string; createdAt: string };
-
-let alarmAudio: AudioContext | null = null;
-
-async function ensureAlarmAudio() {
-  const AudioCtor = window.AudioContext || (window as any).webkitAudioContext;
-  if (!AudioCtor) return null;
-  alarmAudio ||= new AudioCtor();
-  if (alarmAudio.state === 'suspended') await alarmAudio.resume();
-  return alarmAudio;
-}
-
-async function playPageAlarm(test = false) {
-  const audio = await ensureAlarmAudio();
-  if (!audio) return;
-  const start = audio.currentTime + 0.03;
-  const pulses = test ? 2 : 6;
-  for (let index = 0; index < pulses; index += 1) {
-    const oscillator = audio.createOscillator();
-    const gain = audio.createGain();
-    oscillator.type = 'square';
-    oscillator.frequency.value = index % 2 === 0 ? 880 : 660;
-    gain.gain.setValueAtTime(0.0001, start + index * 0.22);
-    gain.gain.exponentialRampToValueAtTime(0.22, start + index * 0.22 + 0.015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, start + index * 0.22 + 0.18);
-    oscillator.connect(gain);
-    gain.connect(audio.destination);
-    oscillator.start(start + index * 0.22);
-    oscillator.stop(start + index * 0.22 + 0.19);
-  }
-}
+type Page = 'leads' | 'approvals' | 'settings';
+const validPage = (value: string | null): Page => (['leads', 'approvals', 'settings'].includes(value || '') ? value as Page : 'leads');
 
 function App() {
   const params = new URLSearchParams(location.search);
   const [auth, setAuth] = useState<'loading' | 'setup' | 'login' | 'ok'>('loading');
   const [page, setPage] = useState<Page>(validPage(params.get('page')));
-  const [selectedLead, setSelectedLead] = useState<string | null>(params.get('lead') || params.get('chat'));
-  const [selectedView, setSelectedView] = useState<'lead' | 'chat'>(params.get('chat') ? 'chat' : 'lead');
-  const [toast, setToast] = useState('');
-  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('sales.pageSound') !== '0');
-  const [liveAlert, setLiveAlert] = useState<LivePageAlert | null>(null);
-  const seenEvents = useRef<Record<'lead' | 'draft' | 'message', LiveEventItem | null> | null>(null);
-
-  const refreshAuth = async () => {
-    try { await api('/auth/me'); setAuth('ok'); }
-    catch {
-      const status = await api<{ required: boolean }>('/auth/setup-status');
-      setAuth(status.required ? 'setup' : 'login');
-    }
-  };
-  useEffect(() => { void refreshAuth(); }, []);
-  useEffect(() => {
-    if (auth === 'ok' && 'serviceWorker' in navigator) void navigator.serviceWorker.register(`${BASE}/sw.js`, { scope: `${BASE}/` });
-  }, [auth]);
-
-  const notify = (text: string) => { setToast(text); window.setTimeout(() => setToast(''), 3500); };
-  const navigate = (next: Page) => { setPage(next); history.replaceState({}, '', `${BASE}/?page=${next}`); window.scrollTo({ top: 0 }); };
-  const openLead = (id: string) => { setSelectedView('lead'); setSelectedLead(id); history.replaceState({}, '', `${BASE}/?lead=${id}`); window.scrollTo({ top: 0 }); };
-  const openChat = (id: string) => { setSelectedView('chat'); setSelectedLead(id); history.replaceState({}, '', `${BASE}/?chat=${id}`); window.scrollTo({ top: 0 }); };
-  const closeLead = () => { setSelectedLead(null); history.replaceState({}, '', `${BASE}/?page=${page}`); window.scrollTo({ top: 0 }); };
+  const [selectedLead, setSelectedLead] = useState<string | null>(params.get('lead'));
+  const [toasts, setToasts] = useState<Array<{ id: number; text: string }>>([]);
+  const [autoMode, setAutoMode] = useState<string>('manual');
+  const status = useStatus(auth === 'ok');
 
   useEffect(() => {
-    if (!soundEnabled) return;
-    const unlock = () => { void ensureAlarmAudio(); };
-    window.addEventListener('pointerdown', unlock, { once: true });
-    return () => window.removeEventListener('pointerdown', unlock);
-  }, [soundEnabled]);
-
-  useEffect(() => {
-    if (auth !== 'ok') return;
-    let cancelled = false;
-    const loadEvents = async () => {
-      try {
-        const next = await api<LiveEventFeed>('/live-events');
-        if (cancelled) return;
-        const current = { lead: next.lead, draft: next.draft, message: next.message };
-        if (!seenEvents.current) {
-          seenEvents.current = current;
-          return;
-        }
-        const previous = seenEvents.current;
-        const isNewer = (kind: keyof typeof current) => Boolean(
-          current[kind] && Date.parse(current[kind]!.created_at) > Date.parse(previous[kind]?.created_at || '1970-01-01'),
-        );
-        const candidates: LivePageAlert[] = [];
-        if (next.lead && isNewer('lead')) candidates.push({
-          kind: 'lead', leadId: next.lead.id, title: 'Новый заказ на FL.ru',
-          text: next.lead.title, createdAt: next.lead.created_at,
-        });
-        if (next.draft && isNewer('draft')) candidates.push({
-          kind: 'draft', leadId: next.draft.lead_id || '', title: 'Отклик готов',
-          text: next.draft.title, createdAt: next.draft.created_at,
-        });
-        if (next.message && isNewer('message')) candidates.push({
-          kind: 'message', leadId: next.message.lead_id || '', title: 'Клиент написал в чат',
-          text: `${next.message.title}. ${String(next.message.content || '').slice(0, 140)}`, createdAt: next.message.created_at,
-        });
-        seenEvents.current = {
-          lead: isNewer('lead') ? next.lead : previous.lead,
-          draft: isNewer('draft') ? next.draft : previous.draft,
-          message: isNewer('message') ? next.message : previous.message,
-        };
-        const newest = candidates.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
-        if (!newest) return;
-        setLiveAlert(newest);
-        setToast(`${newest.title}: ${newest.text}`);
-        window.setTimeout(() => setToast(''), 6_000);
-        document.title = `🔔 ${newest.title}`;
-        if (soundEnabled) await playPageAlarm();
-      } catch {
-        // The normal page keeps working if this lightweight poll misses one cycle.
+    const refreshAuth = async () => {
+      try { await api('/auth/me'); setAuth('ok'); }
+      catch {
+        const status = await api<{ required: boolean }>('/auth/setup-status').catch(() => ({ required: false }));
+        setAuth(status.required ? 'setup' : 'login');
       }
     };
-    void loadEvents();
-    const timer = window.setInterval(() => { void loadEvents(); }, 5_000);
-    const onFocus = () => { void loadEvents(); };
-    window.addEventListener('focus', onFocus);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [auth, soundEnabled]);
+    void refreshAuth();
+  }, []);
+  useEffect(() => {
+    const onExpired = () => setAuth('login');
+    window.addEventListener('dsh:auth-expired', onExpired);
+    return () => window.removeEventListener('dsh:auth-expired', onExpired);
+  }, []);
+  useEffect(() => {
+    if (auth !== 'ok') return;
+    api<{ policy?: { mode?: string } }>('/autonomy')
+      .then((value) => setAutoMode(value.policy?.mode || 'manual'))
+      .catch(() => undefined);
+  }, [auth]);
 
-  const toggleSound = async () => {
-    const next = !soundEnabled;
-    setSoundEnabled(next);
-    localStorage.setItem('sales.pageSound', next ? '1' : '0');
-    if (next) {
-      await playPageAlarm(true);
-      notify('Звук включён. Так прозвучит новое событие.');
-    } else {
-      notify('Звуковой сигнал выключен');
-    }
+  const notify = (text: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev.slice(-2), { id, text }]);
+    window.setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 3500);
   };
-  const openLiveAlert = () => {
-    if (!liveAlert) return;
-    if (liveAlert.kind === 'lead') openLead(liveAlert.leadId);
-    else if (liveAlert.kind === 'draft') navigate('approvals');
-    else openChat(liveAlert.leadId);
-    setLiveAlert(null);
-    document.title = 'Sales Control';
+  const busy = (status?.running?.length || 0) + (status?.queue?.active || 0);
+  const workerSeenAt = status?.worker?.seenAt || null;
+  const serverNow = status?.serverTime ? Date.parse(status.serverTime) : Date.now();
+  const workerDead = Boolean(auth === 'ok' && (!workerSeenAt || serverNow - Date.parse(workerSeenAt) > 150_000));
+  const blocked = blockingError(status);
+  const navigate = (next: Page) => { setPage(next); history.pushState({ dsh: 1 }, '', `${BASE}/?page=${next}`); window.scrollTo({ top: 0 }); };
+  const openLead = (id: string) => { setSelectedLead(id); history.pushState({ dsh: 1 }, '', `${BASE}/?lead=${id}`); window.scrollTo({ top: 0 }); };
+  const closeLead = () => {
+    if (history.state?.dsh) { history.back(); return; }
+    setSelectedLead(null); history.replaceState({}, '', `${BASE}/?page=${page}`); window.scrollTo({ top: 0 });
   };
-  const dismissLiveAlert = () => {
-    setLiveAlert(null);
-    document.title = 'Sales Control';
-  };
+  useEffect(() => {
+    const onPop = () => {
+      const pop = new URLSearchParams(location.search);
+      setPage(validPage(pop.get('page')));
+      setSelectedLead(pop.get('lead'));
+      window.scrollTo({ top: 0 });
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   if (auth === 'loading') return <div className="center"><div className="spinner" /></div>;
   if (auth !== 'ok') return <Auth mode={auth} onDone={() => setAuth('ok')} />;
 
-  return <div className={`shell ${selectedLead ? 'focus' : ''} ${page === 'chat-lab' ? 'chatLabShell' : ''}`}>
+  return <div className={`shell ${selectedLead ? 'focus' : ''}`}>
     <header>
-      <div className="brand"><span className="logo">S</span><div><strong>Sales Control</strong><small>Заказы под контролем</small></div></div>
+      <button className="brand brandButton" onClick={() => navigate('leads')} title="К заказам">
+        <span className="logo">S</span><div><strong>Sales Control</strong><small>Заказы и отклики</small></div>
+      </button>
       <div className="headerActions">
-        <button className={`soundToggle ${soundEnabled ? 'on' : ''}`} onClick={() => { void toggleSound(); }}>
-          {soundEnabled ? '🔊 Звук включён' : '🔇 Включить звук'}
-        </button>
-        <span className="approvalLock"><i /> Отправка только после одобрения</span>
+        <span className={`systemPill ${workerDead ? 'bad' : blocked ? 'warn' : busy ? 'busy' : ''}`}>
+          <i className={busy && !workerDead && !blocked ? 'livePulse' : undefined} />
+          {workerDead ? 'Обработчик не отвечает' : blocked ? 'ИИ остановлен' : busy ? `В работе: ${busy}` : 'Система свободна'}
+        </span>
+        <span className={`approvalLock ${autoMode === 'smart' ? 'auto' : ''}`}><i /> {autoMode === 'smart' ? 'Авто-отправка включена' : 'Отправка вручную'}</span>
       </div>
     </header>
     <main>
-      {liveAlert && <div className="liveAlarm" role="alert">
-        <button className="liveAlarmOpen" onClick={openLiveAlert}>
-          <span className="liveAlarmIcon">🔔</span>
-          <span><b>{liveAlert.title}</b><small>{liveAlert.text}</small></span>
-          <strong>Открыть →</strong>
-        </button>
-        <button className="liveAlarmClose" aria-label="Закрыть уведомление" onClick={dismissLiveAlert}>×</button>
-      </div>}
-      {selectedLead ? selectedView === 'chat' ? <ChatDetail id={selectedLead} back={closeLead} notify={notify} /> : <LeadDetail id={selectedLead} back={closeLead} notify={notify} /> : <>
-        {page === 'dashboard' && <Dashboard openLead={openLead} notify={notify} openApprovals={() => navigate('approvals')} openChats={() => navigate('chats')} />}
-        {page === 'sandbox' && <Sandbox openLead={openLead} notify={notify} />}
-        {page === 'chat-lab' && <ChatLab back={() => navigate('dashboard')} />}
-        {page === 'leads' && <Leads openLead={openLead} notify={notify} />}
-        {page === 'chats' && <Chats openChat={openChat} />}
-        {page === 'approvals' && <Approvals notify={notify} />}
-        {page === 'settings' && <Settings notify={notify} />}
-      </>}
+      <div className="page" key={selectedLead || page}>
+        {selectedLead
+          ? <LeadDetail id={selectedLead} back={closeLead} notify={notify} />
+          : <>
+            {page === 'leads' && <Leads openLead={openLead} notify={notify} status={status} />}
+            {page === 'approvals' && <Approvals notify={notify} openLead={openLead} status={status} />}
+            {page === 'settings' && <Settings notify={notify} status={status} />}
+          </>}
+      </div>
     </main>
-    {!selectedLead && page !== 'chat-lab' && <nav>
-      <Nav active={page === 'dashboard'} onClick={() => navigate('dashboard')} icon="⌂" text="Главная" />
-      <Nav active={page === 'sandbox'} onClick={() => navigate('sandbox')} icon="◇" text="Полигон" />
+    {!selectedLead && <nav>
       <Nav active={page === 'leads'} onClick={() => navigate('leads')} icon="▣" text="Заказы" />
-      <Nav active={page === 'chats'} onClick={() => navigate('chats')} icon="◌" text="Чаты" />
-      <Nav active={page === 'approvals'} onClick={() => navigate('approvals')} icon="✓" text="На проверку" />
+      <Nav active={page === 'approvals'} onClick={() => navigate('approvals')} icon="✓" text="Отклики" />
       <Nav active={page === 'settings'} onClick={() => navigate('settings')} icon="⚙" text="Система" />
     </nav>}
-    {toast && <div className="toast">{toast}</div>}
+    {toasts.length > 0 && <div className="toastStack">{toasts.map((toast) => <div className="toast" role="status" key={toast.id}>{toast.text}</div>)}</div>}
   </div>;
 }
 
@@ -254,7 +136,29 @@ function Auth({ mode, onDone }: { mode: 'setup' | 'login'; onDone: () => void })
 }
 
 function Nav({ active, onClick, icon, text }: { active: boolean; onClick: () => void; icon: string; text: string }) {
-  return <button className={active ? 'active' : ''} onClick={onClick}><span>{icon}</span>{text}</button>;
+  return <button className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} onClick={onClick}><span>{icon}</span>{text}</button>;
+}
+
+/**
+ * One polling rule for every screen: refresh now, then on an interval, never while
+ * the tab is in the background (a hidden tab polling is how this UI used to stutter).
+ */
+function usePolling(load: () => void, everyMs: number, immediate = true) {
+  const saved = useRef(load);
+  saved.current = load;
+  useEffect(() => {
+    let cancelled = false;
+    const run = () => { if (!cancelled && !document.hidden) void saved.current(); };
+    if (immediate) void saved.current();
+    const timer = window.setInterval(run, everyMs);
+    const onVisible = () => { if (!document.hidden) void saved.current(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [everyMs, immediate]);
 }
 
 type ActivityStep = { key: string; label: string; status: 'pending' | 'active' | 'done' | 'skipped' | 'failed'; note?: string; attempts?: number; started_at?: string; ended_at?: string };
@@ -266,10 +170,6 @@ type ActivityJob = {
 };
 type ActivityFeed = { active: ActivityJob[]; recent: ActivityJob[]; aiQueue: number };
 
-/**
- * Pressing a button starts work that finishes minutes later inside the worker.
- * Polling has to be fast while something runs and cheap when nothing does.
- */
 function useActivity(leadId?: string, signal = 0) {
   const [feed, setFeed] = useState<ActivityFeed>();
   const load = useCallback(
@@ -279,13 +179,48 @@ function useActivity(leadId?: string, signal = 0) {
   const running = (feed?.active?.length || 0) > 0;
   useEffect(() => { void load(); }, [load, signal]);
   useEffect(() => {
-    const timer = window.setInterval(() => { void load(); }, running ? 2_000 : 12_000);
+    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, running ? 2_000 : 12_000);
     return () => clearInterval(timer);
   }, [load, running]);
   return { feed, running, reload: load };
 }
 
-/** Second-by-second clock, but only while there is a running job to time. */
+type SystemStatus = {
+  serverTime: string;
+  worker: { seenAt: string | null };
+  queue: { waiting: number; active: number; delayed: number; failed: number };
+  ai: { pending: string; claimed: string; done24: string; failed24: string; waiting_ms: string };
+  scan: {
+    last: { created_at: string; found_count: number; new_count: number; analyzed_count: number; duration_ms: number } | null;
+    intervalSeconds: number; enabled: boolean; healthy: boolean; statusText: string | null; lastSuccessAt: string | null;
+  };
+  broker: { healthy: boolean; statusText: string | null; lastSuccessAt: string | null };
+  drafts: { today: number; autoUsed: number };
+  policy: { minScore: number; minDealPrice: number; autoDraft: boolean; autoDraftLimit: number; autoSend: boolean };
+  running: ActivityJob[];
+  errors: Array<{ message: string; count: string; last_at: string }>;
+};
+
+/** Nothing in this interface may leave the owner guessing whether the click worked. */
+function useStatus(enabled = true, everyMs = 8_000) {
+  const [status, setStatus] = useState<SystemStatus>();
+  const load = useCallback(
+    () => api<SystemStatus>('/status').then(setStatus).catch(() => undefined),
+    [],
+  );
+  const busy = (status?.running?.length || 0) > 0 || (status?.queue?.active || 0) > 0;
+  useEffect(() => { if (enabled) void load(); }, [enabled, load]);
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, busy ? 3_000 : everyMs);
+    return () => clearInterval(timer);
+  }, [enabled, load, busy, everyMs]);
+  return status;
+}
+
+const aiWaiting = (status?: SystemStatus) => Number(status?.ai.pending || 0) + Number(status?.ai.claimed || 0);
+const blockingError = (status?: SystemStatus) => (status?.errors || []).find((row) => /402|credit|quota|limit/i.test(row.message));
+
 function useTicker(enabled: boolean) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -305,12 +240,14 @@ const duration = (ms: number) => {
 /** Broker and queue failures arrive as English internals; the owner needs the meaning. */
 const humanError = (text: string) => {
   const table: Array<[RegExp, string]> = [
-    [/exceeds the Hermes input limit|instruction limit/i, 'Заказ оказался слишком большим для одной задачи ИИ. Система ужимает контекст сама; если повторяется — сократите описание заказа.'],
-    [/Время ожидания Codex истекло/i, 'ИИ не ответил за отведённое время. Запустите ещё раз — обычно проходит со второй попытки.'],
-    [/не прошёл финальную проверку качества/i, 'Текст не прошёл проверку на живость и достоверность, поэтому черновик не сохранён. Запустите заново или задайте свои правки.'],
+    [/402|exceed your available credits|requires more credits|insufficient credits/i, 'Закончились средства на OpenRouter. Пополните баланс на openrouter.ai/settings/credits — пока этого не сделать, заказы не оцениваются и тексты не пишутся.'],
+    [/exceeds the Hermes input limit|instruction limit/i, 'Заказ оказался слишком большим для одной задачи ИИ. Запустите ещё раз или сократите описание.'],
+    [/Время ожидания истекло|Время ожидания Codex истекло/i, 'ИИ не ответил за отведённое время. Запустите ещё раз.'],
+    [/Unsupported AI task kind/i, 'Внутренняя ошибка конфигурации задач — обновите систему или сообщите разработчику.'],
+    [/не прошёл финальную проверку качества/i, 'Текст не прошёл проверку на живость и достоверность. Запустите заново или задайте свои правки.'],
     [/Hermes did not return a JSON object|invalid task id/i, 'ИИ вернул испорченный ответ. Запустите ещё раз.'],
     [/Hermes run failed|run was cancelled/i, 'Задача ИИ оборвалась на стороне брокера. Запустите ещё раз.'],
-    [/fetch failed|ECONNREFUSED|ETIMEDOUT/i, 'Не достучались до внешнего сервиса. Проверьте связь и подключения в разделе «Система».'],
+    [/fetch failed|ECONNREFUSED|ETIMEDOUT/i, 'Не достучались до внешнего сервиса. Проверьте подключения в разделе «Система».'],
     [/Работа прервана: сервис перезапустился/i, 'Работа прервалась из-за перезапуска сервиса. Запустите заново.'],
     [/cookie|Unauthorized|401/i, 'FL.ru не принял вход. Обновите cookies в разделе «Система».'],
   ];
@@ -318,18 +255,16 @@ const humanError = (text: string) => {
   return text;
 };
 
-/** Honest expectation beats a spinner with no end in sight. */
 const jobEta = (kind: string) => ({
   'draft-reply': 'обычно 3–6 минут',
   'analyze-lead': 'обычно 30–90 секунд',
   'generate-documents': 'обычно 2–5 минут',
-  'generate-design': 'обычно 5–10 минут',
   'send-draft': 'обычно несколько секунд',
   'scan-fl': 'обычно 10–30 секунд',
 } as Record<string, string>)[kind] || '';
 
 const jobIcon = ({ kind }: ActivityJob) => ({
-  'draft-reply': '✎', 'analyze-lead': '⚖', 'generate-documents': '▤', 'generate-design': '◨',
+  'draft-reply': '✎', 'analyze-lead': '⚖', 'generate-documents': '▤',
   'send-draft': '➤', 'scan-fl': '⟳', 'owner-command': '☰',
 } as Record<string, string>)[kind] || '•';
 
@@ -367,11 +302,7 @@ function ActivityJobCard({ job, now }: { job: ActivityJob; now: number }) {
   </article>;
 }
 
-/**
- * The one place that answers "я нажал кнопку — что сейчас происходит?".
- * Shown on the dashboard globally and inside a deal filtered to that deal.
- */
-function LiveActivity({ leadId, signal = 0, onIdle, title = 'Прямо сейчас' }: { leadId?: string; signal?: number; onIdle?: () => void; title?: string }) {
+function LiveActivity({ leadId, signal = 0, onIdle, title = 'Прямо сейчас', onlyWhenBusy = false }: { leadId?: string; signal?: number; onIdle?: () => void; title?: string; onlyWhenBusy?: boolean }) {
   const { feed, running } = useActivity(leadId, signal);
   const now = useTicker(running);
   const [wasRunning, setWasRunning] = useState(false);
@@ -380,881 +311,480 @@ function LiveActivity({ leadId, signal = 0, onIdle, title = 'Прямо сейч
     else if (wasRunning) { setWasRunning(false); onIdle?.(); }
   }, [running, wasRunning, onIdle]);
   if (!feed) return null;
-  const recent = feed.recent.slice(0, running ? 2 : 4);
+  if (onlyWhenBusy && !running) return null;
   return <section className={`liveActivity ${running ? 'busy' : ''}`}>
     <div className="liveHead">
       <div><span className="eyebrow">{running ? 'Идёт работа' : 'Система свободна'}</span><h2>{title}</h2></div>
       <span className="liveBadgeCount">{running ? <><i className="livePulse" />{feed.active.length} в работе</> : <>Ожидает команды</>}</span>
     </div>
-    {running && feed.aiQueue > 1 && <p className="liveQueue">ИИ выполняет задачи по очереди: сейчас в очереди {feed.aiQueue}. Пока они не пройдут, текущий шаг будет ждать.</p>}
+    {running && feed.aiQueue > 1 && <p className="liveQueue">ИИ выполняет задачи по очереди: в очереди {feed.aiQueue}.</p>}
     {running
       ? <div className="liveJobs">{feed.active.map((job) => <ActivityJobCard job={job} now={now} key={job.id} />)}</div>
-      : <p className="liveIdle">Ничего не считается и никуда не отправляется. Нажмите любую кнопку выше — здесь появятся все шаги с таймером.</p>}
-    {recent.length > 0 && <div className="liveRecent">
-      <b>Последние завершённые</b>
-      {recent.map((job) => <div className={job.status} key={job.id}>
-        <i>{job.status === 'failed' ? '!' : '✓'}</i>
-        <span>{job.title}{job.lead_title ? ` · ${job.lead_title}` : ''}</span>
-        <time>{job.finished_at ? relativeTime(job.finished_at) : ''} · {duration(new Date(job.finished_at || job.updated_at).getTime() - new Date(job.started_at).getTime())}</time>
-      </div>)}
-    </div>}
+      : <p className="liveIdle">Ничего не считается и никуда не отправляется.</p>}
   </section>;
 }
 
-const chatLabStages = [
-  ['S1', 'Первый ответ', 'Ответить по существу и задать один лёгкий вопрос'],
-  ['S2', 'Discovery', 'Цель, текущее состояние, боль и ограничения'],
-  ['S3', 'Квалификация', 'Рамка, ЛПР, причина дедлайна и критерий успеха'],
-  ['S4', 'Ценность', 'Диагноз, короткий подход и одно доказательство'],
-  ['S5', 'Канал', 'Созвон или Telegram только после предметного интереса'],
-  ['S6', 'Фиксация ТЗ', 'Резюме на письменное подтверждение клиента'],
-  ['S7', 'Условия', 'Цена, срок и договор — только через владельца'],
-  ['S8', 'В работу', 'Подтверждённый пакет передаётся в разработку'],
+function Tile({ label, value, hint, tone }: { label: string; value: string; hint: string; tone?: string }) {
+  return <div className={`tile ${tone || ''}`}><span>{label}</span><b>{value}</b><small>{hint}</small></div>;
+}
+
+/**
+ * The owner's main question is "what is happening and did my click do anything".
+ * Everything the system knows about itself is therefore in one block at the top.
+ */
+function SystemPanel({ status, onScan, scanning }: { status?: SystemStatus; onScan: () => void; scanning: boolean }) {
+  const now = useTicker(Boolean(status));
+  const scanButton = <button className="primary" disabled={scanning} onClick={onScan}>{scanning ? 'Проверяю…' : '⟳ Проверить заказы на FL.ru'}</button>;
+  if (!status) return <section className="systemPanel">
+    <div className="systemTop">
+      <div><span className="eyebrow">Что происходит</span><h2>Процессы</h2></div>
+      {scanButton}
+    </div>
+    <p className="liveIdle">Статус системы недоступен. Кнопка проверки работает — если заказы не появятся, загляните в «Система».</p>
+  </section>;
+  const blocked = blockingError(status);
+  const failed = Number(status.ai.failed24 || 0);
+  const waiting = aiWaiting(status);
+  const seenAt = status.worker?.seenAt || null;
+  const serverNow = status.serverTime ? Date.parse(status.serverTime) : Date.now();
+  const workerDead = !seenAt || serverNow - Date.parse(seenAt) > 150_000;
+  return <section className="systemPanel">
+    <div className="systemTop">
+      <div><span className="eyebrow">Что происходит</span><h2>Процессы</h2></div>
+      {scanButton}
+    </div>
+    {workerDead && <div className="alert bad"><b>Обработчик задач не отвечает.</b> Заказы не оцениваются и отклики не пишутся.</div>}
+    {blocked && <div className="alert bad">
+      <b>ИИ остановлен: {blocked.count} случаев за сутки.</b> {humanError(blocked.message)}
+    </div>}
+    {!blocked && failed > 3 && <div className="alert warn">За сутки {failed} задач ИИ закончились ошибкой. Ниже — что именно не так.</div>}
+    <div className="tiles">
+      <Tile
+        label="Поиск на FL.ru"
+        value={status.scan.enabled ? 'Включён' : 'На паузе'}
+        hint={status.scan.last
+          ? `проверял ${relativeTime(status.scan.last.created_at)} · нашёл ${status.scan.last.found_count}, новых ${status.scan.last.new_count}`
+          : 'ещё не запускался'}
+        tone={status.scan.enabled ? 'ok' : 'muted'}
+      />
+      <Tile
+        label="Задачи"
+        value={`${status.queue.active} в работе`}
+        hint={waiting ? `в очереди ${status.queue.waiting} · у ИИ ${waiting}` : 'очередь пуста'}
+      />
+      <Tile
+        label="Черновики сегодня"
+        value={String(status.drafts.today)}
+        hint={status.policy.autoDraft ? `авто ${status.drafts.autoUsed} из ${status.policy.autoDraftLimit}` : 'только по кнопке'}
+      />
+      <Tile
+        label="Ошибки за сутки"
+        value={String(failed)}
+        hint={status.broker.healthy && status.broker.lastSuccessAt ? `брокер на связи · ${relativeTime(status.broker.lastSuccessAt)}` : 'брокер не отвечает'}
+        tone={failed > 3 ? 'warn' : 'ok'}
+      />
+    </div>
+    <p className="policyLine">
+      Берём заказы с оценкой от <b>{status.policy.minScore}</b> и сделкой от <b>{money(status.policy.minDealPrice)}</b>.
+      {' '}Черновики: {status.policy.autoDraft ? `сами, до ${status.policy.autoDraftLimit} в день` : 'только по кнопке'}.
+      {' '}Отправка — только вашей кнопкой.
+    </p>
+    <div className="liveJobs">
+      {status.running.length > 0
+        ? status.running.map((job) => <ActivityJobCard job={job} now={now} key={job.id} />)
+        : <p className="liveIdle">{waiting > 0 ? `Ждут своей очереди: ${waiting}` : 'Ничего не считается и никуда не отправляется.'}</p>}
+    </div>
+  </section>;
+}
+
+const FILTERS: Array<[string, string]> = [
+  ['all', 'Все'],
+  ['fresh', 'Актуальные 24 ч'],
+  ['qualified', 'Подходят'],
+  ['contacted', 'В работе'],
+  ['rejected', 'Отсеяны'],
 ];
+const SORTS: Array<[string, string]> = [['date', 'Сначала новые'], ['score', 'Сначала лучшие'], ['price', 'Сначала дорогие']];
 
-const chatLabScenarios = [
-  {
-    title: 'FL.ru · три сообщения подряд',
-    stage: 'S2 · Discovery',
-    confidence: '94%',
-    decision: 'Один ответ на весь пакет · 1 вопрос · владелец не нужен',
-    requirements: ['Каталог уже существует', 'Остатки приходят из МойСклад', 'Оплата через ЮKassa'],
-    messages: [
-      ['client', 'Каталог уже есть.'],
-      ['client', 'Остатки приходят из МойСклад.'],
-      ['client', 'Оплата — ЮKassa.'],
-      ['agent', 'Тогда каталог не нужно собирать с нуля: основной контур — связать его с остатками из МойСклад и оплатой через ЮKassa. Что именно требуется реализовать поверх уже готового каталога?'],
-    ],
-  },
-  {
-    title: 'FL.ru · вопрос о цене и сроке',
-    stage: 'S7 · Решение владельца',
-    confidence: '97% + стоп-триггер',
-    decision: 'Черновик безопасной паузы · владельцу передан бриф · цифры не обещаны',
-    requirements: ['Клиент запросил цену', 'Клиент запросил срок', 'Нужно решение владельца'],
-    messages: [
-      ['client', 'Сколько будет стоить и успеете до конца месяца?'],
-      ['agent', 'По деньгам, срокам и условиям решаю лично. Проверю объём и вернусь с конкретикой сегодня до 18:00 по Москве.'],
-    ],
-  },
-  {
-    title: 'Telegram · продолжение той же сделки',
-    stage: 'S4 · Ценностная рамка',
-    confidence: '96%',
-    decision: 'Контекст FL.ru сохранён · агент не перескочил к ТЗ, пока открыто действие по push',
-    requirements: ['iOS и Android', 'Каталог из действующей системы', 'Тестовая оплата', 'Открыт вопрос действия по push'],
-    messages: [
-      ['client', 'Да, пуш нужен только когда заказ собран и когда передан в доставку.'],
-      ['agent', 'Тогда в первом этапе оставляем ровно два push-триггера: заказ собран и передан в доставку — без промежуточных статусов. По нажатию на уведомление нужно открывать карточку соответствующего заказа?'],
-    ],
-  },
-];
-
-function ChatLab({ back }: { back: () => void }) {
-  return <section className="chatLabPage">
-    <button className="back" onClick={back}>← Вернуться на Dashboard</button>
-    <div className="chatLabHero">
-      <div><span className="eyebrow">Изолированная лаборатория</span><h1>Как теперь работает общение</h1><p>Наглядная проверка только чат-контура по исследованию. Здесь нет доступа к FL.ru, Telegram и реальным клиентам.</p></div>
-      <div className="chatLabSafety"><b>19 целевых проверок</b><span>0 внешних отправок</span><small>Ещё 14 проверок схемы Hermes</small></div>
-    </div>
-
-    <div className="chatLabStageGrid">{chatLabStages.map(([code, title, text]) => <article key={code}><i>{code}</i><div><b>{title}</b><p>{text}</p></div></article>)}</div>
-
-    <div className="chatLabHeading"><div><span className="eyebrow">Три точечных сценария</span><h2>Что увидел агент и почему ответил именно так</h2></div><span>Все реплики тестовые</span></div>
-    <div className="chatLabScenarios">{chatLabScenarios.map((scenario) => <article className="chatLabScenario" key={scenario.title}>
-      <div className="chatLabScenarioHead"><div><small>{scenario.stage}</small><h3>{scenario.title}</h3></div><b>{scenario.confidence}</b></div>
-      <div className="chatLabDecision"><span>Решение системы</span><p>{scenario.decision}</p></div>
-      <div className="chatLabThread">{scenario.messages.map(([role, message], index) => <div className={role} key={`${scenario.title}-${index}`}><small>{role === 'client' ? 'Клиент' : 'Черновик агента'}</small><p>{message}</p></div>)}</div>
-      <div className="chatLabFacts"><b>Память сделки</b>{scenario.requirements.map((item) => <span key={item}>✓ {item}</span>)}</div>
-    </article>)}</div>
-
-    <div className="chatLabChecks">
-      <article><b>Программные предохранители</b><p>До сохранения черновика код проверяет: не более 500 знаков, не более одного вопроса, ценность перед вопросом и общий бюджет до семи discovery-вопросов.</p></article>
-      <article><b>Безусловная передача владельцу</b><p>Цена, срок, договор, гарантии, доступы, негатив, созвон, вопрос об ИИ и подозрительные условия больше не остаются на усмотрение модели.</p></article>
-      <article><b>Разные каналы — одна память</b><p>FL.ru деловитее, Telegram разговорнее. Код FS связывает каналы, а подтверждённые условия должны фиксироваться обратно в FL.ru.</p></article>
-      <article className="pending"><b>Пока не включено в бою</b><p>Автоотправка и follow-up +1/+3/+7 не активированы: сначала собираем метрики на черновиках и одобрении владельца.</p></article>
-    </div>
-  </section>;
-}
-
-function Dashboard({ openLead, notify, openApprovals, openChats }: { openLead: (id: string) => void; notify: (text: string) => void; openApprovals: () => void; openChats: () => void }) {
-  const [data, setData] = useState<any>();
-  const [busy, setBusy] = useState(false);
-  const [signal, setSignal] = useState(0);
-  const [tech, setTech] = useState(() => localStorage.getItem('sales.tech') === '1');
-  const load = () => api('/dashboard').then(setData);
-  const reload = useCallback(() => { void load(); }, []);
-  useEffect(() => { void load(); const timer = window.setInterval(load, 20_000); return () => clearInterval(timer); }, []);
-  useEffect(() => { localStorage.setItem('sales.tech', tech ? '1' : '0'); }, [tech]);
-  if (!data) return <Loading />;
-  const fl = data.connectors.find((item: any) => item.connector === 'fl') || {};
-  const scan = data.scan || {};
-  const manualScan = async () => {
-    setBusy(true);
-    setSignal((value) => value + 1);
-    try {
-      const result = await api<any>('/connectors/fl/scan', { method: 'POST' });
-      notify(`FL проверен: новых ${result.projects?.created || 0}, повторов ${result.projects?.skippedKnown || 0}`);
-      await load();
-    } catch (error) { notify((error as Error).message); } finally { setBusy(false); setSignal((value) => value + 1); }
-  };
-  const toggle = async () => {
-    setBusy(true);
-    try {
-      await api('/settings/fl', { method: 'POST', body: JSON.stringify({ enabled: !fl.enabled }) });
-      notify(fl.enabled ? 'Автопроверка остановлена' : 'Автопроверка включена: каждые 5 минут');
-      await load();
-    } catch (error) { notify((error as Error).message); } finally { setBusy(false); }
-  };
-  const new24 = Number(data.metrics.new24 || 0);
-  const analyzed24 = Number(data.metrics.analyzed24 || 0);
-  const qualified = Number(data.metrics.qualified || 0);
-  const qualified24 = Number(data.metrics.qualified24 || 0);
-  const broken = data.connectors.filter((item: any) => ['fl', 'codex', 'telegram'].includes(item.connector)
-    && !(item.connector === 'codex' ? item.healthy : item.enabled && item.healthy));
-
-  return <section>
-    <div className="pageTitle"><div><span className="eyebrow">Сегодня</span><h1>Что сделать сейчас</h1><p>Сверху — то, где нужны вы. Ниже видно, чем система занята прямо сейчас.</p></div><PushControl notify={notify} compact /></div>
-
-    {broken.length > 0 && <div className="alertBar">
-      <i>!</i>
-      <div><b>Не работает: {broken.map((item: any) => labelConnector(item.connector)).join(', ')}</b><small>Пока это не починить, новые заказы и отправка могут не проходить. Подробности — в разделе «Система».</small></div>
-    </div>}
-
-    <div className="stepHint"><b>1</b><span>Проверьте готовые ответы</span><b>2</b><span>Одобрите или поправьте текст</span><b>3</b><span>Система отправит и покажет результат</span></div>
-
-    <div className="metrics actionMetrics">
-      <button className="metric amber actionable primaryAction" onClick={openApprovals}><b>{data.metrics.pending || 0}</b><span>Ответов ждут проверки</span><small>Проверить и отправить →</small></button>
-      <button className="metric green actionable" onClick={openChats}><b>{fl.cursor?.chat_list_count || 0}</b><span>Диалогов с клиентами</span><small>Открыть переписку →</small></button>
-      <Metric label="Подходящих заказов" value={qualified} tone="violet" hint="Система уже отобрала их для вас" />
-    </div>
-
-    <LiveActivity signal={signal} onIdle={reload} />
-
-    <div className={`systemBar ${fl.enabled ? 'online' : 'paused'}`}><span className={fl.enabled ? 'dot ok' : 'dot'} /><div><b>{fl.enabled ? 'Автопоиск работает' : 'Автопоиск на паузе'}</b><small>{fl.status_text || 'Нет данных'}{fl.last_success_at ? ` · ${relativeTime(fl.last_success_at)}` : ''}</small></div><button onClick={manualScan} disabled={busy}>{busy ? 'Проверяю…' : 'Проверить сейчас'}</button><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={toggle} disabled={busy}>{fl.enabled ? 'Пауза' : 'Включить'}</button></div>
-
-    <Card title="Заказы, на которые стоит посмотреть" subtitle={`${new24} новых за сутки · ${analyzed24} уже оценены · нажмите на строку, чтобы открыть заказ`}><LeadRows leads={data.recent.slice(0, 5)} openLead={openLead} /></Card>
-
-    <Card title="Воронка за 24 часа" subtitle="Куда ушли новые проекты">
-      <FunnelRow label="Найдено новых" value={new24} max={Math.max(1, new24)} />
-      <FunnelRow label="Оценено Codex" value={analyzed24} max={Math.max(1, new24)} />
-      <FunnelRow label="Прошли отбор" value={qualified24} max={Math.max(1, new24)} accent />
-      <div className="saving"><span>⚡</span><div><b>{scan.skipped24 || 0} повторов не отправлено в ИИ</b><small>Заказы сверяются по ID до запуска Codex</small></div></div>
-    </Card>
-
-    <div className="techToggle">
-      <button className={tech ? 'active' : ''} onClick={() => setTech(!tech)}>{tech ? '▾' : '▸'} Технические подробности<small>Состояние сервисов, схема архитектуры и метрики исследования</small></button>
-    </div>
-    {tech && <div className="techPanel">
-      <Card title="Состояние системы" subtitle="Живые данные сервисов">
-        {data.connectors.filter((item: any) => item.connector !== 'openai').map((connector: any) => <Connector key={connector.connector} connector={connector} />)}
-        <div className="scanFacts"><span>Средний скан <b>{scan.avg_duration_ms ? `${scan.avg_duration_ms} мс` : '—'}</b></span><span>Последний <b>{scan.last_scan_at ? relativeTime(scan.last_scan_at) : '—'}</b></span></div>
-      </Card>
-      <ResearchDashboard data={data.research} />
-      <ArchitectureDashboard data={data} />
-    </div>}
-  </section>;
-}
-
-function ResearchDashboard({ data }: { data: any }) {
-  if (!data) return null;
-  const funnel = data.funnel || {};
-  const followups = data.followups || {};
-  const evals = data.evals || {};
-  const proposals = numberOf(funnel.proposals);
-  const replied = numberOf(funnel.replied);
-  const replyRate = proposals > 0 ? Math.round((replied / proposals) * 100) : 0;
-  const evalTotal = numberOf(evals.total);
-  const evalRate = evalTotal > 0 ? Math.round((numberOf(evals.passed) / evalTotal) * 100) : 100;
-  const humanity = data.proposalHumanity || {};
-  const measuredHumanity = numberOf(humanity.measured);
-  const humanityRate = measuredHumanity > 0
-    ? Math.round((numberOf(humanity.human_pass) / measuredHumanity) * 100)
-    : 0;
-  return <section className="researchDashboard">
-    <div className="researchHead"><div><span className="eyebrow">Контур доказуемой автономности</span><h2>Воронка, follow-up и качество агента</h2><p>Автоматические классы открываются только после нужного числа одобрений без правок. FL.ru всегда остаётся ручным.</p></div><span className="researchSafety">L1–L2 · сбор доказательств для L3</span></div>
-    <div className="researchMetrics">
-      <article><small>Отклики отправлены</small><b>{proposals}</b><span>Reply rate: {replyRate}% · живые: {humanityRate}%</span></article>
-      <article><small>Ответили / диалог</small><b>{replied} / {funnel.engaged || 0}</b><span>Discovery: {funnel.discovery_complete || 0}</span></article>
-      <article><small>Follow-up готовы</small><b>{followups.drafted || 0}</b><span>Запланировано: {followups.pending || 0}</span></article>
-      <article><small>Бинарные evals</small><b>{evalRate}%</b><span>{evals.failed || 0} провалов за 30 дней</span></article>
-    </div>
-    <div className="researchGrid">
-      <article className="researchFunnel"><b>Полная воронка</b>{[
-        ['Отклики', funnel.proposals], ['Ответы', funnel.replied], ['Диалоги ≥3 сообщений', funnel.engaged],
-        ['Discovery завершён', funnel.discovery_complete], ['FL → Telegram', funnel.handoff],
-        ['ТЗ', funnel.specification], ['Сделки', funnel.won],
-      ].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{value || 0}</strong></div>)}</article>
-      <article className="researchClasses"><b>Классы Telegram</b>{(data.autonomyClasses || []).length
-        ? data.autonomyClasses.map((item: any) => <div key={item.class}><span><i className={item.auto_enabled ? 'on' : ''} />{item.class}</span><strong>{item.approved_asis}/{item.shown}</strong><small>{item.auto_enabled ? 'авто открыт' : 'ручной сбор доказательств'}</small></div>)
-        : <p>Статистика начнёт заполняться с новых черновиков. До порогов всё остаётся ручным.</p>}</article>
-      <article className="researchRules"><b>Что уже действует</b><span>✓ Follow-up +1/+3/+7 — только черновики</span><span>✓ Новое входящее отменяет всю серию</span><span>✓ Деньги, проценты и сроки блокируются в безопасных автоответах</span><span>✓ Ошибка владельца становится regression-кейсом</span><span>✓ AI watchdog не делает слепой повтор</span><span>✓ Естественность: бёрстинесс {humanity.avg_burstiness || '—'}, обращений {humanity.avg_addresses || '—'} (цель ≥90%)</span><span>✓ Эпизодов в памяти: {data.memory?.total || 0}</span></article>
-    </div>
-  </section>;
-}
-
-function ArchitectureDashboard({ data }: { data: any }) {
-  const architecture = data.architecture || {};
-  const [svg, setSvg] = useState('');
-  const [renderError, setRenderError] = useState('');
-  const diagram = useMemo(() => architectureDiagram(data), [
-    data.connectors,
-    architecture.handoffs_used,
-    architecture.discovery_leads,
-    architecture.specifications,
-    architecture.contracts,
-    architecture.designs,
-    architecture.ai_failed_24h,
-    architecture.ai_stuck,
-    architecture.delivery_failed_24h,
-  ]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const renderId = `freelance-architecture-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    setRenderError('');
-    void loadMermaid().then((engine) => engine.render(renderId, diagram)).then((result) => {
-      if (!cancelled) setSvg(result.svg);
-    }).catch(() => {
-      if (!cancelled) setRenderError('Схема временно не отрисовалась. Обновите страницу.');
-    });
-    return () => { cancelled = true; };
-  }, [diagram]);
-
-  const aiProblems = numberOf(architecture.ai_failed_24h) + numberOf(architecture.ai_stuck);
-  const deliveryProblems = numberOf(architecture.delivery_failed_24h);
-  const coreConnectors = [
-    { key: 'fl', label: 'FL.ru' },
-    { key: 'codex', label: 'Hermes/Codex' },
-    { key: 'telegram', label: 'Telegram' },
-  ];
-  const connectorProblems = coreConnectors.filter(({ key }) => {
-    const connector = data.connectors?.find((item: any) => item.connector === key);
-    return !connector?.enabled || !connector?.healthy;
-  });
-  const totalProblems = connectorProblems.length + aiProblems + deliveryProblems;
-  const lateFlowStarted = numberOf(architecture.handoffs_used) > 0;
-  const discoveryStarted = numberOf(architecture.discovery_leads) > 0;
-  const documentsStarted = numberOf(architecture.specifications) + numberOf(architecture.contracts) > 0;
-  const designsStarted = numberOf(architecture.designs) > 0;
-
-  const gaps = [
-    connectorProblems.length > 0
-      ? { tone: 'bad', title: `Недоступны: ${connectorProblems.map(({ label }) => label).join(', ')}`, text: 'Основной путь остановлен. Сначала восстановите эти подключения в разделе «Система».' }
-      : { tone: 'ok', title: 'Основные подключения доступны', text: 'FL.ru, Hermes/Codex и Telegram включены и подтверждают здоровье.' },
-    aiProblems > 0
-      ? { tone: 'bad', title: `${aiProblems} проблем ИИ требуют проверки`, text: 'Есть упавшие или зависшие задачи Hermes/Codex за последние сутки.' }
-      : { tone: 'ok', title: 'Очередь ИИ работает чисто', text: 'За последние сутки нет упавших или зависших задач.' },
-    deliveryProblems > 0
-      ? { tone: 'bad', title: `${deliveryProblems} проблем доставки`, text: 'Есть отправки с ошибкой или неизвестным внешним результатом.' }
-      : { tone: 'ok', title: 'Ошибок доставки за сутки нет', text: 'Журнал отправок не показывает подтверждённых проблем.' },
-    lateFlowStarted
-      ? { tone: 'ok', title: 'Переход FL → Telegram пройден', text: `${architecture.handoffs_used} клиентов связаны между каналами.` }
-      : { tone: 'warn', title: 'FL → Telegram не проверен на живом клиенте', text: 'Механика токена и связывания есть, но успешных переходов в базе пока 0.' },
-    discoveryStarted && documentsStarted
-      ? { tone: 'ok', title: 'Сбор требований и документы используются', text: `Клиентов с требованиями: ${architecture.discovery_leads}; ТЗ и договоров: ${numberOf(architecture.specifications) + numberOf(architecture.contracts)}.` }
-      : { tone: 'warn', title: 'Хвост воронки ещё не обкатан', text: 'Требования, ТЗ и договор написаны в коде, но живых результатов в базе пока нет.' },
-    designsStarted
-      ? { tone: 'ok', title: 'Дизайн-концепции создавались', text: `Готовых изображений в системе: ${architecture.designs}.` }
-      : { tone: 'warn', title: 'Генерация дизайна не подтверждена живым результатом', text: 'Путь Codex → HTML → PNG реализован, но сохранённых дизайн-результатов сейчас 0.' },
-  ];
-  const nextSteps = [
-    ...(connectorProblems.length > 0 ? [{ priority: 'Срочно', tone: 'bad', title: 'Восстановить основной контур', text: `Проверить настройки и журналы: ${connectorProblems.map(({ label }) => label).join(', ')}.` }] : []),
-    ...(aiProblems > 0 ? [{ priority: 'Срочно', tone: 'bad', title: 'Разобрать очередь ИИ', text: `${aiProblems} задач упали или зависли; без этого новые оценки и документы могут не завершаться.` }] : []),
-    ...(deliveryProblems > 0 ? [{ priority: 'Срочно', tone: 'bad', title: 'Проверить журнал отправок', text: `${deliveryProblems} доставок имеют ошибку или неизвестный результат — повторять их автоматически нельзя.` }] : []),
-    ...(!lateFlowStarted ? [{ priority: 'Следом', tone: 'warn', title: 'Обкатать FL → Telegram', text: 'Провести один контролируемый диалог через одноразовый токен и проверить, что клиент привязался к тому же заказу.' }] : []),
-    ...(!discoveryStarted || !documentsStarted ? [{ priority: 'Следом', tone: 'warn', title: 'Пройти хвост воронки целиком', text: 'На одном проекте собрать подтверждённые требования, выпустить ТЗ и договор, затем проверить пакет передачи в работу.' }] : []),
-    ...(!designsStarted ? [{ priority: 'Проверить', tone: 'warn', title: 'Принять одну дизайн-концепцию', text: 'Сгенерировать PNG через Codex → HTML → Chromium и визуально подтвердить, что результат пригоден заказчику.' }] : []),
-  ];
-
-  return <div className="architecturePanel">
-    <div className="architectureHead">
-      <div><span className="eyebrow">Живая архитектура</span><h2>Как работает фриланс-система</h2><p>Схема собирается из фактических статусов и счётчиков. Обновление — каждые 20 секунд вместе с Dashboard.</p></div>
-      <div className="architectureLegend"><span><i className="legendOk" /> Работает</span><span><i className="legendWarn" /> Есть, но не обкатано</span><span><i className="legendBad" /> Требует внимания</span></div>
-    </div>
-
-    <div className="architectureStats">
-      <ArchitectureStat label="FL → Telegram" value={architecture.handoffs_used || 0} hint="успешных переходов" tone={lateFlowStarted ? 'ok' : 'warn'} />
-      <ArchitectureStat label="Сбор требований" value={architecture.discovery_leads || 0} hint="клиентов с фактами" tone={discoveryStarted ? 'ok' : 'warn'} />
-      <ArchitectureStat label="ТЗ и договоры" value={numberOf(architecture.specifications) + numberOf(architecture.contracts)} hint="готовых документов" tone={documentsStarted ? 'ok' : 'warn'} />
-      <ArchitectureStat label="Требует внимания" value={totalProblems} hint="подключения, ИИ и отправка" tone={totalProblems > 0 ? 'bad' : 'ok'} />
-    </div>
-
-    <div className="architecturePanHint">На телефоне тяните схему влево и вправо</div>
-    <div className="architectureFlow" aria-label="Схема архитектуры фриланс-системы">
-      {renderError ? <div className="architectureRenderError">{renderError}</div> : svg ? <div dangerouslySetInnerHTML={{ __html: svg }} /> : <div className="architectureLoading">Строю схему…</div>}
-    </div>
-
-    <div className="architectureExplain">
-      <div><b>1. Находит</b><span>FL.ru проверяется по расписанию. Повторы отбрасываются до обращения к ИИ.</span></div>
-      <div><b>2. Оценивает</b><span>Hermes/Codex ставит балл. Вы решаете, нужен ли отклик — дорогой текст заранее не генерируется.</span></div>
-      <div><b>3. Продаёт</b><span>Отклик и ответы создаются как черновики. Отправка — после вашего решения либо по точечной задаче на клиента.</span></div>
-      <div><b>4. Собирает проект</b><span>Агент ведёт диалог, фиксирует требования, формирует ТЗ и договор, при необходимости переводит клиента в Telegram.</span></div>
-      <div><b>5. Передаёт в работу</b><span>Подтверждённое ТЗ, файлы и дизайн-концепции становятся пакетом для выполнения проекта.</span></div>
-    </div>
-
-    <div className="architectureUnderhood">
-      <div className="cardTitle"><h3>Что находится под капотом</h3><p>Эти компоненты обслуживают весь путь, но не усложняют основную схему.</p></div>
-      <div className="architectureSystems">
-        <div><i>AI</i><b>Hermes + Codex</b><span>Оценка заказа, смысл ваших команд, тексты, ТЗ, договор и HTML-макет дизайна.</span></div>
-        <div><i>DB</i><b>PostgreSQL</b><span>Единая память: заказ, клиент, каналы, сообщения, решения, требования и журнал отправок.</span></div>
-        <div><i>↻</i><b>Redis + очередь</b><span>Долгие задачи выполняются в фоне и не тормозят Dashboard.</span></div>
-        <div><i>✓</i><b>Предохранители</b><span>Ручное одобрение; цена, сроки и договор всегда возвращаются вам. Активных точечных задач: {architecture.active_missions || 0}.</span></div>
-      </div>
-    </div>
-
-    <div className="architectureAudit">
-      <div className="cardTitle"><h3>Где сейчас косяки и пробелы</h3><p>Зелёное — подтверждено живыми данными. Жёлтое — функция есть, но реальная воронка её ещё не прошла.</p></div>
-      <div className="architectureIssues">{gaps.map((gap) => <div className={`architectureIssue ${gap.tone}`} key={gap.title}><i /><div><b>{gap.title}</b><span>{gap.text}</span></div></div>)}</div>
-    </div>
-
-    <div className="architectureRoadmap">
-      <div className="cardTitle"><h3>Что довести дальше</h3><p>Порядок меняется автоматически по живому состоянию системы.</p></div>
-      {nextSteps.length > 0 ? <div className="architectureNextSteps">{nextSteps.map((step, index) => <div className={`architectureNext ${step.tone}`} key={step.title}><strong>{index + 1}</strong><div><span>{step.priority}</span><b>{step.title}</b><p>{step.text}</p></div></div>)}</div> : <div className="architectureAllClear"><b>Критических пробелов не видно</b><span>Все этапы проходили живыми данными, а основной контур сейчас здоров.</span></div>}
-    </div>
-  </div>;
-}
-
-function ArchitectureStat({ label, value, hint, tone }: { label: string; value: number | string; hint: string; tone: 'ok' | 'warn' | 'bad' }) {
-  return <div className={`architectureStat ${tone}`}><span>{label}</span><b>{value}</b><small>{hint}</small></div>;
-}
-
-function architectureDiagram(data: any) {
-  const architecture = data.architecture || {};
-  const connectorOk = (name: string) => {
-    const connector = data.connectors?.find((item: any) => item.connector === name);
-    return Boolean(connector?.enabled && connector?.healthy);
-  };
-  const flClass = connectorOk('fl') ? 'ok' : 'bad';
-  const codexClass = connectorOk('codex') ? 'ok' : 'bad';
-  const telegramClass = connectorOk('telegram') ? 'ok' : 'bad';
-  const handoffClass = numberOf(architecture.handoffs_used) > 0 ? 'ok' : 'warn';
-  const discoveryClass = numberOf(architecture.discovery_leads) > 0 ? 'ok' : 'warn';
-  const specificationClass = numberOf(architecture.specifications) > 0 ? 'ok' : 'warn';
-  const contractClass = numberOf(architecture.contracts) > 0 ? 'ok' : 'warn';
-  const designClass = numberOf(architecture.designs) > 0 ? 'ok' : 'warn';
-  const deliveryClass = numberOf(architecture.delivery_failed_24h) > 0 ? 'bad' : 'ok';
-  const aiClass = numberOf(architecture.ai_failed_24h) + numberOf(architecture.ai_stuck) > 0 ? 'bad' : codexClass;
-
-  return `flowchart TB
-    subgraph FIND["1 · Поиск и отбор заказов"]
-      direction LR
-      FL["FL.ru<br/>новые заказы"] --> SCAN["Мониторинг<br/>каждые 5 минут"] --> DEDUPE["Проверка дублей<br/>экономит токены"] --> SCORE["Hermes + Codex<br/>оценка заказа"] --> DASH{"Dashboard<br/>ваше решение"}
-    end
-
-    subgraph SALE["2 · Отклик и продажа"]
-      direction LR
-      DASH -->|подходит| RESPONSE["Отклик по кнопке<br/>+ подходящий кейс"] --> APPROVAL["Черновик<br/>ручная проверка"] --> DELIVERY["Отправка<br/>в FL.ru"] --> FLCHAT["Чат с клиентом<br/>агент отвечает"]
-      DASH -->|не подходит| SKIP["Пропустить<br/>без расхода токенов"]
-    end
-
-    subgraph DISCOVERY["3 · Переход к проекту"]
-      direction LR
-      FLCHAT --> HANDOFF{"Нужен длинный<br/>диалог?"}
-      HANDOFF -->|да| TOKEN["Одноразовый токен<br/>FL → Telegram"] --> TG["Telegram<br/>тот же клиент"]
-      HANDOFF -->|нет| REQUIREMENTS["Сбор требований<br/>в чате FL.ru"]
-      TG --> REQUIREMENTS --> SPEC["Реализуемое ТЗ<br/>без лишнего"] --> CONTRACT["Договор<br/>по подтверждённым данным"] --> BUILD["Передача<br/>в выполнение"]
-      REQUIREMENTS --> DESIGN["Codex → HTML → PNG<br/>дизайн-концепции"] --> BUILD
-    end
-
-    classDef ok fill:#ecfdf3,stroke:#12b76a,color:#065f46,stroke-width:2px;
-    classDef warn fill:#fffaeb,stroke:#f79009,color:#7a2e0e,stroke-width:2px;
-    classDef bad fill:#fff1f0,stroke:#f04438,color:#912018,stroke-width:2px;
-    classDef neutral fill:#f8f7ff,stroke:#818cf8,color:#3730a3,stroke-width:1.5px;
-    class FL,SCAN ${flClass};
-    class SCORE ${aiClass};
-    class TG ${telegramClass};
-    class TOKEN ${handoffClass};
-    class REQUIREMENTS ${discoveryClass};
-    class SPEC ${specificationClass};
-    class CONTRACT ${contractClass};
-    class DESIGN ${designClass};
-    class DELIVERY ${deliveryClass};
-    class DASH,RESPONSE,APPROVAL,FLCHAT,SKIP,HANDOFF,BUILD,DEDUPE neutral;`;
-}
-
-const numberOf = (value: unknown) => Number(value || 0);
-
-function Sandbox({ openLead, notify }: { openLead: (id: string) => void; notify: (text: string) => void }) {
-  const [runs, setRuns] = useState<any[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [state, setState] = useState<any>();
-  const [scenario, setScenario] = useState('web_service');
-  const [clientMessage, setClientMessage] = useState('Спасибо. Нужны роли администратора и менеджера, интеграция с нашей PostgreSQL, уведомления в Telegram и запуск первой версии за 6 недель. Что ещё нужно уточнить?');
-  const [telegramMessage, setTelegramMessage] = useState('Продолжим здесь. В первой версии используем существующего Telegram-бота: он принимает заявки и уведомляет менеджера о новой заявке и просроченном ответе. Администратор видит все сделки, менеджер — только назначенные ему.');
-  const [busy, setBusy] = useState('');
-  const [signal, setSignal] = useState(0);
-
-  const loadRuns = async () => {
-    const result = await api<any[]>('/sandbox');
-    setRuns(result);
-    if (!activeId && result[0]?.id) setActiveId(result[0].id);
-  };
-  const loadState = async () => {
-    if (!activeId) { setState(undefined); return; }
-    setState(await api(`/sandbox/${activeId}`));
-  };
-  useEffect(() => { void loadRuns(); }, []);
-  useEffect(() => {
-    void loadState();
-    const timer = window.setInterval(() => { void loadState(); void loadRuns(); }, 5_000);
-    return () => clearInterval(timer);
-  }, [activeId]);
-
-  const run = async (key: string, action: () => Promise<unknown>, success: string) => {
-    setBusy(key);
-    setSignal((value) => value + 1);
-    try {
-      await action();
-      notify(success);
-      window.setTimeout(() => { void loadState(); void loadRuns(); }, 700);
-    } catch (error) { notify((error as Error).message); }
-    finally { setBusy(''); setSignal((value) => value + 1); }
-  };
-  const create = () => run('create', async () => {
-    const created = await api<{ id: string }>('/sandbox', { method: 'POST', body: JSON.stringify({ scenario }) });
-    setActiveId(created.id);
-  }, 'Тестовый заказ создан. Codex оценивает его в фоне.');
-
-  const pendingDrafts = state?.drafts?.filter((draft: any) => draft.status === 'pending') || [];
-  const handoffDone = Boolean(state?.handoffs?.some((handoff: any) => handoff.status === 'used'));
-  const done = state?.steps?.filter((step: any) => step.done).length || 0;
-  const total = state?.steps?.length || 13;
-
-  return <section className="sandboxPage">
-    <div className="pageTitle"><div><span className="eyebrow">Без расхода откликов FL.ru</span><h1>Полигон системы</h1><p>Здесь виден весь тест без сокращений: задача, решения Codex, точные тексты переписки, требования, ТЗ, договор, дизайн и технические доказательства.</p></div><span className="sandboxLock"><i /> FL.ru и клиенты недоступны из теста</span></div>
-
-    <div className="sandboxHero">
-      <div><b>Создать новую репетицию</b><span>Выберите тип заказа. Он появится только здесь и не испортит боевую статистику.</span></div>
-      <select value={scenario} onChange={(event) => setScenario(event.target.value)}>
-        <option value="web_service">SaaS и личный кабинет</option>
-        <option value="ecommerce">Интернет-магазин и 1С</option>
-        <option value="vague">Нечёткий заказ — проверка вопросов</option>
-      </select>
-      <button className="primary" disabled={Boolean(busy)} onClick={create}>{busy === 'create' ? 'Создаю…' : 'Начать полный тест'}</button>
-    </div>
-
-    {runs.length > 0 && <div className="sandboxRuns">{runs.map((item) => <button className={activeId === item.id ? 'active' : ''} key={item.id} onClick={() => setActiveId(item.id)}><b>{item.title.replace('[ТЕСТ] ', '')}</b><span>{item.score === null ? 'Оценивается' : `${item.score}/100`} · {relativeTime(item.updated_at)}</span></button>)}</div>}
-
-    {!activeId ? <Card><Empty text="Создайте первый тестовый заказ — реальные отклики FL.ru не расходуются." /></Card> : !state ? <Loading /> : <>
-      <div className="sandboxProgress"><div><span>Пройдено этапов</span><b>{done} из {total}</b></div><i><em style={{ width: `${Math.round(done / total * 100)}%` }} /></i><small>{done === total ? 'Полный сценарий пройден' : 'Двигайтесь сверху вниз; долгие операции обновятся автоматически.'}</small></div>
-
-      <LiveActivity leadId={activeId} signal={signal} onIdle={() => { void loadState(); void loadRuns(); }} title="Что сейчас делает система в этом прогоне" />
-
-      <div className="sandboxWorkspace">
-        <div className="sandboxSteps"><strong>Покрытие прогона</strong>{state.steps.map((step: any, index: number) => <a className={`${step.done ? 'done' : ''} ${step.failed ? 'failed' : ''}`} href={`#sandbox-step-${step.key}`} key={step.key}><i>{step.done ? '✓' : step.failed ? '!' : index + 1}</i><span>{step.label}</span></a>)}</div>
-
-        <div className="sandboxActions">
-          <Card title="1. Отклик и безопасная отправка" subtitle="Используются те же генератор, ручное одобрение и реестр доставки, что для FL.ru.">
-            <div className="sandboxButtons">
-              <button disabled={Boolean(busy) || state.lead.analysis_state !== 'completed'} onClick={() => run('draft', () => api(`/sandbox/${activeId}/draft`, { method: 'POST' }), 'Отклик поставлен в очередь')}>{busy === 'draft' ? 'Генерирую…' : 'Создать отклик'}</button>
-            </div>
-            {pendingDrafts.map((draft: any) => <div className="sandboxDraft" key={draft.id}><small>{sandboxDraftLabel(draft)}</small><p>{draft.content}</p><button className="primary" disabled={Boolean(busy)} onClick={() => run(`approve-${draft.id}`, () => api(`/drafts/${draft.id}/approve`, { method: 'POST' }), 'Отправка отрепетирована: наружу ничего не ушло')}>{busy === `approve-${draft.id}` ? 'Проверяю…' : 'Одобрить и безопасно отправить'}</button></div>)}
-          </Card>
-
-          <Card title="2. Сообщение клиента в чате FL.ru" subtitle="Введите реплику клиента. Агент сохранит её, выделит требования и подготовит точный ответ.">
-            <textarea rows={5} value={clientMessage} onChange={(event) => setClientMessage(event.target.value)} />
-            <button disabled={Boolean(busy) || !clientMessage.trim()} onClick={() => run('message', () => api(`/sandbox/${activeId}/client-message`, { method: 'POST', body: JSON.stringify({ content: clientMessage }) }), 'Сообщение принято, агент готовит ответ')}>{busy === 'message' ? 'Обрабатываю…' : 'Отправить от тестового клиента'}</button>
-          </Card>
-
-          <Card title="3. Переход и общение в Telegram" subtitle="Сначала одноразовый код связывает каналы, затем сообщение проходит через боевой Telegram-ingest с искусственным chat id.">
-            <div className="sandboxButtons"><button disabled={Boolean(busy) || handoffDone} onClick={() => run('handoff', () => api(`/sandbox/${activeId}/handoff`, { method: 'POST' }), 'Связка FL → Telegram создана без внешнего сообщения')}>{handoffDone ? 'FL → Telegram связан ✓' : 'Связать FL → Telegram'}</button></div>
-            <textarea rows={5} value={telegramMessage} onChange={(event) => setTelegramMessage(event.target.value)} disabled={!handoffDone} />
-            <button disabled={Boolean(busy) || !handoffDone || !telegramMessage.trim()} onClick={() => run('telegram-message', () => api(`/sandbox/${activeId}/telegram-message`, { method: 'POST', body: JSON.stringify({ content: telegramMessage }) }), 'Telegram-сообщение принято, агент готовит ответ по общей истории')}>{busy === 'telegram-message' ? 'Обрабатываю…' : 'Отправить от клиента в тестовый Telegram'}</button>
-          </Card>
-
-          <Card title="4. Итоговые материалы" subtitle="ТЗ, данные договора, пакет Codex и PNG создаются боевыми механизмами из накопленного контекста.">
-            <div className="sandboxButtons wrap">
-              <button disabled={Boolean(busy)} onClick={() => run('documents', () => api(`/sandbox/${activeId}/documents`, { method: 'POST' }), 'ТЗ, договор и пакет Codex поставлены в очередь')}>Собрать ТЗ, договор и пакет Codex</button>
-              <button disabled={Boolean(busy)} onClick={() => run('design', () => api(`/sandbox/${activeId}/design`, { method: 'POST' }), 'Две PNG-концепции поставлены в очередь')}>Создать 2 PNG-концепции</button>
-            </div>
-          </Card>
-
-          <div className="sandboxFooter"><button onClick={() => document.getElementById('sandbox-full-report')?.scrollIntoView({ behavior: 'smooth' })}>Перейти к полному протоколу ↓</button><button onClick={() => openLead(activeId)}>Открыть карточку сделки</button><button className="danger soft" onClick={() => run('archive', () => api(`/sandbox/${activeId}/archive`, { method: 'POST' }), 'Тестовый прогон архивирован')}>Архивировать прогон</button></div>
-        </div>
-      </div>
-
-      <SandboxFullReport state={state} done={done} total={total} notify={notify} />
-    </>}
-  </section>;
-}
-
-function SandboxFullReport({ state, done, total, notify }: { state: any; done: number; total: number; notify: (text: string) => void }) {
-  const analysis = state.lead.analysis || {};
-  const understanding = analysis.understanding || {};
-  const groupedRequirements = useMemo(() => state.requirements.reduce((result: Record<string, any[]>, item: any) => {
-    (result[item.category] ||= []).push(item);
-    return result;
-  }, {}), [state.requirements]);
-  const copy = async (value: string, label: string) => {
-    try { await navigator.clipboard.writeText(value); notify(`${label} скопирован`); }
-    catch { notify('Не удалось скопировать в этом браузере'); }
-  };
-  const flMessages = state.messages.filter((message: any) => message.channel === 'fl');
-  const telegramMessages = state.messages.filter((message: any) => message.channel === 'telegram');
-  const confirmed = state.requirements.filter((item: any) => item.status === 'confirmed').length;
-  const open = state.requirements.filter((item: any) => item.status === 'open').length;
-  return <div className="sandboxReport" id="sandbox-full-report">
-    <div className="sandboxReportHead"><div><span className="eyebrow">Проверяемый протокол</span><h2>Что именно произошло в этом тесте</h2><p>Ниже не описание «как должно быть», а содержимое выбранного прогона из PostgreSQL, реестра доставок и очереди ИИ.</p></div><span className={`sandboxVerdict ${done === total ? 'ok' : ''}`}>{done === total ? 'Полный прогон пройден' : `Пройдено ${done} из ${total}`}</span></div>
-
-    <div className="sandboxMetrics">
-      <SandboxMetric label="Оценка заказа" value={`${state.lead.score ?? '—'}/100`} hint={`уверенность ${state.lead.confidence ?? '—'}%`} />
-      <SandboxMetric label="Предложенная цена" value={money(state.lead.recommended_price)} hint={`срок ${state.lead.recommended_days ?? '—'} дней`} />
-      <SandboxMetric label="Требования" value={String(state.requirements.length)} hint={`${confirmed} подтверждено · ${open} открыто`} />
-      <SandboxMetric label="Внешних отправок" value={String(state.safety?.escaped_deliveries ?? '—')} hint={`${state.safety?.captured_deliveries || 0} перехвачено полигоном`} tone={state.safety?.escaped_deliveries ? 'bad' : 'ok'} />
-    </div>
-
-    <div className="grid two sandboxBriefGrid">
-      <Card title="Исходная задача" subtitle="Ровно то, что было подано системе как заказ">
-        <h3 className="sandboxTaskTitle">{state.lead.title.replace('[ТЕСТ] ', '')}</h3>
-        <p className="sandboxTaskText">{state.lead.description}</p>
-        <div className="sandboxFactRows"><span>Бюджет<b>{state.lead.budget_text || '—'}</b></span><span>Создан<b>{exactTime(state.lead.created_at)}</b></span><span>Источник<b>Изолированный sandbox</b></span></div>
-      </Card>
-      <Card title="Что понял Codex" subtitle="Результат первичной оценки заказа">
-        <p className="sandboxTaskText">{understanding.summary || analysis.fit_reason || 'Анализ ещё не завершён.'}</p>
-        {analysis.fit_reason && <p className="sandboxCallout"><b>Почему подходит:</b> {analysis.fit_reason}</p>}
-        <div className="sandboxFactRows"><span>Тип проекта<b>{understanding.project_kind || '—'}</b></span><span>Уровень цены<b>{analysis.pricing_level || '—'}</b></span><span>Риск выполнения<b>{analysis.delivery_risk ?? '—'}/100</b></span></div>
-      </Card>
-    </div>
-
-    <Card title="Границы, риски и вопросы оценки" subtitle="Так видно, что ИИ не просто поставил балл, а отделил известное от неизвестного.">
-      <div className="sandboxAnalysisColumns">
-        <SandboxList title="Подтверждённый объём" items={understanding.confirmed_scope || []} tone="ok" />
-        <SandboxList title="Не входит в оценку" items={understanding.wishlist_or_future_scope || []} tone="neutral" />
-        <SandboxList title="Риски" items={analysis.risks || []} tone="warn" />
-        <SandboxList title="Что нужно уточнить" items={analysis.questions || []} tone="question" />
-      </div>
-    </Card>
-
-    <section className="sandboxProtocol">
-      <div className="sectionHeading"><span className="eyebrow">Все контрольные точки</span><h2>Пошаговый журнал теста</h2><p>У каждого шага есть цель и конкретное доказательство из этого прогона.</p></div>
-      <div className="sandboxProtocolList">{state.steps.map((step: any, index: number) => <article id={`sandbox-step-${step.key}`} className={`${step.done ? 'done' : ''} ${step.failed ? 'failed' : ''}`} key={step.key}><i>{step.done ? '✓' : step.failed ? '!' : index + 1}</i><div><span>{step.done ? 'Пройдено' : step.failed ? 'Ошибка' : 'Ожидает'}</span><h3>{step.label}</h3><p>{step.description}</p><small>{step.evidence}</small></div></article>)}</div>
-    </section>
-
-    <Card title="Переписка FL.ru" subtitle="Точные входящие и исходящие тексты в хронологическом порядке">
-      <SandboxMessageThread messages={flMessages} empty="В FL-чате сообщений пока нет." />
-    </Card>
-
-    <div className="sandboxHandoffBand">
-      <div><span>FL.ru</span><b>→</b><span>тот же клиент и сделка</span><b>→</b><span>Telegram</span></div>
-      {state.handoffs.length ? state.handoffs.map((handoff: any) => <p key={handoff.token}><b>Код {handoff.token}</b> · {handoff.status === 'used' ? `использован ${exactTime(handoff.used_at)}` : `статус ${handoff.status}`} · chat id искусственный и не существует в Telegram.</p>) : <p>Переход ещё не запускался.</p>}
-    </div>
-
-    <Card title="Переписка Telegram" subtitle="Тексты проходят через боевой обработчик Telegram, но наружу не отправляются">
-      <SandboxMessageThread messages={telegramMessages} empty="Реального Telegram-диалога в этом прогоне ещё не было. Одна связка канала не считается проверкой общения." />
-      {state.turns.filter((turn: any) => turn.channel === 'telegram').map((turn: any) => <details className="sandboxTurn" key={turn.id}><summary>Как агент разобрал Telegram-реплику</summary><div className="sandboxFactRows"><span>Стадия<b>{turn.stage_before} → {turn.stage_after}</b></span><span>Намерение<b>{turn.intent}</b></span></div><p>{turn.summary}</p>{turn.decision?.riskFlags?.length > 0 && <SandboxList title="Риски этого ответа" items={turn.decision.riskFlags} tone="warn" />}</details>)}
-    </Card>
-
-    <Card title="Все черновики и решения" subtitle="Содержимое до отправки, канал, режим и итоговый статус">
-      <div className="sandboxDraftArchive">{state.drafts.map((draft: any) => <details key={draft.id} open={draft.status === 'pending'}><summary><span>{sandboxDraftLabel(draft)}</span><Status value={draft.status} /></summary><p>{draft.content}</p><div className="sandboxFactRows"><span>Создан<b>{exactTime(draft.created_at)}</b></span><span>Канал<b>{draft.channel.toUpperCase()}</b></span><span>Решение<b>{draft.metadata?.autonomy?.decision || 'ручное'}</b></span></div></details>)}</div>
-    </Card>
-
-    <Card title="Извлечённые требования" subtitle="Статус, уверенность и фактическое значение каждого требования">
-      {state.requirements.length === 0 ? <Empty text="Требования ещё не извлечены." /> : <div className="sandboxRequirements">{Object.entries(groupedRequirements).map(([category, items]) => <section key={category}><h4>{category}</h4>{(items as any[]).map((item: any) => <div key={`${item.category}:${item.slug}`}><span className={`requirementState ${item.status}`}>{sandboxRequirementStatus(item.status)}</span><div><b>{item.title}</b><p>{sandboxValue(item.value)}</p><small>Уверенность {item.confidence}%{item.source_message_id ? ' · подтверждается сообщением' : ''}</small></div></div>)}</section>)}</div>}
-    </Card>
-
-    <Card title="Итоговые документы" subtitle="Полный текст ТЗ, подтверждённые поля договора и handoff-пакет для Codex">
-      {state.documents.length === 0 ? <Empty text="Документы ещё не создавались." /> : <div className="sandboxDocuments">{state.documents.map((document: any) => <details key={document.id}><summary><div><b>{sandboxDocumentLabel(document.kind)}</b><small>Версия {document.version} · {document.markdown?.length || 0} знаков · {exactTime(document.created_at)}</small></div><span>Показать полностью</span></summary><div className="sandboxDocumentActions"><button onClick={() => void copy(document.markdown || '', sandboxDocumentLabel(document.kind))}>Копировать текст</button>{document.downloadable && <a className="button" href={`${BASE}/api/documents/${document.id}/download`}>Скачать DOCX</a>}</div><pre>{document.markdown || 'Текст хранится только в DOCX.'}</pre></details>)}</div>}
-    </Card>
-
-    <Card title="Дизайн-концепции" subtitle="Фактические PNG 1536×1024, созданные в этом прогоне">
-      {state.designs.length === 0 ? <Empty text="Концепции ещё не создавались." /> : <div className="sandboxDesigns">{state.designs.map((asset: any) => <figure key={asset.id}><img src={asset.preview_url} alt={asset.metadata?.label || 'Тестовая дизайн-концепция'} loading="lazy" /><figcaption><b>{asset.metadata?.label || `Вариант ${asset.metadata?.variant || ''}`}</b><span>{asset.metadata?.model || '—'} · {asset.metadata?.size || '—'} · {Math.round(asset.bytes / 1024)} КБ</span><a href={asset.preview_url} target="_blank" rel="noreferrer">Открыть PNG</a></figcaption></figure>)}</div>}
-    </Card>
-
-    <div className="grid two sandboxEvidenceGrid">
-      <Card title="Доказательство изоляции" subtitle="Что случилось с попытками отправки">
-        <div className={`sandboxSafety ${state.safety?.escaped_deliveries === 0 ? 'ok' : 'bad'}`}><b>{state.safety?.escaped_deliveries === 0 ? '✓ Наружу ничего не ушло' : '! Обнаружена подозрительная доставка'}</b><p>Перехвачено: {state.safety?.captured_deliveries || 0}. Внешних записей: {state.safety?.escaped_deliveries || 0}.</p></div>
-        {state.deliveries.map((delivery: any) => <div className="sandboxDelivery" key={delivery.id}><span>{delivery.channel.toUpperCase()}</span><div><b>{delivery.status}</b><small>{delivery.external_id || '—'} · попыток {delivery.attempt_count}</small><p>{delivery.error}</p></div></div>)}
-      </Card>
-      <Card title="Очередь ИИ" subtitle="Какие реальные задачи выполнил Hermes/Codex">
-        {state.ai_tasks.length === 0 ? <Empty text="ИИ-задачи этого прогона ещё не зафиксированы." /> : <div className="sandboxAiTasks">{state.ai_tasks.map((task: any) => <div key={task.id}><span className={`requirementState ${task.status === 'completed' ? 'confirmed' : task.status === 'failed' ? 'open' : 'assumed'}`}>{task.status}</span><div><b>{task.kind}</b><small>{exactTime(task.created_at)}{task.completed_at ? ` · завершено ${exactTime(task.completed_at)}` : ''}</small>{task.error && <p>{task.error}</p>}</div></div>)}</div>}
-      </Card>
-    </div>
-
-    <Card title="Технический журнал" subtitle="События базы и worker в порядке выполнения">
-      <div className="sandboxActivityLog">{state.activities.map((activity: any) => <div key={`${activity.created_at}:${activity.action}`}><time>{exactTime(activity.created_at)}</time><span>{activity.actor}</span><b>{sandboxActionLabel(activity.action)}</b><code>{JSON.stringify(activity.details)}</code></div>)}</div>
-    </Card>
-  </div>;
-}
-
-function SandboxMetric({ label, value, hint, tone = '' }: { label: string; value: string; hint: string; tone?: string }) {
-  return <div className={`sandboxMetric ${tone}`}><span>{label}</span><b>{value}</b><small>{hint}</small></div>;
-}
-
-function SandboxList({ title, items, tone }: { title: string; items: string[]; tone: string }) {
-  return <div className={`sandboxList ${tone}`}><h4>{title}<span>{items.length}</span></h4>{items.length ? <ul>{items.map((item, index) => <li key={`${index}:${item}`}>{item}</li>)}</ul> : <p>Нет данных.</p>}</div>;
-}
-
-function SandboxMessageThread({ messages, empty }: { messages: any[]; empty: string }) {
-  if (!messages.length) return <Empty text={empty} />;
-  return <div className="sandboxThread">{messages.map((message: any) => <article className={message.direction} key={message.id}><small>{message.direction === 'outbound' ? 'Агент / владелец' : 'Тестовый заказчик'} · {message.channel.toUpperCase()} · {exactTime(message.created_at)}</small><p>{message.content}</p></article>)}</div>;
-}
-
-const exactTime = (value: string | null) => value ? new Date(value).toLocaleString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
-const sandboxDraftLabel = (draft: any) => draft.metadata?.mode === 'response' || draft.kind === 'initial_response' ? 'Первичный отклик FL.ru' : `Ответ в ${draft.channel === 'telegram' ? 'Telegram' : 'FL-чате'}`;
-const sandboxDocumentLabel = (kind: string) => ({ specification: 'Техническое задание', contract_data: 'Данные для договора', contract: 'Договор DOCX', codex_handoff: 'Пакет передачи в Codex' } as Record<string, string>)[kind] || kind;
-const sandboxRequirementStatus = (status: string) => ({ confirmed: 'Подтверждено', open: 'Нужно уточнить', assumed: 'Допущение', rejected: 'Отклонено', not_applicable: 'Не требуется' } as Record<string, string>)[status] || status;
-const sandboxValue = (value: unknown) => {
-  if (value === null || value === undefined || value === '') return 'Значение пока не зафиксировано';
-  if (typeof value === 'string') return value;
-  if (typeof value === 'boolean') return value ? 'Да' : 'Нет';
-  return JSON.stringify(value, null, 2);
-};
-const sandboxActionLabel = (action: string) => ({ sandbox_created: 'Создан тестовый заказ', draft_created: 'Создан черновик', sandbox_delivery_captured: 'Внешняя отправка перехвачена', sandbox_client_message: 'Принято сообщение FL', sandbox_handoff_used: 'Связан Telegram-канал', sandbox_telegram_message: 'Принято сообщение Telegram', documents_generated: 'Созданы документы', sandbox_design_ready: 'Созданы PNG-концепции' } as Record<string, string>)[action] || action.replaceAll('_', ' ');
-
-function FunnelRow({ label, value, max, accent = false }: { label: string; value: number; max: number; accent?: boolean }) {
-  const width = value === 0 ? 0 : Math.max(7, Math.round(value / max * 100));
-  return <div className={`funnelRow ${accent ? 'accent' : ''}`}><div><span>{label}</span><b>{value}</b></div><i><em style={{ width: `${width}%` }} /></i></div>;
-}
-
-function Connector({ connector }: { connector: any }) {
-  const active = connector.connector === 'codex' ? connector.healthy : connector.enabled && connector.healthy;
-  return <div className="connector"><span className={active ? 'dot ok' : 'dot'} /><div><b>{labelConnector(connector.connector)}</b><small>{connector.status_text}</small></div><span className={`state ${active ? 'ok' : ''}`}>{active ? 'Активен' : connector.enabled ? 'Проверка' : 'Выкл.'}</span></div>;
-}
-
-function Leads({ openLead, notify }: { openLead: (id: string) => void; notify: (text: string) => void }) {
+function Leads({ openLead, notify, status }: { openLead: (id: string) => void; notify: (text: string) => void; status?: SystemStatus }) {
   const [leads, setLeads] = useState<any[]>([]);
-  const [show, setShow] = useState(false);
-  const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState('fresh');
-  const [lastLoaded, setLastLoaded] = useState<Date | null>(null);
-  const load = useCallback(() => api<any[]>('/leads').then((next) => {
-    setLeads(next);
-    setLastLoaded(new Date());
-  }), []);
-  useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => { void load(); }, 5_000);
-    const refresh = () => { if (!document.hidden) void load(); };
-    window.addEventListener('focus', refresh);
-    document.addEventListener('visibilitychange', refresh);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener('focus', refresh);
-      document.removeEventListener('visibilitychange', refresh);
-    };
-  }, [load]);
-  const isFresh = (lead: any) => lead.status !== 'rejected'
-    && Date.now() - Date.parse(lead.published_at || lead.created_at) <= 24 * 60 * 60 * 1_000;
-  const filtered = useMemo(() => leads.filter((lead) => {
-    const matchesFilter = filter === 'all' || (filter === 'fresh' ? isFresh(lead) : lead.status === filter);
-    return matchesFilter && lead.title.toLowerCase().includes(query.toLowerCase());
-  }), [leads, filter, query]);
-  return <section><div className="pageTitle"><div><span className="eyebrow">База заказов</span><h1>Заказы</h1><p>Обновляются каждые 5 секунд. По умолчанию показаны свежие за последние сутки.</p></div><div className="leadPageActions"><span className="liveBadge"><i /> {lastLoaded ? `Обновлено ${lastLoaded.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : 'Подключаюсь'}</span><button className="primary small" onClick={() => setShow(true)}>+ Добавить</button></div></div>
-    <div className="toolbar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по названию" /><div className="chips">{[['fresh','Актуальные 24 ч'],['qualified','Подходят'],['contacted','В работе'],['new','Оцениваются'],['all','Все'],['rejected','Отсеяны']].map(([value,label]) => <button className={filter === value ? 'active' : ''} key={value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
-    <Card><LeadRows leads={filtered} openLead={openLead} /></Card>
-    {show && <Modal close={() => setShow(false)}><NewLead done={() => { setShow(false); void load(); notify('Лид добавлен и отправлен на анализ'); }} /></Modal>}
-  </section>;
-}
-
-function NewLead({ done }: { done: () => void }) {
-  const [form, setForm] = useState({ title: '', description: '', budgetText: '', url: '' });
-  const submit = async (event: React.FormEvent) => { event.preventDefault(); await api('/leads', { method: 'POST', body: JSON.stringify(form) }); done(); };
-  return <form onSubmit={submit}><h2>Новый лид</h2><input required placeholder="Название" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
-    <textarea placeholder="Описание" rows={6} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
-    <input placeholder="Бюджет" value={form.budgetText} onChange={(event) => setForm({ ...form, budgetText: event.target.value })} />
-    <input placeholder="Ссылка" value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} /><button className="primary">Добавить</button></form>;
-}
-
-function Chats({ openChat }: { openChat: (id: string) => void }) {
-  const [chats, setChats] = useState<any[]>([]);
+  const [scanning, setScanning] = useState(false);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
-  const load = () => api<any[]>('/chats').then(setChats).finally(() => setLoading(false));
-  useEffect(() => { void load(); const timer = window.setInterval(load, 15_000); return () => clearInterval(timer); }, []);
-  const visible = useMemo(() => chats.filter((chat) => `${chat.title} ${chat.last_message || ''}`.toLowerCase().includes(query.toLowerCase())), [chats, query]);
-  if (loading) return <Loading />;
-  return <section><div className="pageTitle"><div><span className="eyebrow">Переписка FL.ru</span><h1>Чаты</h1><p>{chats.length} диалогов · обновляются каждые 5 минут</p></div><span className="liveBadge"><i /> Онлайн</span></div>
-    <div className="toolbar chatToolbar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по чатам" /></div>
-    <div className="chatList">{visible.length === 0 ? <Empty text="Чатов пока нет" /> : visible.map((chat) => <button key={chat.id} onClick={() => openChat(chat.id)}>
-      <span className="chatAvatar">{String(chat.title || 'F').trim().charAt(0).toUpperCase()}</span>
-      <span className="chatCopy"><span><b>{chat.title}</b><time>{relativeTime(chat.last_message_at || chat.updated_at)}</time></span><small>{chat.last_direction === 'outbound' ? 'Вы: ' : ''}{chat.last_message || 'Диалог синхронизирован'}</small></span>
-      <span className="chatMeta">{Number(chat.pending_drafts) > 0 && <em>Ответ готов</em>}<i>›</i></span>
-    </button>)}</div>
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all');
+  const [sort, setSort] = useState('date');
+  const [limit, setLimit] = useState(150);
+  const [lastLoaded, setLastLoaded] = useState<Date | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSearch(query.trim()), 350);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  const load = useCallback(() => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (search) params.set('q', search);
+    if (filter !== 'all' && filter !== 'fresh') params.set('status', filter);
+    return api<any[]>(`/leads?${params.toString()}`)
+      .then((next) => { setLeads(next); setLastLoaded(new Date()); })
+      .catch(() => undefined)
+      .finally(() => setLoading(false));
+  }, [search, filter, limit]);
+
+  useEffect(() => { setLoading(true); void load(); }, [load]);
+  usePolling(load, 30_000, false);
+
+  const visible = useMemo(() => {
+    const isFresh = (lead: any) => lead.status !== 'rejected'
+      && Date.now() - Date.parse(lead.published_at || lead.created_at || lead.updated_at) <= 24 * 60 * 60 * 1_000;
+    const rows = filter === 'fresh' ? leads.filter(isFresh) : leads;
+    const sorted = [...rows];
+    if (sort === 'score') sorted.sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+    else if (sort === 'price') sorted.sort((a, b) => Number(b.recommended_price || 0) - Number(a.recommended_price || 0));
+    else sorted.sort((a, b) => Date.parse(b.published_at || b.created_at) - Date.parse(a.published_at || a.created_at));
+    return sorted;
+  }, [leads, filter, sort]);
+
+  const scan = async () => {
+    setScanning(true);
+    try {
+      const result = await api<{ projects?: { found?: number; created?: number } }>('/connectors/fl/scan', { method: 'POST' });
+      notify(`Проверил FL.ru: найдено ${result.projects?.found ?? 0}, новых ${result.projects?.created ?? 0}`);
+      await load();
+    } catch (error) { notify((error as Error).message); }
+    finally { setScanning(false); }
+  };
+
+  const startDraft = async (lead: any) => {
+    setBusyId(lead.id);
+    try {
+      await api(`/leads/${lead.id}/draft`, { method: 'POST', body: '{}' });
+      notify('Готовлю отклик — он появится в разделе «Отклики»');
+    } catch (error) { notify((error as Error).message); }
+    finally { setBusyId(null); }
+  };
+
+  return <section>
+    <SystemPanel status={status} onScan={scan} scanning={scanning} />
+    <div className="pageTitle">
+      <div><span className="eyebrow">Заказы с FL.ru</span><h1>Заказы</h1><p>Показаны последние {visible.length}. Нажмите на заказ, чтобы открыть его целиком.</p></div>
+      <span className="liveBadge"><i /> {lastLoaded ? `Обновлено ${lastLoaded.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}` : 'Подключаюсь'}</span>
+    </div>
+    <div className="toolbar leadsToolbar">
+      <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по названию" />
+      <select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Сортировка">
+        {SORTS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+      </select>
+    </div>
+    <div className="chips">
+      {FILTERS.map(([value, label]) => <button className={filter === value ? 'active' : ''} key={value} onClick={() => setFilter(value)}>{label}</button>)}
+    </div>
+    {loading && !leads.length
+      ? <SkeletonRows />
+      : <div className="leadrows">
+        {visible.length === 0
+          ? <Empty text="Ничего не найдено — попробуйте другой фильтр или слово" />
+          : visible.map((lead) => <div className="leadRow" key={lead.id}>
+            <button className="leadRowOpen" onClick={() => openLead(lead.id)}>
+              <Grade price={lead.recommended_price} />
+              <span className="leadRowBody"><b>{lead.title}</b>
+                <small><StatusDot status={lead.status} /> {labelStatus(lead.status)} · {relativeTime(lead.published_at || lead.created_at || lead.updated_at)}{lead.budget_text ? ` · бюджет ${lead.budget_text}` : ''}</small>
+              </span>
+              <span className="price">{money(lead.recommended_price)}</span>
+            </button>
+            <div className="leadRowActions">
+              {['qualified', 'new'].includes(lead.status) && <button className="small" disabled={busyId === lead.id} onClick={() => startDraft(lead)}>{busyId === lead.id ? 'Готовлю…' : 'Отклик'}</button>}
+              {lead.url && <a className="button small ghost" href={lead.url} target="_blank" rel="noreferrer">FL</a>}
+            </div>
+          </div>)}
+      </div>}
+    {leads.length >= limit && <div className="actions"><button onClick={() => setLimit(limit + 150)}>Показать ещё</button></div>}
   </section>;
 }
 
-function Approvals({ notify }: { notify: (text: string) => void }) {
+function LeadDetail({ id, back, notify }: { id: string; back: () => void; notify: (text: string) => void }) {
+  const [data, setData] = useState<any>();
+  const [failed, setFailed] = useState(false);
+  const [signal, setSignal] = useState(0);
+  const [busyJob, setBusyJob] = useState<string | null>(null);
+  const load = useCallback(() => api(`/leads/${id}`)
+    .then((value) => { setData(value); setFailed(false); })
+    .catch(() => setFailed(true)), [id]);
+  useEffect(() => { setData(undefined); setFailed(false); void load(); }, [load]);
+  if (failed) return <section>
+    <button className="back" onClick={back}>← К заказам</button>
+    <Card title="Заказ не открылся">
+      <Empty text="Не удалось загрузить заказ — он удалён или сервис недоступен." />
+      <div className="actions"><button onClick={() => { setFailed(false); void load(); }}>Повторить</button><button className="ghost" onClick={back}>К заказам</button></div>
+    </Card>
+  </section>;
+  if (!data) return <Loading />;
+  const lead = data.lead;
+  const project = lead.requirements?.project || {};
+  const job = async (path: string, message: string) => {
+    setBusyJob(path); setSignal((value) => value + 1);
+    try { await api(`/leads/${id}/${path}`, { method: 'POST', body: '{}' }); notify(message); }
+    catch (error) { notify((error as Error).message); }
+    finally {
+      setBusyJob(null); setSignal((value) => value + 1);
+      window.setTimeout(() => void load(), 1500);
+    }
+  };
+  return <section>
+    <button className="back" onClick={back}>← К заказам</button>
+    <div className="pageTitle leadTitle">
+      <div><span className="eyebrow">{labelStatus(lead.status)}</span><h1>{lead.title}</h1><p>{lead.source.toUpperCase()} · обновлён {relativeTime(lead.updated_at)}</p></div>
+      <Grade grade={lead.analysis?.size_grade} price={lead.recommended_price} />
+    </div>
+    <div className="facts bigfacts">
+      <span>Рыночная цена <b>{money(lead.recommended_price)}</b></span>
+      <span>Срок <b>{lead.recommended_days || '—'} дн.</b></span>
+      <span>Гриф <b>{GRADE_LABELS[lead.analysis?.size_grade || gradeOf(lead.recommended_price)] || '—'}</b></span>
+      {lead.analysis?.underpriced && <span className="trapBadge">⚠ Ловушка цены: просят {money(lead.analysis.underpriced.named_budget)}, справедливая {money(lead.analysis.underpriced.fair_price)}</span>}
+      <span>Уверенность <b>{lead.confidence ?? '—'}%</b></span>
+      {lead.budget_text && <span>Бюджет заказчика <b>{lead.budget_text}</b></span>}
+      {project.response_count != null && <span>Откликов у заказчика <b>{project.response_count}</b></span>}
+    </div>
+    <div className="actions wrap">
+      <button disabled={busyJob !== null} onClick={() => job('analyze', 'Запустил переоценку')}>{busyJob === 'analyze' ? 'Оцениваю…' : 'Обновить оценку'}</button>
+      <button className="primary" disabled={busyJob !== null} onClick={() => job('draft', 'Готовлю отклик — он появится в разделе «Отклики»')}>{busyJob === 'draft' ? 'Готовлю…' : 'Написать отклик'}</button>
+      {lead.url && <a className="button" href={lead.url} target="_blank" rel="noreferrer">Открыть на FL.ru</a>}
+    </div>
+    <LiveActivity leadId={id} signal={signal} onIdle={load} title="Что делает система по этому заказу" />
+    <div className="grid two">
+      <Card title="Описание заказа"><p className="pre">{lead.description || '—'}</p></Card>
+      <Card title="Оценка системы">
+        <p>{lead.analysis?.fit_reason || 'Ещё не выполнена'}</p>
+        {lead.analysis?.risks?.length > 0 && <><h4>Риски</h4><ul>{lead.analysis.risks.map((item: string) => <li key={item}>{item}</li>)}</ul></>}
+      </Card>
+    </div>
+    {data.messages?.length > 0 && <Card title="Переписка">{data.messages.map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.channel} · {new Date(message.created_at).toLocaleString('ru')}</small><p>{message.content}</p></div>)}</Card>}
+  </section>;
+}
+
+function Approvals({ notify, openLead, status }: { notify: (text: string) => void; openLead: (id: string) => void; status?: SystemStatus }) {
   const [drafts, setDrafts] = useState<any[]>([]);
   const [history, setHistory] = useState(false);
   const [kind, setKind] = useState<'response' | 'message'>('response');
-  const load = () => api<any[]>('/drafts').then(setDrafts);
-  useEffect(() => { void load(); const timer = window.setInterval(load, 15_000); return () => clearInterval(timer); }, []);
-  const activeDrafts = drafts.filter((draft) => history || ['pending', 'approved', 'sending', 'failed', 'stale', 'send_unknown'].includes(draft.status));
+  const load = useCallback(() => api<any[]>('/drafts').then(setDrafts).catch(() => undefined), []);
+  useEffect(() => { void load(); }, [load]);
+  usePolling(load, 20_000, false);
+  const activeDrafts = drafts.filter((draft) => history
+    ? ['pending', 'approved', 'sending', 'sent', 'failed', 'stale', 'send_unknown'].includes(draft.status)
+    : ['pending', 'approved', 'sending', 'failed', 'send_unknown'].includes(draft.status));
   const visible = activeDrafts.filter((draft) => draft.draft_type === kind);
   const responseCount = activeDrafts.filter((draft) => draft.draft_type === 'response').length;
   const messageCount = activeDrafts.filter((draft) => draft.draft_type === 'message').length;
-  const action = async (id: string, name: string) => { try { await api(`/drafts/${id}/${name}`, { method: 'POST' }); notify(name === 'approve' ? 'Одобрено и поставлено в отправку' : 'Черновик отклонён'); load(); } catch (error) { notify((error as Error).message); load(); } };
-  return <section><div className="pageTitle"><div><span className="eyebrow">Ваше решение</span><h1>На проверку</h1><p>Отклики на проекты и ответы в чатах больше не смешиваются.</p></div><button className="ghost" onClick={() => setHistory(!history)}>{history ? 'Скрыть историю' : 'Показать историю'}</button></div>
-    <LiveActivity title="Что сейчас готовится" />
-    <div className="approvalTabs"><button className={kind === 'response' ? 'active' : ''} onClick={() => setKind('response')}>Отклики на проекты <b>{responseCount}</b></button><button className={kind === 'message' ? 'active' : ''} onClick={() => setKind('message')}>Сообщения клиентам <b>{messageCount}</b></button></div>
-    <div className="drafts">{visible.length === 0 ? <Card><Empty text="Новых черновиков нет" /></Card> : visible.map((draft) => <DraftCard key={draft.id} draft={draft} reload={load} action={action} notify={notify} />)}</div>
+  useEffect(() => {
+    if (kind === 'response' && responseCount === 0 && messageCount > 0) setKind('message');
+    if (kind === 'message' && messageCount === 0 && responseCount > 0) setKind('response');
+  }, [kind, responseCount, messageCount]);
+  const action = async (id: string, name: string) => {
+    try {
+      await api(`/drafts/${id}/${name}`, { method: 'POST' });
+      notify(name === 'approve' ? 'Одобрено и поставлено в отправку' : 'Черновик отклонён');
+      await load();
+    } catch (error) { notify((error as Error).message); await load(); }
+  };
+  return <section>
+    <div className="pageTitle">
+      <div><span className="eyebrow">Ваше решение</span><h1>Отклики</h1><p>Проверьте текст и отправьте. Ничего не уйдёт без вашей кнопки.</p></div>
+      <button className="ghost" onClick={() => setHistory(!history)}>{history ? 'Скрыть историю' : 'Показать историю'}</button>
+    </div>
+    <div className="approvalTabs">
+      <button className={kind === 'response' ? 'active' : ''} onClick={() => setKind('response')}>Отклики на проекты <b>{responseCount}</b></button>
+      <button className={kind === 'message' ? 'active' : ''} onClick={() => setKind('message')}>Сообщения клиентам <b>{messageCount}</b></button>
+    </div>
+    {status && <p className="hint">
+      Сегодня подготовлено {status.drafts.today}
+      {status.policy.autoDraft ? `, из них автоматически ${status.drafts.autoUsed} из ${status.policy.autoDraftLimit}` : ''}.
+      {' '}Отправка только после вашей кнопки.
+      {blockingError(status) ? ' Сейчас ИИ не работает — новые черновики не появятся.' : ''}
+    </p>}
+    <div className="drafts">
+      {visible.length === 0
+        ? <Card><Empty text={status?.policy.autoDraft
+          ? `Ждущих откликов нет. Они появляются сами для заказов с оценкой от ${status.policy.minScore} и ценой от ${money(status.policy.minDealPrice)} — до ${status.policy.autoDraftLimit} в день. Или нажмите «Отклик» на заказе.`
+          : 'Ждущих откликов нет. Нажмите «Отклик» на подходящем заказе.'} /></Card>
+        : visible.map((draft) => <DraftCard key={draft.id} draft={draft} reload={load} action={action} notify={notify} openLead={openLead} />)}
+    </div>
   </section>;
 }
 
-function DraftCard({ draft, reload, action, notify }: any) {
+function DraftCard({ draft, reload, action, notify, openLead }: any) {
   const [content, setContent] = useState(draft.content);
   const [instructions, setInstructions] = useState('');
   const [price, setPrice] = useState(String(draft.recommended_price || ''));
   const [days, setDays] = useState(String(draft.recommended_days || ''));
+  const [openPanel, setOpenPanel] = useState<'none' | 'warnings' | 'regen'>('none');
   const [regenerating, setRegenerating] = useState(false);
   const [acting, setActing] = useState(false);
-  const editable = ['pending','failed','stale'].includes(draft.status);
+  useEffect(() => {
+    setContent(draft.content ?? '');
+    setPrice(String(draft.recommended_price || ''));
+    setDays(String(draft.recommended_days || ''));
+  }, [draft.content, draft.recommended_price, draft.recommended_days]);
+  const editable = ['pending', 'failed', 'stale'].includes(draft.status);
   const review = draft.metadata?.review;
   const reviewFlags: string[] = Array.isArray(review?.flags) ? review.flags : [];
   const unverifiedTechnologies: string[] = Array.isArray(review?.technology_fit?.unverified)
     ? review.technology_fit.unverified
     : [];
   const qualityIssues: string[] = Array.isArray(review?.quality_issues) ? review.quality_issues : [];
-  const voiceprintSamples = Number(review?.voiceprint?.sampleCount || 0);
-  const voiceprintMinimum = Number(review?.voiceprint?.minimumSamples || 10);
-  const save = async () => { await api(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }); notify('Изменения сохранены — требуется новое одобрение'); reload(); };
+  const warnings: string[] = [];
+  if (reviewFlags.includes('technology_fit_unverified')) warnings.push(`Нет подтверждённого кейса по технологии: ${unverifiedTechnologies.join(', ')}`);
+  if (reviewFlags.includes('availability_missing')) warnings.push('Не заполнена дата старта — укажите её в профиле или добавьте в текст');
+  if (reviewFlags.includes('style_check_failed')) warnings.push(`Текст похож на шаблон: ${qualityIssues.join(' ')}`.trim());
+  const changed = content !== draft.content;
+  const save = async () => {
+    try {
+      await api(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ content }) });
+      notify('Сохранено. Отправится после вашего одобрения');
+      await reload();
+      return true;
+    } catch (error) { notify((error as Error).message); return false; }
+  };
   const regenerate = async () => {
     setRegenerating(true);
     try {
       const body: Record<string, unknown> = { instructions };
       if (draft.draft_type === 'response') {
-        body.recommendedPrice = Number(price);
-        body.recommendedDays = Number(days);
+        const parsedPrice = Number(price);
+        const parsedDays = Number(days);
+        if (Number.isFinite(parsedPrice) && parsedPrice > 0) body.recommendedPrice = parsedPrice;
+        if (Number.isFinite(parsedDays) && parsedDays > 0) body.recommendedDays = parsedDays;
       }
       await api(`/drafts/${draft.id}/regenerate`, { method: 'POST', body: JSON.stringify(body) });
-      notify('Перегенерация запущена. Новый вариант появится здесь и придёт push');
+      notify('Пишу новый вариант — он появится здесь');
       setInstructions('');
-      reload();
+      setOpenPanel('none');
+      await reload();
     } catch (error) { notify((error as Error).message); } finally { setRegenerating(false); }
   };
   const runAction = async (name: 'approve' | 'reject') => {
     setActing(true);
-    try { await action(draft.id, name); }
-    finally { setActing(false); }
+    try {
+      if (name === 'approve' && changed && !(await save())) return;
+      await action(draft.id, name);
+    } finally { setActing(false); }
   };
-  return <article className="draft"><div className="draftHead"><div><span className={`badge ${draft.channel}`}>{draft.draft_type === 'message' ? 'Сообщение' : 'Отклик'}</span><b>{draft.lead_title}</b></div><Status value={draft.status} /></div>
-    <div className="facts"><span>Релевантность <b>{draft.score ?? '—'}/100</b></span><span>Цена <b>{money(draft.recommended_price)}</b></span><span>Срок <b>{draft.recommended_days || '—'} дн.</b></span></div>
-    {reviewFlags.length > 0 && <div className="proposalWarning"><b>Нужна ручная проверка перед отправкой</b>
-      {reviewFlags.includes('technology_fit_unverified') && <span>Нет подтверждённого кейса или записи в профиле по технологии: {unverifiedTechnologies.join(', ')}. Черновик не должен заявлять такой опыт.</span>}
-      {reviewFlags.includes('availability_missing') && <span>Дата старта не заполнена в настройках. Система её не выдумывает — укажите доступность или добавьте её вручную.</span>}
-      {reviewFlags.includes('voiceprint_insufficient') && <span>Голос владельца ещё не откалиброван: ручных правок {voiceprintSamples} из минимальных {voiceprintMinimum}. Сохранённые вами правки будут пополнять корпус.</span>}
-      {reviewFlags.includes('style_check_failed') && <span><b>Автопроверка стиля не пройдена.</b> Текст сохранён, чтобы вы не ждали заново — прочитайте, поправьте вручную или перегенерируйте с указаниями. Замечания: {qualityIssues.join(' ')}</span>}
-    </div>}
+  return <article className="draft">
+    <div className="draftHead">
+      <div>
+        <span className={`badge ${draft.channel}`}>{draft.draft_type === 'message' ? 'Сообщение' : 'Отклик'}</span>
+        <button className="draftTitle" onClick={() => draft.lead_id && openLead(draft.lead_id)}>{draft.lead_title || 'Заказ без названия'}</button>
+      </div>
+      <Status value={draft.status} />
+    </div>
+    <div className="facts draftFacts">
+      <span>Гриф <b>{GRADE_LABELS[gradeOf(draft.recommended_price)] || '—'}</b></span>
+      <span>Рыночная цена <b>{money(draft.recommended_price)}</b></span>
+      <span>Срок <b>{draft.recommended_days || '—'} дн.</b></span>
+    </div>
+    {warnings.length > 0 && <button className="inlineToggle warn" onClick={() => setOpenPanel(openPanel === 'warnings' ? 'none' : 'warnings')}>
+      ⚠ Проверить перед отправкой ({warnings.length}) <i>{openPanel === 'warnings' ? '▾' : '▸'}</i>
+    </button>}
+    {openPanel === 'warnings' && <div className="proposalWarning">{warnings.map((text) => <span key={text}>{text}</span>)}</div>}
     <textarea rows={8} value={content} disabled={!editable} onChange={(event) => setContent(event.target.value)} />
     {draft.error && <div className="error">{humanError(draft.error)}</div>}
-    {editable && <div className="regenerateBox"><div><b>Не нравится? Напишите, что исправить</b><small>Например: короче, больше уверенности, упомянуть кейс, убрать технические детали.</small></div><textarea rows={3} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Ваши корректировки для нового варианта" />
-      {draft.draft_type === 'response' && <div className="regenerateNumbers"><label>Цена, ₽<input type="number" min="1" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label>Срок, дней<input type="number" min="1" value={days} onChange={(event) => setDays(event.target.value)} /></label></div>}
-      <button className="regenButton" disabled={regenerating || (draft.draft_type === 'message' && !instructions.trim())} onClick={regenerate}>{regenerating ? 'Перегенерирую…' : '↻ Перегенерировать с правками'}</button><small>Текущий вариант останется до готовности нового. Ничего не отправится автоматически.</small></div>}
-    {editable && <div className="actions"><button onClick={save} disabled={acting}>Сохранить</button>{['pending','failed'].includes(draft.status) && <button className="primary" disabled={acting} onClick={() => runAction('approve')}>{acting ? 'Отправляю…' : draft.status === 'failed' ? '↻ Повторить отправку' : '✓ Одобрить и отправить'}</button>}<button className="danger" disabled={acting} onClick={() => runAction('reject')}>Отклонить</button></div>}
+    {editable && <>
+      <button className="inlineToggle" onClick={() => setOpenPanel(openPanel === 'regen' ? 'none' : 'regen')}>
+        ↻ Переписать <i>{openPanel === 'regen' ? '▾' : '▸'}</i>
+      </button>
+      {openPanel === 'regen' && <div className="regenerateBox">
+        {draft.draft_type === 'response' && <div className="regenerateNumbers"><label>Цена, ₽<input type="number" min="1" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label>Срок, дней<input type="number" min="1" value={days} onChange={(event) => setDays(event.target.value)} /></label></div>}
+        <textarea rows={3} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Что исправить: короче, увереннее, убрать детали, добавить кейс" />
+        <button className="regenButton" disabled={regenerating} onClick={regenerate}>{regenerating ? 'Пишу…' : 'Переписать с правками'}</button>
+        <small>Цена и срок применятся в новом варианте. Текущий останется, пока не готов новый.</small>
+      </div>}
+      <div className="actions">
+        <button className="primary" disabled={acting || !content.trim()} onClick={() => runAction('approve')}>{acting ? 'Отправляю…' : draft.status === 'failed' ? '↻ Повторить отправку' : '✓ Отправить'}</button>
+        {changed && <button onClick={save} disabled={acting}>Сохранить правки</button>}
+        <button className="danger" disabled={acting} onClick={() => runAction('reject')}>Отклонить</button>
+      </div>
+    </>}
   </article>;
 }
 
-function ChatDetail({ id, back, notify }: { id: string; back: () => void; notify: (text: string) => void }) {
+function Settings({ notify, status }: { notify: (text: string) => void; status?: SystemStatus }) {
   const [data, setData] = useState<any>();
-  const [agent, setAgent] = useState<any>();
-  const [content, setContent] = useState('');
-  const [question, setQuestion] = useState('');
-  const [agentAnswer, setAgentAnswer] = useState('');
-  const [agentBusy, setAgentBusy] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [signal, setSignal] = useState(0);
-  const load = () => Promise.all([
-    api(`/leads/${id}`),
-    api(`/leads/${id}/agent`),
-  ]).then(([leadData, agentData]) => {
-    setData(leadData);
-    setAgent(agentData);
-  });
-  useEffect(() => { void load(); const timer = window.setInterval(load, 15_000); return () => clearInterval(timer); }, [id]);
-  const pending = data?.drafts?.find((draft: any) => draft.status === 'pending');
-  useEffect(() => { setContent(pending?.content || ''); }, [pending?.id]);
-  if (!data) return <Loading />;
-  const lead = data.lead;
-  const run = async (action: () => Promise<unknown>, message: string) => {
-    setBusy(true);
-    setSignal((value) => value + 1);
-    try { await action(); notify(message); window.setTimeout(load, 1200); } catch (error) { notify((error as Error).message); } finally { setBusy(false); setSignal((value) => value + 1); }
-  };
-  const makeDraft = () => run(() => api(`/leads/${id}/draft`, { method: 'POST', body: '{}' }), 'Запустил. Каждый шаг виден в блоке «Что сейчас делает система»');
-  const saveDraft = () => run(() => api(`/drafts/${pending.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }), 'Правки сохранены');
-  const approve = () => run(() => api(`/drafts/${pending.id}/approve`, { method: 'POST' }), 'Ответ одобрен и отправляется');
-  const reject = () => run(() => api(`/drafts/${pending.id}/reject`, { method: 'POST' }), 'Ответ отклонён');
-  const askAgent = async () => {
-    if (!question.trim()) return;
-    setAgentBusy(true);
-    try {
-      const result = await api<any>(`/leads/${id}/agent/query`, {
-        method: 'POST',
-        body: JSON.stringify({ question }),
-      });
-      setAgentAnswer(result.answer || 'Ответ не получен');
-    } catch (error) {
-      notify((error as Error).message);
-    } finally {
-      setAgentBusy(false);
-    }
-  };
-  return <section className="chatScreen"><button className="back" onClick={back}>← Все чаты</button><div className="pageTitle chatTitle"><div><span className="eyebrow">{lead.source === 'telegram' ? 'Диалог Telegram' : 'Диалог FL.ru'}</span><h1>{lead.title}</h1><p>{data.messages.length} сообщений · обновлён {relativeTime(lead.updated_at)}</p></div>{lead.url && <a className="button ghost" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
-    <div className="chatWorkspace"><div className="conversationColumn">
-      <LiveActivity leadId={id} signal={signal} onIdle={load} title="Что сейчас делает система" />
-      {pending ? <article className="replyReady"><div className="replyReadyHead"><div><span>Готово к отправке</span><h2>Ответ клиенту</h2></div><Status value={pending.status} /></div><textarea rows={7} value={content} onChange={(event) => setContent(event.target.value)} /><div className="actions"><button onClick={saveDraft} disabled={busy}>Сохранить правки</button><button className="primary" onClick={approve} disabled={busy}>✓ Одобрить и отправить</button><button className="danger" onClick={reject} disabled={busy}>Отклонить</button></div></article> : <div className="replyEmpty"><div><b>Нужно ответить клиенту?</b><small>Система подготовит ответ в вашем стиле. Без одобрения он не уйдёт.</small></div><button className="primary" onClick={makeDraft} disabled={busy}>{busy ? 'Готовлю…' : 'Подготовить ответ'}</button></div>}
-      <Card title="Переписка" subtitle="Последние сообщения снизу"><div className="messageThread">{data.messages.length === 0 ? <Empty text="Сообщений пока нет" /> : data.messages.slice(-50).map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.direction === 'outbound' ? 'Вы' : 'Клиент'} · {new Date(message.created_at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</small><p>{message.content}</p></div>)}</div></Card>
-    </div><aside className="chatContext"><Card title="Агент сделки" subtitle="Можно спрашивать обычными словами"><div className="contextFacts"><span>Стадия<b>{agent?.stage || '—'}</b></span><span>Интервью<b>{agent?.discoveryReadiness ?? 0}%</b></span><span>Готовность к разработке<b>{agent?.buildReadiness ?? 0}%</b></span></div>{agent?.nextAction && <p className="hint"><b>Следующий шаг:</b> {agent.nextAction}</p>}<textarea rows={3} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Например: что клиент хочет и какие вопросы ещё не закрыты?" /><button className="primary" disabled={agentBusy || !question.trim()} onClick={askAgent}>{agentBusy ? 'Анализирую…' : 'Спросить агента'}</button>{agentAnswer && <p className="pre">{agentAnswer}</p>}</Card><Card title="Заказ и условия"><div className="contextFacts"><span>Этап<b>{labelStatus(lead.status)}</b></span><span>Релевантность<b>{lead.score ?? '—'}/100</b></span><span>Цена<b>{money(lead.recommended_price)}</b></span><span>Срок<b>{lead.recommended_days ? `${lead.recommended_days} дней` : '—'}</b></span></div>{lead.description && lead.description !== 'Диалог FL.ru' && <details><summary>Описание заказа</summary><p className="pre">{lead.description}</p></details>}<div className="actions"><button onClick={() => run(() => api(`/leads/${id}/documents`, { method: 'POST', body: '{}' }), 'ТЗ, договор и пакет для Codex готовятся')}>Сформировать пакет проекта</button></div></Card><Card title="Правило отправки"><p className="hint">Рискованные ответы, цены, сроки и договорённости всегда требуют вашего подтверждения.</p></Card></aside></div>
-  </section>;
-}
-
-function LeadDetail({ id, back, notify }: { id: string; back: () => void; notify: (text: string) => void }) {
-  const [data, setData] = useState<any>();
-  const [signal, setSignal] = useState(0);
-  const load = () => api(`/leads/${id}`).then(setData);
-  const reload = useCallback(() => { void load(); }, [id]);
-  useEffect(() => { void load(); }, [id]);
-  if (!data) return <Loading />;
-  const lead = data.lead;
-  const project = lead.requirements?.project || {};
-  const job = async (path: string, message: string) => {
-    setSignal((value) => value + 1);
-    try { await api(`/leads/${id}/${path}`, { method: 'POST', body: '{}' }); notify(message); }
-    catch (error) { notify((error as Error).message); }
-    finally { setSignal((value) => value + 1); window.setTimeout(load, 1500); }
-  };
-  return <section><button className="back" onClick={back}>← Назад</button><div className="pageTitle leadTitle"><div><span className="eyebrow">{labelStatus(lead.status)}</span><h1>{lead.title}</h1><p>{lead.source.toUpperCase()} · обновлён {relativeTime(lead.updated_at)}</p></div><Score value={lead.score} /></div>
-    <div className="facts bigfacts"><span>Цена <b>{money(lead.recommended_price)}</b></span><span>Срок <b>{lead.recommended_days || '—'} дней</b></span><span>Уверенность <b>{lead.confidence ?? '—'}%</b></span></div>
-    <div className="actions wrap"><button onClick={() => job('analyze','Запустил переоценку — шаги видно ниже')}>Обновить анализ</button><button onClick={() => job('draft','Запустил подготовку текста — шаги видно ниже')}>Создать ответ</button><button className="primary" onClick={() => job('documents','Запустил сборку ТЗ и договора — шаги видно ниже')}>Сформировать ТЗ</button>{lead.url && <a className="button" href={lead.url} target="_blank" rel="noreferrer">Открыть FL.ru</a>}</div>
-    <p className="actionsHint">Работа идёт в фоне и занимает от нескольких секунд до нескольких минут. Ничего не отправляется клиенту без вашего одобрения.</p>
-    <LiveActivity leadId={id} signal={signal} onIdle={reload} title="Что сейчас делает система по этому заказу" />
-    {project.detail_parsed_at && <div className="projectSignals"><span>Карточка проекта<b>прочитана полностью</b></span><span>Откликов<b>{project.response_count ?? '—'}</b></span><span>Вилка исполнителей<b>{project.response_price_min ? `${money(project.response_price_min)} — ${money(project.response_price_max)}` : '—'}</b></span><span>Вложений<b>{project.attachments?.length || 0}</b></span></div>}
-    <div className="grid two"><Card title="Полное описание проекта"><p className="pre">{lead.description || '—'}</p>{project.attachments?.length > 0 && <div className="attachmentList"><h4>Вложения</h4>{project.attachments.map((file: any) => <div key={file.sha256}><b>{file.name}</b><small>{Math.ceil(file.size / 1024)} КБ · {file.extraction === 'image' ? 'изображение передано Codex' : file.extracted_text ? 'текст извлечён' : 'файл сохранён'}</small></div>)}</div>}</Card><Card title="Оценка Codex"><p>{lead.analysis?.fit_reason || 'Ещё не выполнена'}</p>{lead.analysis?.risks?.length > 0 && <><h4>Риски</h4><ul>{lead.analysis.risks.map((item: string) => <li key={item}>{item}</li>)}</ul></>}</Card></div>
-    <Card title="Переписка">{data.messages.length === 0 ? <Empty text="Сообщений пока нет" /> : data.messages.map((message: any) => <div key={message.id} className={`message ${message.direction}`}><small>{message.channel} · {new Date(message.created_at).toLocaleString('ru')}</small><p>{message.content}</p></div>)}</Card>
-    <Card title="Документы">{data.documents.length === 0 ? <Empty text="Документов пока нет" /> : data.documents.map((document: any) => <div className="doc" key={document.id}><div><b>{document.kind === 'specification' ? 'Техническое задание' : document.kind === 'contract' ? 'Договор' : 'Данные договора'}</b><small>Версия {document.version}</small></div>{document.downloadable && <a className="button" href={`${BASE}/api/documents/${document.id}/download`}>Скачать DOCX</a>}</div>)}</Card>
-  </section>;
-}
-
-function Settings({ notify }: { notify: (text: string) => void }) {
-  const [data, setData] = useState<any>();
+  const [failed, setFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [seller, setSeller] = useState<any>({});
   const [style, setStyle] = useState<any>({});
-  const [keys, setKeys] = useState({ telegram: '', cookies: '', images: '' });
+  const [cookies, setCookies] = useState('');
   const [showCookies, setShowCookies] = useState(false);
-  const [contractTemplate, setContractTemplate] = useState<File | null>(null);
-  const load = () => api('/settings').then((value) => { setData(value); setSeller(value.seller || {}); setStyle(value.style || {}); });
-  useEffect(() => { void load(); }, []);
+  const load = useCallback(() => api('/settings').then((value) => {
+    setData(value); setSeller(value.seller || {}); setStyle(value.style || {}); setFailed(false);
+  }).catch(() => setFailed(true)), []);
+  useEffect(() => { void load(); }, [load]);
+  if (failed) return <section>
+    <div className="pageTitle"><div><span className="eyebrow">Управление</span><h1>Система</h1></div></div>
+    <Card title="Настройки не загрузились">
+      <Empty text="Сервис не ответил. Проверьте связь и повторите." />
+      <div className="actions"><button className="primary" onClick={() => { setFailed(false); void load(); }}>Повторить</button></div>
+    </Card>
+  </section>;
   if (!data) return <Loading />;
   const fl = data.connectors.find((item: any) => item.connector === 'fl') || {};
-  const telegramMonitoring = data.telegramMonitoring !== false;
-  const saveProfile = async () => { await api('/settings/profile', { method: 'PATCH', body: JSON.stringify({ seller, style }) }); notify('Профиль сохранён'); };
-  const connect = async (kind: string, body: unknown) => { try { await api(`/settings/${kind}`, { method: 'POST', body: JSON.stringify(body) }); notify(`${kind} подключён`); await load(); } catch (error) { notify((error as Error).message); } };
-  const uploadContract = async () => { if (!contractTemplate) return; const form = new FormData(); form.append('template', contractTemplate); try { await api('/settings/contract-template', { method: 'POST', body: form }); notify('Шаблон договора сохранён'); await load(); } catch (error) { notify((error as Error).message); } };
-  return <section><div className="pageTitle"><div><span className="eyebrow">Управление</span><h1>Система</h1><p>Автоматизация, ваш профиль и подключения — в одном месте.</p></div></div>
+  const serverNow = status?.serverTime ? Date.parse(status.serverTime) : Date.now();
+  const workerAlive = Boolean(status?.worker?.seenAt && serverNow - Date.parse(status.worker.seenAt) < 150_000);
+  const saveProfile = async () => {
+    setSaving(true);
+    try { await api('/settings/profile', { method: 'PATCH', body: JSON.stringify({ seller, style }) }); notify('Профиль сохранён'); }
+    catch (error) { notify((error as Error).message); }
+    finally { setSaving(false); }
+  };
+  const connect = async (kind: string, body: unknown) => {
+    try { await api(`/settings/${kind}`, { method: 'POST', body: JSON.stringify(body) }); notify('Сохранено'); await load(); }
+    catch (error) { notify((error as Error).message); }
+  };
+  return <section>
+    <div className="pageTitle"><div><span className="eyebrow">Управление</span><h1>Система</h1><p>Только то, без чего заказы и отклики не работают.</p></div></div>
     <div className="settingsGrid">
-      <Card title="Push-уведомления" subtitle="О подходящем заказе и готовом черновике"><PushControl notify={notify} /></Card>
-      <Card title="Автопоиск FL.ru" subtitle="Только новые проекты, один раз в 5 минут"><div className="settingStatus"><span className={fl.enabled ? 'dot ok' : 'dot'} /><b>{fl.enabled ? 'Включён' : 'На паузе'}</b></div><button className={fl.enabled ? 'danger soft' : 'primary'} onClick={() => connect('fl', { enabled: !fl.enabled })}>{fl.enabled ? 'Остановить' : 'Включить мониторинг'}</button></Card>
-      <Card title="Мониторинг Telegram" subtitle="Входящие сообщения и подготовка ответов"><div className="settingStatus"><span className={telegramMonitoring ? 'dot ok' : 'dot'} /><b>{telegramMonitoring ? 'Включён' : 'На паузе'}</b></div><p className="hint">{telegramMonitoring ? 'Новые сообщения Telegram разбираются системой.' : 'Сообщения Telegram не читаются и задачи ИИ по ним не запускаются.'}</p><button className={telegramMonitoring ? 'danger soft' : 'primary'} onClick={() => connect('telegram', { enabled: !telegramMonitoring })}>{telegramMonitoring ? 'Остановить' : 'Включить мониторинг'}</button></Card>
+      <Card title="Обработчик и ИИ" subtitle="Живы ли они прямо сейчас">
+        <div className="settingStatus"><span className={workerAlive ? 'dot ok' : 'dot bad'} /><b>{workerAlive ? 'Обработчик работает' : 'Обработчик не отвечает'}</b></div>
+        <p className="hint">{status?.worker?.seenAt ? `Откликался ${relativeTime(status.worker.seenAt!)}` : 'Нет данных'} · в работе {status?.queue.active ?? 0}, в очереди {status?.queue.waiting ?? 0}</p>
+        <div className="settingStatus"><span className={status?.broker.healthy ? 'dot ok' : 'dot bad'} /><b>{status?.broker.healthy ? 'Брокер ИИ на связи' : 'Брокер ИИ не отвечает'}</b></div>
+        <p className="hint">{status?.broker.statusText || 'Нет данных'}{status?.broker.lastSuccessAt ? ` · ${relativeTime(status.broker.lastSuccessAt)}` : ''}</p>
+        {blockingError(status) && <div className="alert bad"><b>ИИ остановлен.</b> {humanError(blockingError(status)!.message)}</div>}
+      </Card>
+      <Card title="Автопоиск FL.ru" subtitle="Ищет новые проекты и ставит их на оценку">
+        <div className="settingStatus"><span className={fl.enabled ? 'dot ok' : 'dot'} /><b>{fl.enabled ? 'Включён' : 'На паузе'}</b></div>
+        <p className="hint">{fl.status_text || 'Нет данных'}{fl.last_success_at ? ` · последний раз ${relativeTime(fl.last_success_at)}` : ''}</p>
+        <button className={fl.enabled ? 'danger soft' : 'primary'} onClick={() => connect('fl', { enabled: !fl.enabled })}>{fl.enabled ? 'Остановить' : 'Включить поиск'}</button>
+      </Card>
+      <Card title={`Cookies FL.ru ${data.configured.fl ? '✓' : ''}`} subtitle="Без них нет ни заказов, ни отправки">
+        {data.flCookies?.expiryKnown && <p className="cookieExpiry">Действуют до <b>{new Date(data.flCookies.expiresAt).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })} МСК</b></p>}
+        {showCookies
+          ? <>
+            <textarea rows={5} autoFocus placeholder="Вставьте JSON cookies" value={cookies} onChange={(event) => setCookies(event.target.value)} />
+            <div className="actions">
+              <button onClick={() => setShowCookies(false)}>Отмена</button>
+              <button className="primary" onClick={() => {
+                try { void connect('fl', { cookies: JSON.parse(cookies), enabled: fl.enabled }); setShowCookies(false); setCookies(''); }
+                catch { notify('Некорректный JSON'); }
+              }}>Сохранить cookies</button>
+            </div>
+          </>
+          : <button onClick={() => setShowCookies(true)}>Обновить cookies</button>}
+      </Card>
+      <Card title="Push-уведомления" subtitle="О подходящем заказе и готовом отклике"><PushControl notify={notify} /></Card>
     </div>
-    <Card title="Ваше предложение" subtitle="Чем точнее заполнено, тем меньше лишних заказов"><div className="formgrid"><label>Имя<input value={seller.name || ''} onChange={(event) => setSeller({ ...seller, name: event.target.value })} /></label><label>Минимальная цена<input type="number" value={seller.minimum_price || ''} onChange={(event) => setSeller({ ...seller, minimum_price: Number(event.target.value) })} /></label><label>Telegram для клиентов<input placeholder="@username" value={seller.telegram_username || ''} onChange={(event) => setSeller({ ...seller, telegram_username: event.target.value })} /></label><label>Когда могу начать<input placeholder="например: с 10 августа" value={seller.available_from || ''} onChange={(event) => setSeller({ ...seller, available_from: event.target.value })} /></label><label className="wide">Услуги<textarea rows={4} value={seller.services || ''} onChange={(event) => setSeller({ ...seller, services: event.target.value })} /></label><label className="wide">Подтверждённые кейсы<textarea rows={4} value={seller.cases || ''} onChange={(event) => setSeller({ ...seller, cases: event.target.value })} /></label><label className="wide">Стиль общения<textarea rows={4} value={style.rules || ''} onChange={(event) => setStyle({ ...style, rules: event.target.value })} /></label></div><p className="hint">Если дату не указать, система не будет её выдумывать и покажет предупреждение перед отправкой отклика.</p><button className="primary" onClick={saveProfile}>Сохранить профиль</button></Card>
-    <div className="settingsGrid">
-      <Card title={`Codex Hub ${data.configured.codex ? '✓' : ''}`} subtitle="ИИ и подготовка документов"><p className="hint">Работает через Codex Hub на сервере. От вас ничего не требуется.</p></Card>
-      <Card title={`Telegram Business ${data.configured.telegram ? '✓' : ''}`} subtitle="Общение через ваш аккаунт"><p className="hint">Подключайте, когда будете готовы перенести клиента из FL.ru в Telegram.</p><div className="inline"><input type="password" placeholder="Bot token" value={keys.telegram} onChange={(event) => setKeys({ ...keys, telegram: event.target.value })} /><button onClick={() => connect('telegram', { botToken: keys.telegram })}>Подключить</button></div></Card>
-      <Card title={`Генерация дизайна ${data.configured.images ? '✓' : ''}`} subtitle="4 предварительных концепции только по вашей команде"><p className="hint">OpenAI Images: gpt-image-2, low quality, примерно $0.02 за четыре эскиза. Ключ хранится в зашифрованных настройках и не попадает в браузер после сохранения.</p><div className="inline"><input type="password" placeholder="OpenAI API key" value={keys.images} onChange={(event) => setKeys({ ...keys, images: event.target.value })} /><button disabled={!keys.images.trim()} onClick={() => connect('images', { apiKey: keys.images })}>Подключить</button></div></Card>
-      <Card title={`Cookies FL.ru ${data.configured.fl ? '✓' : ''}`} subtitle="Чаты и отправка одобренных ответов"><p className="hint">Проверяются каждые 5 минут. До истечения и при разлогине придёт push.</p>{data.flCookies?.expiryKnown && <p className="cookieExpiry">Действуют до <b>{new Date(data.flCookies.expiresAt).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })} МСК</b></p>}{showCookies ? <><textarea rows={5} autoFocus placeholder='Вставьте JSON cookies' value={keys.cookies} onChange={(event) => setKeys({ ...keys, cookies: event.target.value })} /><div className="actions"><button onClick={() => setShowCookies(false)}>Отмена</button><button className="primary" onClick={() => { try { void connect('fl', { cookies: JSON.parse(keys.cookies), enabled: fl.enabled }); setShowCookies(false); } catch { notify('Некорректный JSON'); } }}>Сохранить cookies</button></div></> : <button onClick={() => setShowCookies(true)}>Обновить cookies</button>}</Card>
-      <Card title={`Шаблон договора ${data.configured.contractTemplate ? '✓' : ''}`} subtitle="Ваш DOCX-шаблон"><p className="hint">Договор всегда останется на проверке до вашего решения.</p><div className="inline"><input type="file" accept=".docx" onChange={(event) => setContractTemplate(event.target.files?.[0] || null)} /><button disabled={!contractTemplate} onClick={uploadContract}>Загрузить</button></div></Card>
-    </div>
+    <Card title="Ваше предложение" subtitle="Чем точнее заполнено, тем меньше лишних заказов и точнее цена">
+      <div className="formgrid">
+        <label>Имя<input value={seller.name || ''} onChange={(event) => setSeller({ ...seller, name: event.target.value })} /></label>
+        <label>Минимальная цена<input type="number" value={seller.minimum_price || ''} onChange={(event) => setSeller({ ...seller, minimum_price: Number(event.target.value) })} /></label>
+        <label>Telegram для клиентов<input placeholder="@username" value={seller.telegram_username || ''} onChange={(event) => setSeller({ ...seller, telegram_username: event.target.value })} /></label>
+        <label>Когда могу начать<input placeholder="например: с 10 августа" value={seller.available_from || ''} onChange={(event) => setSeller({ ...seller, available_from: event.target.value })} /></label>
+        <label className="wide">Услуги<textarea rows={4} value={seller.services || ''} onChange={(event) => setSeller({ ...seller, services: event.target.value })} /></label>
+        <label className="wide">Подтверждённые кейсы<textarea rows={4} value={seller.cases || ''} onChange={(event) => setSeller({ ...seller, cases: event.target.value })} /></label>
+        <label className="wide">Стиль общения<textarea rows={4} value={style.rules || ''} onChange={(event) => setStyle({ ...style, rules: event.target.value })} /></label>
+      </div>
+      <button className="primary" disabled={saving} onClick={saveProfile}>{saving ? 'Сохраняю…' : 'Сохранить профиль'}</button>
+    </Card>
   </section>;
 }
 
@@ -1263,22 +793,20 @@ function PushControl({ notify, compact = false }: { notify: (text: string) => vo
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const refresh = async () => {
-    const next = await api('/push/status');
-    setStatus(next);
-    if ('serviceWorker' in navigator) {
-      const registration = await navigator.serviceWorker.ready;
-      const subscription = await registration.pushManager.getSubscription();
-      if (subscription) await api('/push/subscribe', { method: 'POST', body: JSON.stringify(subscription.toJSON()) });
-      setEnabled(Boolean(subscription));
-    }
+    try {
+      const value = await api<any>('/push/status');
+      setStatus(value);
+      setEnabled(Boolean(value.enabled));
+    } catch { setStatus({}); }
   };
-  useEffect(() => { void refresh().catch(() => undefined); }, []);
+  useEffect(() => { void refresh(); }, []);
   const enable = async () => {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) return notify('Этот браузер не поддерживает push');
     setBusy(true);
     try {
       const permission = await Notification.requestPermission();
       if (permission !== 'granted') throw new Error('Разрешение на уведомления не выдано');
+      if (!status?.publicKey) throw new Error('Сервер не выдал ключ уведомлений — обновите страницу и попробуйте снова');
       const registration = await navigator.serviceWorker.ready;
       const existing = await registration.pushManager.getSubscription();
       const subscription = existing || await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(status.publicKey) });
@@ -1292,7 +820,7 @@ function PushControl({ notify, compact = false }: { notify: (text: string) => vo
     setBusy(true);
     try {
       const result = await api<any>('/push/test', { method: 'POST' });
-      notify(result.sent > 0 ? `Тестовый push отправлен на устройств: ${result.sent}` : 'Сервер не видит активной push-подписки');
+      notify(result.sent > 0 ? `Тестовый push отправлен: ${result.sent}` : 'Сервер не видит активной push-подписки');
       await refresh();
     } catch (error) { notify((error as Error).message); } finally { setBusy(false); }
   };
@@ -1309,26 +837,50 @@ function PushControl({ notify, compact = false }: { notify: (text: string) => vo
     } catch (error) { notify((error as Error).message); } finally { setBusy(false); }
   };
   if (!status) return compact ? null : <p className="hint">Проверяю поддержку…</p>;
-  return <div className={`pushControl ${compact ? 'compact' : ''}`}>{enabled ? <div className="pushButtons"><button className="pushOn" disabled={busy} onClick={test}>🔔 Отправить тест</button><button disabled={busy} onClick={disable}>Выключить</button></div> : <button className="primary" disabled={busy} onClick={enable}>Включить push</button>}{!compact && <small>{enabled ? `Разрешение браузера: ${Notification.permission}. Подписок на сервере: ${status.subscriptions}.` : 'На iPhone сначала добавьте сайт на главный экран.'}</small>}</div>;
-}
-
-function LeadRows({ leads, openLead }: { leads: any[]; openLead: (id: string) => void }) {
-  return <div className="leadrows">{leads.length === 0 ? <Empty text="Ничего не найдено" /> : leads.map((lead) => <button key={lead.id} onClick={() => openLead(lead.id)}><Score value={lead.score} /><div><b>{lead.title}</b><small><StatusDot status={lead.status} /> {labelStatus(lead.status)} · опубликован {relativeTime(lead.published_at || lead.created_at)}</small></div><span className="price">{money(lead.recommended_price)}</span><span className="chevron">›</span></button>)}</div>;
+  return <div className={`pushControl ${compact ? 'compact' : ''}`}>
+    {enabled
+      ? <div className="pushButtons"><button className="pushOn" disabled={busy} onClick={test}>🔔 Отправить тест</button><button disabled={busy} onClick={disable}>Выключить</button></div>
+      : <button className="primary" disabled={busy} onClick={enable}>Включить push</button>}
+    {!compact && <small>{enabled ? `Разрешение браузера: ${Notification.permission}.` : 'На iPhone сначала добавьте сайт на главный экран.'}</small>}
+  </div>;
 }
 
 function StatusDot({ status }: { status: string }) { return <i className={`statusDot ${status}`} />; }
-function Metric({ label, value, tone = '', hint = '' }: any) { return <div className={`metric ${tone}`}><b>{value ?? 0}</b><span>{label}</span>{hint && <small>{hint}</small>}</div>; }
-function Score({ value }: { value: number | null }) { return <span className={`score ${(value || 0) >= 65 ? 'high' : (value || 0) >= 45 ? 'mid' : ''}`}>{value ?? '—'}</span>; }
-function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{({ pending:'Ждёт решения',approved:'Одобрено',sending:'Отправляется',failed:'Ошибка отправки',stale:'Устарело',send_unknown:'Проверьте отправку' } as Record<string,string>)[value] || value}</span>; }
+const GRADE_LABELS: Record<string, string> = { large: 'Крупный', medium: 'Средний', small: 'Мелкий' };
+
+// Same thresholds as sizeGrade() in pricing-policy.ts: the lead list does not
+// ship the analysis JSON, so the grade is derived from the fair price here.
+function gradeOf(price: number | null | undefined): string {
+  const value = Number(price || 0);
+  if (!value) return '';
+  if (value >= 300_000) return 'large';
+  if (value >= 100_000) return 'medium';
+  return 'small';
+}
+
+function Grade({ grade, price }: { grade?: string | null; price?: number | null }) {
+  const g = grade || gradeOf(price);
+  if (!g) return <span className="grade small">Мелкий</span>;
+  return <span className={`grade ${g}`}>{GRADE_LABELS[g] || g}</span>;
+}
+function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{({ pending: 'Ждёт решения', approved: 'Одобрено', sending: 'Отправляется', sent: 'Отправлено', failed: 'Ошибка отправки', stale: 'Устарело', send_unknown: 'Проверьте отправку' } as Record<string, string>)[value] || value}</span>; }
 function Card({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) { return <div className="card">{title && <div className="cardTitle"><h3>{title}</h3>{subtitle && <p>{subtitle}</p>}</div>}{children}</div>; }
-function Modal({ close, children }: { close: () => void; children: React.ReactNode }) { return <div className="modal" onMouseDown={close}><div onMouseDown={(event) => event.stopPropagation()}>{children}</div></div>; }
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }
 function Loading() { return <div className="center"><div className="spinner" /></div>; }
+function SkeletonRows({ count = 6 }: { count?: number }) {
+  return <div className="skeleton" aria-hidden="true">
+    {Array.from({ length: count }, (_, index) => <div className="skeletonRow" key={index}>
+      <i className="sk sq" />
+      <div className="skBody"><i className="sk w70" /><i className="sk w45" /></div>
+      <i className="sk w60" />
+    </div>)}
+  </div>;
+}
 
 const money = (value: number | null) => value ? `${new Intl.NumberFormat('ru-RU').format(value)} ₽` : '—';
-const labelConnector = (value: string) => ({ codex:'Codex Hub',images:'Генерация дизайна',fl:'FL.ru',telegram:'Telegram Business' } as Record<string,string>)[value] || value;
-const labelStatus = (value: string) => ({ new:'На оценке',qualified:'Подходит',rejected:'Отсеян',contacted:'Связались',discovery:'Уточнение',proposal:'Предложение',negotiation:'Переговоры' } as Record<string,string>)[value] || value;
+const labelStatus = (value: string) => ({ new: 'На оценке', qualified: 'Подходит', rejected: 'Отсеян', contacted: 'Связались', discovery: 'Уточнение', proposal: 'Предложение', negotiation: 'Переговоры' } as Record<string, string>)[value] || value;
 const relativeTime = (value: string) => {
+  if (!value) return '—';
   const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
   if (seconds < 60) return 'только что';
   if (seconds < 3600) return `${Math.floor(seconds / 60)} мин назад`;
@@ -1342,3 +894,7 @@ const urlBase64ToUint8Array = (value: string) => {
 };
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => { navigator.serviceWorker.register(`${BASE}/sw.js`).catch(() => undefined); });
+}

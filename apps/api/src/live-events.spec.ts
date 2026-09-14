@@ -43,5 +43,10 @@ describe('FL publication time in the lead list', () => {
     expect(sql).toContain('AS published_at');
     expect(sql).toContain('ORDER BY published_at DESC');
     expect(sql).not.toContain('ORDER BY updated_at DESC');
+    // A pagination cap is expected; what matters is that the cap rides on the
+    // publication-time ordering instead of replacing it.
+    expect(sql).toMatch(/ORDER BY published_at DESC[\s\S]*LIMIT/);
+    expect(sql).not.toMatch(/score\s*[<>=]/i);
+    expect(sql).not.toContain("status='rejected'");
   });
 });
