@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
@@ -1352,6 +1353,66 @@ const RESPONSE_CALIBRATION = [
   },
 ];
 
+// Prompts live in ./prompts (mounted into the container) so the owner can edit the
+// wording without a rebuild. Built-in constants stay as the fallback: a missing or
+// unparsable file changes nothing.
+const PROMPTS_DIR = process.env.PROMPTS_DIR || '/app/prompts';
+const promptFileCache = new Map<string, { mtimeMs: number; value: string }>();
+
+function readPromptFile(relPath: string): string | null {
+  try {
+    const fullPath = `${PROMPTS_DIR}/${relPath}`;
+    const stat = statSync(fullPath);
+    const cached = promptFileCache.get(fullPath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.value;
+    const value = readFileSync(fullPath, 'utf8');
+    promptFileCache.set(fullPath, { mtimeMs: stat.mtimeMs, value });
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+const promptSources = new Map<string, string>();
+
+function loadProposalRules(): string[] {
+  const raw = readPromptFile('response_principles.md');
+  if (!raw) return RESPONSE_PRINCIPLES;
+  const rules = raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map((line) => line.replace(/^[-*]\s+/, '').replace(/\\n/g, '\n'));
+  return rules.length >= 3 ? rules : RESPONSE_PRINCIPLES;
+}
+
+function loadResponseCalibration(): Array<{ kind: string; example: string; why: string }> {
+  const raw = readPromptFile('response_calibration.md');
+  if (!raw) return RESPONSE_CALIBRATION;
+  const examples: Array<{ kind: string; example: string; why: string }> = [];
+  for (const block of raw.split(/^## /m).slice(1)) {
+    const lines = block.split('\n');
+    const kind = (lines.shift() || '').trim();
+    let example = '';
+    let why = '';
+    let mode: 'example' | 'why' | null = null;
+    for (const line of lines) {
+      const text = line.trim();
+      if (/^Пример:$/.test(text)) { mode = 'example'; continue; }
+      if (/^Почему:/.test(text)) { why = text.replace(/^Почему:\s*/, ''); mode = 'why'; continue; }
+      if (mode === 'example') example += (example ? '\n' : '') + text;
+    }
+    if (kind && example) examples.push({ kind, example: example.replace(/\\n/g, '\n'), why: why.replace(/\\n/g, '\n') });
+  }
+  return examples.length ? examples : RESPONSE_CALIBRATION;
+}
+
+function promptSourceNote(name: string, fromFile: boolean): void {
+  if (promptSources.get(name) === (fromFile ? 'file' : 'builtin')) return;
+  promptSources.set(name, fromFile ? 'file' : 'builtin');
+  new Logger('Prompts').log(`${name}: ${fromFile ? 'читаю из prompts/' : 'файл нет, использую встроенный текст'}`);
+}
+
 const ANALYZER_VERSION = 'v3-single-pass-20260723';
 
 type LocalFilterRule = {
@@ -1570,6 +1631,18 @@ export class AiService {
     }
   }
 
+  private proposalRules(): string[] {
+    const rules = loadProposalRules();
+    promptSourceNote('response_principles', rules !== RESPONSE_PRINCIPLES);
+    return rules;
+  }
+
+  private responseCalibration(): Array<{ kind: string; example: string; why: string }> {
+    const examples = loadResponseCalibration();
+    promptSourceNote('response_calibration', examples !== RESPONSE_CALIBRATION);
+    return examples;
+  }
+
   async draftReply(context: Record<string, unknown>): Promise<string> {
     const seller = (await this.settings.getPublic('seller_profile') || {}) as Record<string, unknown>;
     const allPortfolio = await this.settings.getPublic('fl_portfolio_cases') || [];
@@ -1619,8 +1692,8 @@ export class AiService {
       mode,
       portfolio,
       // The ethalon: owner's structure, tone, bans and approved case metrics.
-      proposal_rules: RESPONSE_PRINCIPLES,
-      calibration_examples: RESPONSE_CALIBRATION,
+      proposal_rules: this.proposalRules(),
+      calibration_examples: this.responseCalibration(),
       commercial_terms: {
         price_rub: commercialTerms.price ?? null,
         duration_days: commercialTerms.days ?? null,

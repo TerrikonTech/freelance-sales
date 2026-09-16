@@ -820,6 +820,28 @@ export class ProcessorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * One notice per fingerprint per window. The owner asked for silence, so every
+   * alert path goes through here instead of firing per task or per lead.
+   */
+  private async alertOnce(fingerprint: string, windowMinutes: number, message: string): Promise<boolean> {
+    const inserted = await this.db.query<{ id: string }>(
+      `INSERT INTO activities(actor,action,details)
+       SELECT 'watchdog','health_alert',$1::jsonb
+       WHERE NOT EXISTS (
+         SELECT 1 FROM activities WHERE action='health_alert'
+           AND details->>'fingerprint'=$2 AND created_at>=now()-($3::int * interval '1 minute')
+       ) RETURNING id`,
+      [JSON.stringify({ fingerprint, message }), fingerprint, windowMinutes],
+    );
+    if (!inserted.rows[0]) return false;
+    await this.push.notify('Freelance Sales требует внимания', message, '/sales/?page=settings')
+      .catch((error) => this.logger.warn(`Watchdog push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    await this.telegram.notifyOwnerSystem(message, '/sales/?page=settings')
+      .catch((error) => this.logger.warn(`Watchdog Telegram notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    return true;
+  }
+
   private async healthWatchdog() {
     const failed = await this.db.query<{ id: string; kind: string }>(
       `UPDATE ai_tasks SET status='failed',error='AI worker heartbeat timeout; automatic replay disabled',
@@ -859,6 +881,39 @@ export class ProcessorService implements OnModuleDestroy {
         .catch((error) => this.logger.warn(`Connector push skipped: ${error instanceof Error ? error.message : 'unknown'}`));
       await this.telegram.notifyOwnerSystem(message, '/sales/?page=settings')
         .catch((error) => this.logger.warn(`Connector Telegram notice skipped: ${error instanceof Error ? error.message : 'unknown'}`));
+    }
+    // A broker outage shows up as a wave of timed-out tasks, not as stuck 'claimed'
+    // rows, so the stuck-task sweep above stays silent. One notice per hour is enough:
+    // the owner can act, and a per-task notice would be a flood (1709 failures on 2026-09-14).
+    const aiHealth = await this.db.query<{ failed: string; completed: string }>(
+      `SELECT count(*) FILTER (WHERE status='failed')::text AS failed,
+              count(*) FILTER (WHERE status='completed')::text AS completed
+         FROM ai_tasks WHERE created_at>=now()-interval '30 minutes'`,
+    );
+    const failedAi = Number(aiHealth.rows[0]?.failed || 0);
+    const completedAi = Number(aiHealth.rows[0]?.completed || 0);
+    if (failedAi >= 8 && failedAi > completedAi) {
+      await this.alertOnce(
+        'ai_broker_outage',
+        60,
+        `Нейросеть не отвечает: за 30 минут ${failedAi} задач упало, удачных ${completedAi}. Заказы копились в базе, часть анализа пропущена.`,
+      );
+    }
+    // Leads that never reached analysis: no activity row at all means the pipeline
+    // dropped them. Old ones stay old, so the window is deliberately long.
+    const stuckLeads = await this.db.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM leads l
+        WHERE l.status='new' AND l.created_at<=now()-interval '3 hours'
+          AND l.created_at>=now()-interval '24 hours'
+          AND NOT EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id)`,
+    );
+    const stuckCount = Number(stuckLeads.rows[0]?.total || 0);
+    if (stuckCount >= 10) {
+      await this.alertOnce(
+        'leads_stuck',
+        360,
+        `${stuckCount} заказов висят без движения дольше трёх часов: анализ до них не дошёл.`,
+      );
     }
     return { failed: failed.rows.length, connectorAlerts };
   }

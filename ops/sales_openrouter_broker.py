@@ -45,6 +45,45 @@ from sales_hermes_broker import (  # noqa: E402
     _validate_schema,
 )
 
+# Prompts live in ./prompts/ai/<kind>.md so the owner can edit the wording without
+# touching code. Files are re-read when their mtime changes, so an edit takes effect
+# on the next task; a missing file falls back to the built-in text.
+PROMPTS_DIR = ROOT / "prompts" / "ai"
+_PROMPT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def prompt_for(kind: str) -> str:
+    try:
+        path = PROMPTS_DIR / f"{kind}.md"
+        mtime = path.stat().st_mtime
+    except OSError:
+        return PROMPTS[kind]
+    cached = _PROMPT_CACHE.get(kind)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return PROMPTS[kind]
+    if not text:
+        return PROMPTS[kind]
+    _PROMPT_CACHE[kind] = (mtime, text)
+    return text
+
+
+def build_instructions(kind: str, body: str) -> str:
+    schema = json.dumps(SCHEMAS[kind], ensure_ascii=False, separators=(",", ":"))
+    return (
+        "Ты изолированный аналитический worker системы продаж. Не отправляй "
+        "сообщения, не управляй браузером и не изменяй внешние системы. "
+        "Выполни только анализ переданных данных. "
+        + body
+        + "\nВерни только один JSON-объект без markdown-ограждений и текста до или после него. "
+        "JSON обязан соответствовать этой схеме:\n"
+        + schema
+    )
+
+
 LOG = logging.getLogger("sales-openrouter-broker")
 
 _TASK_ID_RE = r"^[A-Za-z0-9._:-]{1,160}$"
@@ -297,7 +336,7 @@ def process(config: Config, api: SalesApi, task: dict[str, Any]) -> None:
     safe_payload = json.loads(json.dumps(payload, ensure_ascii=False))
     try:
         image_parts = inline_attachments(safe_payload, config)
-        instructions = _instructions(kind)
+        instructions = build_instructions(kind, prompt_for(kind))
         context = _bounded_context(safe_payload)
         content: list[dict[str, Any]] = [{"type": "text", "text": context}] + image_parts
         messages = [

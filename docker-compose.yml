@@ -56,6 +56,7 @@ services:
       - ./data/documents:/app/data/documents
       - ./apps/web/dist:/app/apps/web/dist:ro
       - ./apps/api/dist:/app/apps/api/dist:ro
+      - ./prompts:/app/prompts:ro
     networks: [internal]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
@@ -87,6 +88,7 @@ services:
     volumes:
       - ./data/documents:/app/data/documents
       - ./apps/api/dist:/app/apps/api/dist:ro
+      - ./prompts:/app/prompts:ro
     networks: [internal]
     shm_size: "256mb"
     logging:
