@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { CodexTaskService } from './codex-task.service';
 import { DatabaseService } from './database.service';
 import { SettingsService } from './settings.service';
+import { leadCaseTypes, loadPortfolioCaseTags, portfolioCaseKey, type PortfolioCaseTags } from './portfolio-tags';
 import {
   calculateBottomUpPrice,
   calculateCatalogPrice,
@@ -1261,13 +1262,24 @@ function portfolioTokens(text: string): Set<string> {
  * the portfolio, and only the strongest few matches count — otherwise a card wins
  * by sheer description length instead of by fit.
  */
+export type PortfolioMatchOptions = {
+  /** Job types of this order, aligned with PRICING_CATEGORIES. */
+  leadTypes?: string[];
+  /** Owner-editable tags per case (prompts/portfolio_case_tags.json). */
+  tags?: Record<string, PortfolioCaseTags>;
+};
+
 export function selectRelevantPortfolio(
   value: unknown,
   leadText: string,
   limit = 6,
+  options: PortfolioMatchOptions = {},
 ): Record<string, unknown>[] {
   if (!Array.isArray(value)) return [];
   const rows = value.map((item) => (item && typeof item === 'object' ? item as Record<string, unknown> : {}));
+  const caseTags = options.tags || {};
+  const leadTypes = Array.isArray(options.leadTypes) ? options.leadTypes.filter(Boolean) : [];
+  const primaryType = String(leadTypes[0] || '');
   const caseTokens = rows.map((row) => portfolioTokens(`${row.title || ''} ${row.description || ''}`));
   const titleTokens = rows.map((row) => portfolioTokens(String(row.title || '')));
   const documentFrequency = new Map<string, number>();
@@ -1280,8 +1292,7 @@ export function selectRelevantPortfolio(
   const headline = portfolioTokens(String(leadText).split(/\n/u)[0] || '');
   const leadTokens = portfolioTokens(leadText);
   const STRONGEST_MATCHES = 6;
-  return rows
-    .map((row, index) => {
+  const scored = rows.map((row, index) => {
       const itemText = `${row.title || ''} ${row.description || ''}`;
       const matches: number[] = [];
       for (const word of leadTokens) {
@@ -1299,27 +1310,51 @@ export function selectRelevantPortfolio(
         if (concept.lead.test(leadText) && concept.item.test(itemText)) concepts += 1;
       }
       score += Math.min(concepts, 2) * 0.8;
-      return { index, score: Number(score.toFixed(2)), row };
-    })
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .filter(({ score }) => score > 0)
+      // A case of the right job type beats any number of shared words: MES LITE used to
+      // win a parser brief on the word "данные", because nothing knew the difference.
+      const tags = caseTags[portfolioCaseKey(row.url)] || null;
+      const sharedTypes = tags && leadTypes.length
+        ? tags.job_types.filter((type) => leadTypes.includes(type))
+        : [];
+      const matchedByType = sharedTypes.length > 0;
+      // The analyzer's own category is the sharpest signal; wider wording types such as
+      // automation_or_bot fire on half the portfolio, so they only nudge the score.
+      const primaryMatch = matchedByType && primaryType ? sharedTypes.includes(primaryType) : false;
+      if (matchedByType) score += primaryMatch ? 6 : 2;
+      return { index, score: Number(score.toFixed(2)), row, tags, matchedByType, primaryMatch };
+    });
+  // Ranking happens in tiers: the order's own category first, then a wider type such as
+  // automation, then pure word overlap. The shortlist still stays full, so the model keeps
+  // a choice and one brief never drains the whole portfolio; when no case shares a type,
+  // every slot comes from words, which is the honest stretch the owner asked for.
+  const tierOf = (item: { primaryMatch: boolean; matchedByType: boolean }) => (
+    item.primaryMatch ? 2 : item.matchedByType ? 1 : 0
+  );
+  return scored
+    .filter((item) => item.matchedByType || item.score > 0)
+    .sort((left, right) => tierOf(right) - tierOf(left) || right.score - left.score || left.index - right.index)
     .slice(0, Math.max(1, limit))
-    .map(({ row, score }) => ({
+    .map(({ row, score, tags, matchedByType }) => ({
       title: String(row.title || '').slice(0, 180),
       description: String(row.description || '').slice(0, 900),
       url: String(row.url || '').slice(0, 500),
+      job_types: tags ? tags.job_types : [],
+      matches_order_type: matchedByType,
+      domain: tags ? tags.domain : '',
       // The owner's 87 cases carry only title, description and url; every structured
       // field is empty. Without ready-to-quote concrete lines the model falls back to
       // "спроектировал структуру базы данных" — true, but worthless as proof.
-      what_it_is: caseOneLiner(row),
-      concrete_details: caseConcreteDetails(row),
+      what_it_is: tags && tags.domain ? `${caseOneLiner(row)} (${tags.domain})`.slice(0, 200) : caseOneLiner(row),
+      // Ready-to-quote proof lines from the tag file: without them the model falls back
+      // to "спроектировал структуру базы данных" — true, but worthless as proof.
+      concrete_details: [...(tags ? tags.facts : []), ...caseConcreteDetails(row)].slice(0, 5),
       case_card: {
         client_context: String(row.client_context || row.title || '').slice(0, 500),
         task: String(row.task || row.description || '').slice(0, 900),
         solution_details: String(row.solution_details || '').slice(0, 900),
         challenge: String(row.challenge || '').slice(0, 700),
         result: String(row.result || '').slice(0, 500),
-        stack: String(row.stack || '').slice(0, 300),
+        stack: String(row.stack || (tags ? tags.stack : '') || '').slice(0, 300),
         stack_mismatch_note: String(row.stack_mismatch_note || '').slice(0, 300),
       },
       relevance_score: score,
@@ -1581,11 +1616,11 @@ export class AiService {
     ).trim().slice(0, 160);
     // The picker can legitimately choose a case the word ranking put 12th, so the
     // review has to look at the same shortlist or it reports "кейс не использован".
-    const portfolio = selectRelevantPortfolio(
-      portfolioValue,
-      `${lead.title || ''}\n${lead.description || ''}`,
-      PORTFOLIO_SHORTLIST,
-    );
+    const portfolioLeadText = `${lead.title || ''}\n${lead.description || ''}`;
+    const portfolio = selectRelevantPortfolio(portfolioValue, portfolioLeadText, PORTFOLIO_SHORTLIST, {
+      leadTypes: leadCaseTypes(lead.analysis, portfolioLeadText),
+      tags: loadPortfolioCaseTags(),
+    });
     const metrics = content ? proposalHumanityMetrics(content) : null;
     const usedCase = content
       ? portfolio.find((item) => String(item.url || '').trim() && content.includes(String(item.url).trim()))
@@ -1650,7 +1685,12 @@ export class AiService {
     const leadText = String(sourceLead.title || '') + '\n' + String(sourceLead.description || '');
     const mode = context.mode === 'chat' ? 'chat' : 'response';
     // One deterministic shortlist; the model picks the case itself under proposal_rules.
-    const portfolio = selectRelevantPortfolio(allPortfolio, leadText, PORTFOLIO_IN_PROMPT);
+    const portfolioLeadTypes = leadCaseTypes(sourceLead.analysis, leadText);
+    const portfolio = selectRelevantPortfolio(allPortfolio, leadText, PORTFOLIO_IN_PROMPT, {
+      leadTypes: portfolioLeadTypes,
+      tags: loadPortfolioCaseTags(),
+    });
+
     // Anti-repeat compares against OTHER leads only: regenerating a draft for the
     // same lead would otherwise collide with its own earlier version.
     const recentDraftResult = await this.db.query<{ content: string }>(
@@ -1691,6 +1731,8 @@ export class AiService {
       seller,
       mode,
       portfolio,
+      // The order's own job types, so the prompt can tell a type match from a stretch.
+      portfolio_job_types: portfolioLeadTypes,
       // The owner's rules and approved examples are appended to the broker system
       // prompt (prompts/response_principles.md, prompts/response_calibration.md).
       // They used to travel inside this payload, which pushed it past the broker
