@@ -1,6 +1,8 @@
 import {
   calculateBottomUpPrice,
   calculateCatalogPrice,
+  CORRIDOR_HIGH_RATIO,
+  CORRIDOR_LOW_RATIO,
   DEFAULT_DAILY_RATE_RUB,
   reconcileEstimate,
 } from './pricing-policy';
@@ -70,26 +72,37 @@ describe('reconciling the breakdown with the catalogue', () => {
     category: 'automation_or_bot', level: 'standard', modifiers: [], estimatedDays: 16,
   });
 
-  test('a breakdown within reach of the catalogue is reported as the spread', () => {
+  test('a breakdown inside the corridor prices the actual list of work', () => {
     const breakdown = calculateBottomUpPrice([
       { what: 'Бот', days_optimistic: 10, days_realistic: 14, days_pessimistic: 20 },
     ]);
     const result = reconcileEstimate(breakdown, catalog);
-    // The market anchor is quoted; the breakdown only reports its spread.
-    expect(result.source).toBe('catalog');
-    expect(result.price).toBe(catalog!.price);
-    expect(result.days).toBe(catalog!.days);
+    expect(result.source).toBe('breakdown');
+    expect(result.price).toBe(breakdown!.price);
+    expect(result.days).toBe(breakdown!.days);
     expect(result.gap).toBeCloseTo(breakdown!.price / catalog!.price, 2);
   });
 
-  test('a breakdown four times off is overruled and the gap is reported', () => {
+  test('a breakdown far above the catalogue is capped by the corridor', () => {
     const breakdown = calculateBottomUpPrice([
       { what: 'Огромный объём', days_optimistic: 60, days_realistic: 90, days_pessimistic: 120 },
     ]);
     const result = reconcileEstimate(breakdown, catalog);
+    expect(result.source).toBe('corridor_capped');
+    expect(result.price).toBe(145_000);
+    expect(result.days).toBeGreaterThan(0);
+    expect(result.days).toBeLessThan(breakdown!.days);
+    expect(result.gap).toBeGreaterThan(CORRIDOR_HIGH_RATIO);
+  });
+
+  test('a breakdown far below the catalogue hands the answer back to the catalogue', () => {
+    const breakdown = calculateBottomUpPrice([
+      { what: 'Точечная правка', days_optimistic: 1, days_realistic: 1, days_pessimistic: 2 },
+    ]);
+    const result = reconcileEstimate(breakdown, catalog);
     expect(result.source).toBe('catalog');
     expect(result.price).toBe(catalog!.price);
-    expect(result.gap).toBeGreaterThan(2.5);
+    expect(result.gap).toBeLessThan(CORRIDOR_LOW_RATIO);
   });
 
   test('no breakdown at all still yields the old catalogue answer', () => {

@@ -67,7 +67,7 @@ export interface LeadAnalysis {
   /** Honest spread of the same estimate; the buyer sees it, FL.ru fields keep the centre. */
   price_range?: [number, number];
   days_range?: [number, number];
-  estimate_source?: 'breakdown' | 'catalog';
+  estimate_source?: 'breakdown' | 'catalog' | 'corridor_capped';
   /** Fair-price bucket: small / medium / large. Arithmetic, not another model opinion. */
   size_grade?: SizeGrade;
   /**

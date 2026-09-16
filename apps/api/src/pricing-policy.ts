@@ -333,20 +333,46 @@ export function calculateBottomUpPrice(
 }
 
 /**
- * The buyer is quoted what such projects cost on this market: the catalogue is
- * the price source, the bottom-up list is the adequacy check.  A gap between
- * the two means the analyzer picked the wrong category or level — that is
- * reported, never silently priced in, so the same order always quotes the same.
+ * The buyer is quoted what the work actually costs: the bottom-up list is the
+ * price source and the catalogue keeps it inside a believable corridor. Inside
+ * the corridor the breakdown wins, because the catalogue only knows the
+ * category while the breakdown knows the work. Below the corridor the catalogue
+ * speaks: a worklist that cheap usually describes a different job (retainer,
+ * design, non-development scope). Above it the catalogue caps the quote, so an
+ * over-detailed breakdown cannot triple an ordinary order.
  */
+export const CORRIDOR_LOW_RATIO = 0.6;
+export const CORRIDOR_HIGH_RATIO = 1.3;
+
+export type EstimateSource = 'breakdown' | 'catalog' | 'corridor_capped';
+
+export type EstimateReconciliation = {
+  price: number;
+  days: number;
+  source: EstimateSource;
+  gap: number | null;
+};
+
 export function reconcileEstimate(
   bottomUp: BottomUpResult | null,
   catalog: PricingResult | null,
-): { price: number; days: number; source: 'breakdown' | 'catalog'; gap: number | null } {
-  if (!bottomUp && !catalog) return { price: 0, days: 0, source: 'catalog', gap: null };
-  if (!catalog && bottomUp) return { price: bottomUp.price, days: bottomUp.days, source: 'breakdown', gap: null };
-  if (!catalog) return { price: 0, days: 0, source: 'catalog', gap: null };
-  const gap = bottomUp
-    ? Number((bottomUp.price / Math.max(1, catalog.price)).toFixed(2))
-    : null;
-  return { price: catalog.price, days: catalog.days, source: 'catalog', gap };
+): EstimateReconciliation {
+  if (!bottomUp) {
+    return catalog
+      ? { price: catalog.price, days: catalog.days, source: 'catalog', gap: null }
+      : { price: 0, days: 0, source: 'catalog', gap: null };
+  }
+  if (!catalog) return { price: bottomUp.price, days: bottomUp.days, source: 'breakdown', gap: null };
+  const gap = Number((bottomUp.price / Math.max(1, catalog.price)).toFixed(2));
+  if (gap < CORRIDOR_LOW_RATIO) {
+    return { price: catalog.price, days: catalog.days, source: 'catalog', gap };
+  }
+  if (gap > CORRIDOR_HIGH_RATIO) {
+    const price = roundPrice(catalog.price * CORRIDOR_HIGH_RATIO);
+    // The term is cut by the same factor as the price, so a capped quote still
+    // reads as the owner's daily rate instead of twelve days for twenty thousand.
+    const days = Math.max(1, Math.round(bottomUp.days * (price / Math.max(1, bottomUp.price))));
+    return { price, days, source: 'corridor_capped', gap };
+  }
+  return { price: bottomUp.price, days: bottomUp.days, source: 'breakdown', gap };
 }
