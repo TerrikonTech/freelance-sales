@@ -79,7 +79,7 @@ services:
     environment:
       TELEGRAM_ON_DEMAND_ONLY: "true"
       STRICT_APPROVAL: "false"
-      FL_SCAN_INTERVAL_SECONDS: "180"
+      # интервал скана берётся из .env (FL_SCAN_INTERVAL_SECONDS)
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,7 +134,7 @@ services:
       SALES_OPENROUTER_MODEL_VISION: ${SALES_OPENROUTER_MODEL_VISION:-deepseek/deepseek-v4-flash-vision-exp}
       SALES_OPENROUTER_KEY_FILE: /run/secrets/openrouter-key
       SALES_OPENROUTER_TEMPERATURE: "0.2"
-      SALES_OPENROUTER_TIMEOUT_SECONDS: "180"
+      SALES_OPENROUTER_TIMEOUT_SECONDS: "600"
       SALES_OPENROUTER_USAGE_LOG: /project/runtime/ai-usage/openrouter.jsonl
       SALES_OPENROUTER_DOCUMENTS_DIR: /project/data/documents
       SALES_BROKER_ENV_FILE: /run/secrets/sales-broker.env

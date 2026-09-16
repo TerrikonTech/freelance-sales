@@ -23,7 +23,7 @@ export class CodexTaskService {
     owner_intent: 120_000,
     // Compose measured 2.5-7 min on real long briefs (2026-09-10): 240 s cut off
     // 3 of 5 live drafts. 8 min is still far below the old 20-min hang.
-    draft_compose: 180_000,
+    draft_compose: 600_000,
     draft_reply: 300_000,
     conversation_turn: 180_000,
     lead_analysis_v2: 120_000,

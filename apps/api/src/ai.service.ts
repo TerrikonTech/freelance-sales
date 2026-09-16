@@ -1691,9 +1691,11 @@ export class AiService {
       seller,
       mode,
       portfolio,
-      // The ethalon: owner's structure, tone, bans and approved case metrics.
-      proposal_rules: this.proposalRules(),
-      calibration_examples: this.responseCalibration(),
+      // The owner's rules and approved examples are appended to the broker system
+      // prompt (prompts/response_principles.md, prompts/response_calibration.md).
+      // They used to travel inside this payload, which pushed it past the broker
+      // input limit; the broker then truncated every string to 200 chars and the
+      // model never saw the order text.  Rules are instructions, not data.
       commercial_terms: {
         price_rub: commercialTerms.price ?? null,
         duration_days: commercialTerms.days ?? null,
