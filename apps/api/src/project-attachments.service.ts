@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { PDFParse } from 'pdf-parse';
 import PizZip from 'pizzip';
+import { SettingsService } from './settings.service';
 
 export type ProjectAttachment = {
   name: string;
@@ -22,6 +23,9 @@ export class ProjectAttachmentsService {
   private readonly logger = new Logger(ProjectAttachmentsService.name);
   private readonly maxFileBytes = 15 * 1024 * 1024;
   private readonly maxTotalBytes = 40 * 1024 * 1024;
+  private static readonly flHosts = new Set(['st.fl.ru', 'www.fl.ru', 'fl.ru']);
+
+  constructor(private readonly settings: SettingsService) {}
 
   async download(projectId: string, links: Array<{ url: string; name?: string }>): Promise<ProjectAttachment[]> {
     const safeProjectId = projectId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'project';
@@ -29,14 +33,30 @@ export class ProjectAttachmentsService {
     await mkdir(root, { recursive: true });
     const results: ProjectAttachment[] = [];
     let totalBytes = 0;
+    const cookieHeader = await this.flCookieHeader();
     for (const [index, link] of links.slice(0, 8).entries()) {
       if (!this.allowed(link.url) || totalBytes >= this.maxTotalBytes) continue;
       try {
-        const response = await fetch(link.url, {
-          headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' },
-          redirect: 'follow',
+        // FL отдаёт файл 302-редиректом на предподписанную ссылку хранилища.
+        // Редирект обрабатываем вручную: cookies FL уходят только на fl.ru,
+        // до хранилища они доходить не должны.
+        const flHost = this.isFlHost(link.url);
+        let response = await fetch(link.url, {
+          headers: {
+            'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)',
+            ...(flHost && cookieHeader ? { cookie: cookieHeader, referer: 'https://www.fl.ru/' } : {}),
+          },
+          redirect: flHost ? 'manual' : 'follow',
           signal: AbortSignal.timeout(35_000),
         });
+        if (flHost && response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          if (!location || !this.allowed(new URL(location, link.url).toString())) {
+            this.logger.warn(`FL attachment skipped: redirect to non-allowed host ${location ? new URL(location, link.url).host : '(none)'}`);
+            continue;
+          }
+          response = await this.fetchStorage(new URL(location, link.url).toString());
+        }
         if (!response.ok || !this.allowed(response.url)) continue;
         const declared = Number(response.headers.get('content-length') || 0);
         if (declared > this.maxFileBytes || declared + totalBytes > this.maxTotalBytes) continue;
@@ -66,13 +86,62 @@ export class ProjectAttachmentsService {
     return results;
   }
 
+  // Хранилище FL может быть недоступно с этого сервера (у провайдера заблокирован
+  // TLS к selcloud). Сначала пробуем напрямую, при сетевом сбое — через релей
+  // на Cloudflare Worker (ATTACHMENT_RELAY_URL + ATTACHMENT_RELAY_KEY).
+  private async fetchStorage(url: string) {
+    try {
+      return await fetch(url, {
+        headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      const relay = process.env.ATTACHMENT_RELAY_URL;
+      const key = process.env.ATTACHMENT_RELAY_KEY;
+      if (!relay || !key) throw error;
+      const direct = error instanceof Error ? error.message : 'unknown';
+      this.logger.warn(`FL attachment: storage fetch failed (${direct.slice(0, 80)}), retrying via relay`);
+      const joiner = relay.includes('?') ? '&' : '?';
+      const relayUrl = `${relay}${joiner}key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
+      return await fetch(relayUrl, {
+        headers: { 'user-agent': 'Mozilla/5.0 (compatible; FreelanceSales/2.0)' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(60_000),
+      });
+    }
+  }
+
   private allowed(value: string) {
     try {
       const url = new URL(value);
       const host = url.hostname.toLowerCase();
-      return url.protocol === 'https:' && (host === 'st.fl.ru' || host === 'www.fl.ru' || host === 'fl.ru');
+      return url.protocol === 'https:' && (this.isFlHost(host) || host.endsWith('.storage.selcloud.ru'));
     } catch {
       return false;
+    }
+  }
+
+  private isFlHost(value: string) {
+    try {
+      return ProjectAttachmentsService.flHosts.has(new URL(value, 'https://fl.ru').hostname.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
+  private async flCookieHeader(): Promise<string | null> {
+    try {
+      const raw = await this.settings.getSecret('fl_cookies');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Array<{ name?: string; value?: string; domain?: string }>;
+      const pairs = parsed
+        .filter((cookie) => cookie.name && cookie.value && (!cookie.domain || /(^|\.)fl\.ru$/i.test(cookie.domain)))
+        .map((cookie) => `${cookie.name}=${cookie.value}`);
+      return pairs.length ? pairs.join('; ') : null;
+    } catch (error) {
+      this.logger.warn(`FL cookies unavailable for attachments: ${error instanceof Error ? error.message : 'unknown'}`);
+      return null;
     }
   }
 
